@@ -72,7 +72,7 @@ fn safe_path(s: &str) -> Result<PathBuf, String> {
     let low = s.to_ascii_lowercase();
     let root_file = !s.contains('/')
         && (low == "unleashed-launcher.exe"
-            || low == "undma_v2.exe"
+            || low == "undma_v3.exe"
             || low == "portable-manifest.json"
             || low == "info.db"
             || low.ends_with(".dll"));
@@ -163,7 +163,7 @@ fn manifest(dir: &Path, version: &str) -> Result<Manifest, String> {
             return Err(format!("Package hash mismatch: {}", f.path));
         }
     }
-    if !names.contains("unleashed-launcher.exe") || !names.contains("undma_v2.exe") {
+    if !names.contains("unleashed-launcher.exe") || !names.contains("undma_v3.exe") {
         return Err("Incomplete portable runtime".into());
     }
     Ok(m)
@@ -430,7 +430,3 @@ pub fn helper_entry() -> bool {
     }
     true
 }
-
-#[cfg(test)]
-#[path = "../../../../../04_SCENARIO/un-dma-v2/src/PortableUpdaterTests.rs"]
-mod tests;

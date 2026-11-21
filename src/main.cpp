@@ -4,6 +4,7 @@ namespace OW {int RunSkillModeScopeSelfTest();}
 #endif
 #include "features/visuals/EntityVisuals.hpp"
 #include "runtime/LauncherBridge.hpp"
+#include "features/visuals/RayScene.hpp"
 // =============================================================================
 // Unleashed DMA -- Overwatch 2 External Cheat
 //
@@ -64,7 +65,7 @@ namespace OW {int RunSkillModeScopeSelfTest();}
 
 namespace {
 
-    constexpr const char* kProductVariantName = "un-dma-v2";
+    constexpr const char* kProductVariantName = "un-dma-v3";
 
     std::atomic<bool> g_DiagnosticsThreadRunning{ false };
     std::thread g_DiagnosticsThread;
@@ -324,7 +325,7 @@ static int RunConfigCheckCli()
         return EXIT_FAILURE;
     }
 
-    std::printf("[PRODUCT] variant=%s executable=UNDMA_V2.exe lockedProfile=%s\n",
+    std::printf("[PRODUCT] variant=%s executable=UNDMA_V3.exe lockedProfile=%s\n",
         kProductVariantName,
         OW::offset::ActiveProfileName());
     std::printf("[CONFIG] directory=%s\n", OW::Config::ConfigDirectoryPath().c_str());
@@ -439,20 +440,28 @@ int main(int argc, char** argv)
     CrashDump::InstallUnhandledExceptionFilter(L"crash_dumps");
 
     // ---- Console ----
-    SetConsoleTitleA("UNDMA V2");
+    SetConsoleTitleA("UNDMA V3");
 
     std::printf("\n");
     std::printf("  ============================================\n");
-    std::printf("     UNDMA V2 -- Overwatch CN\n");
+    std::printf("     UNDMA V3 -- Overwatch CN\n");
     std::printf("  ============================================\n");
     std::printf("\n");
 
+    std::string rayScenePath;
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index] ? argv[index] : "";
         if (argument == "--help" || argument == "-h") {
-            std::printf("Usage: UNDMA_V2 [--config-check] [--test-server]\n"
+            std::printf("Usage: UNDMA_V3 [--ray-scene FILE] [--config-check] [--test-server]\n"
                         "       [--test-server-port 1..65535] [--test-server-cors] [--box-perf-mode]\n       [--run-seconds 1..1800] [--reconnect-after 1..1799] [--canvas-only]\n       [--profile auto|cn|world|nexon] [--capture-screen] [--aim-diagnostics]\n");
             return 0;
+        }
+        if (argument == "--ray-scene") {
+            if (++index >= argc || !argv[index][0] || !rayScenePath.empty()) {
+                std::fprintf(stderr, "--ray-scene requires one local scene file.\n"); return 2;
+            }
+            rayScenePath = argv[index];
+            continue;
         }
         if (argument == "--profile") {
             if (++index>=argc) { std::fprintf(stderr,"Missing --profile value.\n"); return 2; }
@@ -545,8 +554,8 @@ int main(int argc, char** argv)
     // ---------------------------------------------------------------
     // Step 1 -- Load settings before starting hardware connections
     // ---------------------------------------------------------------
-    Diagnostics::Initialize(Diagnostics::LogLevel::Info, "./undma_v2_diag.log");
-    Diagnostics::InitializeAimLog("./undma_v2_aim_diag.log");
+    Diagnostics::Initialize(Diagnostics::LogLevel::Info, "./undma_v3_diag.log");
+    Diagnostics::InitializeAimLog("./undma_v3_aim_diag.log");
     Diagnostics::SetProcessTimerResolutionStatus(
         processTimerResolution.Requested(),
         processTimerResolution.Enabled(),
@@ -563,7 +572,12 @@ int main(int argc, char** argv)
         Diagnostics::Error("Config load failed: %s", OW::Config::LastPersistenceError().c_str());
         return EXIT_FAILURE;
     }
-    const bool capturePreferencesLoaded = V2::Vision::Preferences::Load();
+    const bool localScene = !rayScenePath.empty();
+    if (localScene && !V3::RayScene::Open(rayScenePath)) {
+        Diagnostics::Error("Invalid or unreadable ray scene: %s", rayScenePath.c_str());
+        return 2;
+    }
+    const bool capturePreferencesLoaded = localScene || V2::Vision::Preferences::Load();
     if (!capturePreferencesLoaded)
         Diagnostics::Warn("Capture preferences unavailable: %s", V2::Vision::Preferences::Error().c_str());
     if (HasCommandLineFlag(argc, argv, "--aim-diagnostics")) {
@@ -606,9 +620,9 @@ int main(int argc, char** argv)
         OW::Config::boxPerfFastRect ? 1 : 0,
         boxPerfModeRequested ? 1 : 0);
     Diagnostics::SetDmaReady(false);
-    StartDiagnosticStatusThread();
+    if (!localScene) StartDiagnosticStatusThread();
 
-    if (testServerRequested) {
+    if (!localScene && testServerRequested) {
         TestServer::Options testServerOptions{};
         testServerOptions.port = static_cast<uint16_t>(testServerPortValue);
         testServerOptions.allowWildcardCors = testServerCorsRequested;
@@ -643,9 +657,10 @@ int main(int argc, char** argv)
     // ---------------------------------------------------------------
     std::printf("[MAIN] Initialising overlay...\n");
     Diagnostics::Info("Initialising overlay.");
-    if (!g_Overlay.Initialize(L"UNDMA V2")) {
+    if (!g_Overlay.Initialize(L"UNDMA V3")) {
         std::fprintf(stderr, "[FATAL] Overlay initialisation failed.\n");
         Diagnostics::Error("Overlay initialisation failed.");
+        if (localScene) return 1;
         ShutdownHeadlessRuntime("overlay_init_failure");
         std::printf("[INFO] Press Enter to exit.\n");
         std::getchar();
@@ -655,8 +670,8 @@ int main(int argc, char** argv)
     Diagnostics::Info("Overlay ready.");
     PreloadHeroAvatars();
     PreloadAbilityIcons();
-    V2::Alerts::Start();
-    if (HasCommandLineFlag(argc, argv, "--capture-screen")) {
+    if (!localScene) V2::Alerts::Start();
+    if (!localScene && HasCommandLineFlag(argc, argv, "--capture-screen")) {
         // Explicit session-only capture using the same service as the UI and
         // contour consumers. Do not persist enabled state or open a second card.
         auto& capture = V2::Vision::GetService();
@@ -668,8 +683,8 @@ int main(int argc, char** argv)
             Diagnostics::Warn("--capture-screen could not start capture; inspect capture settings and status.");
     }
     V2::Launcher::Send("{\"event\":\"ready\"}");
-    StartProcessConnectionThread();
-    Diagnostics::Info("Settings ready; hardware and process connection run in background.");
+    if (!localScene) StartProcessConnectionThread();
+    else Diagnostics::Info("Local ray scene active; source=%s connector=off", rayScenePath.c_str());
 
     // ---------------------------------------------------------------
     // Step 5 -- Main loop (blocks until overlay / game closes)
@@ -699,7 +714,7 @@ int main(int argc, char** argv)
         Diagnostics::Info("Validation duration reached; requesting normal exit.");
         g_Overlay.RequestExit();
     });
-    if(reconnectAfter)SetTimer(nullptr,0,UINT(reconnectAfter*1000),[](HWND,UINT,UINT_PTR timer,DWORD) {
+    if(!localScene && reconnectAfter)SetTimer(nullptr,0,UINT(reconnectAfter*1000),[](HWND,UINT,UINT_PTR timer,DWORD) {
         KillTimer(nullptr,timer);
         Diagnostics::Info("Validation timer requesting normal reconnect.");
         OW::ProcessConnection::RequestReconnect();
@@ -712,7 +727,11 @@ int main(int argc, char** argv)
     std::printf("\n[MAIN] Display closed.  Shutting down...\n");
     Diagnostics::Info("Display closed. Shutting down.");
     Diagnostics::DumpStatus();
-    ShutdownHeadlessRuntime("overlay_shutdown");
+    if (localScene) {
+        Diagnostics::ShutdownAimLog();
+        Diagnostics::Shutdown();
+        RuntimeTrace::Stop();
+    } else ShutdownHeadlessRuntime("overlay_shutdown");
 
     std::printf("[MAIN] Goodbye.\n");
     return 0;

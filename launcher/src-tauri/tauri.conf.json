@@ -1,8 +1,8 @@
 {
   "$schema": "https://schema.tauri.app/config/2",
-  "productName": "Unleashed V2",
-  "version": "2.0.0",
-  "identifier": "com.sensezen.unleashed.v2",
+  "productName": "Unleashed V3",
+  "version": "3.0.0",
+  "identifier": "com.sensezen.unleashed.v3",
   "build": {
     "frontendDist": "../dist",
     "beforeBuildCommand": "npm run build"
@@ -10,7 +10,7 @@
   "app": {
     "windows": [
       {
-        "title": "UNLEASHED",
+        "title": "UNLEASHED V3",
         "label": "main",
         "width": 375,
         "height": 484,
@@ -34,9 +34,7 @@
   },
   "plugins": {
     "updater": {
-      "endpoints": [
-        "https://github.com/RUC601/un-dma-v2/releases/latest/download/latest.json"
-      ],
+      "endpoints": [],
       "pubkey": "dW50cnVzdGVkIGNvbW1lbnQ6IG1pbmlzaWduIHB1YmxpYyBrZXk6IDU4RjZFREE3OTYwQzg1NTMKUldSVGhReVdwKzMyV0FxRHJkaEtCRXNWblRDVlNmMFNsTzZHMFFqaS82Y3JyWW14VzFWdDZjZkIK",
       "requireSignedVersion": true
     }

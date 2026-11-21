@@ -39,10 +39,10 @@ void entity_thread() {
     Diagnostics::ScopedDmaCallsite tag(Diagnostics::DmaCallsite::EntityDecrypt);
     const bool scanLatestWinsEnabled=V2::Acquisition::kLatestWins;
     const bool coldTopologyScanEnabled=V2::Acquisition::kColdTopology;
-    Diagnostics::Info("UNDMA V2: unified acquisition, compact hot fields, resumable discovery, UN feature settings retained.");
+    Diagnostics::Info("UNDMA V3: unified acquisition, compact hot fields, resumable discovery, UN feature settings retained.");
     const auto entityProcessPeriod = V2::Acquisition::Period();
     auto nextProcessTick = std::chrono::steady_clock::now();
-    Diagnostics::Info("UNDMA V2 acquisition target=%d Hz period_ms=%.7f.",
+    Diagnostics::Info("UNDMA V3 acquisition target=%d Hz period_ms=%.7f.",
         V2::Acquisition::kTargetHz, std::chrono::duration<double,std::milli>(entityProcessPeriod).count());
     bool lastCriticalBatchFusionActive = OW::CriticalBatchFusionActive();
     uint64_t lastConnectionEpoch = OW::ProcessConnection::ConnectionEpoch();
@@ -464,6 +464,7 @@ void entity_thread() {
     std::vector<HotFieldBatchItem> hotFieldBatchStorage;
     std::unordered_map<uint64_t,size_t> hotFieldBatchIndex;
     std::unordered_map<uint64_t,uint64_t> successfulSamples;
+    std::unordered_map<uint64_t,DWORD> nativeHitboxLogTicks;
     auto measurementStart=std::chrono::steady_clock::now();
     size_t measuredCycles=0; double hotTotalMs=0, hotMaxMs=0;
 
@@ -1316,6 +1317,63 @@ void entity_thread() {
                     next.native_hitboxes=item.nativeHitboxes.Commit(
                         cached.skeletonCache.revision,item.readStartedTick,next.model_world,
                         item.geometryPoses,nativeModel,cached.skeletonCache.shapeMapped);
+                    if (!next.native_hitboxes.Matches(next.VelocityBase,next.skeleton_revision)) {
+                        static std::unordered_map<uint64_t, DWORD> lastNativeRejectLog;
+                        const DWORD now = GetTickCount();
+                        auto& last = lastNativeRejectLog[next.address];
+                        if (now - last >= 1000) {
+                            last = now;
+                            const char* reason = !skeletonConfirmed ? "pose-not-confirmed"
+                                : !next.HasCurrentModelWorldTransform() ? "model-world-invalid"
+                                : !item.nativeHitboxes.Complete() ? "native-capture-incomplete"
+                                : "pose-or-shape-invalid";
+                            Diagnostics::Info(
+                                "[RAY-SHAPE-REJECT] entity=0x%llX model=0x%llX hitbox=0x%llX "
+                                "reason=%s critical=unknown prepared=%d complete=%d bytes[root/header/sphere/capsule]=%lu/%lu/%lu/%lu "
+                                "expected=%zu/%zu pose_tick_ms=%u",
+                                static_cast<unsigned long long>(next.address),
+                                static_cast<unsigned long long>(cached.nativeHitboxLayout.modelBase),
+                                static_cast<unsigned long long>(cached.nativeHitboxLayout.root),reason,
+                                int(item.nativeHitboxes.prepared),int(item.nativeHitboxes.Complete()),
+                                static_cast<unsigned long>(item.nativeHitboxes.rootBytes),
+                                static_cast<unsigned long>(item.nativeHitboxes.headerBytes),
+                                static_cast<unsigned long>(item.nativeHitboxes.sphereBytes),
+                                static_cast<unsigned long>(item.nativeHitboxes.capsuleBytes),
+                                item.nativeHitboxes.spheres.size(),item.nativeHitboxes.capsules.size(),
+                                item.readStartedTick);
+                        }
+                    }
+                    if (next.native_hitboxes.Matches(next.VelocityBase,next.skeleton_revision)) {
+                        const DWORD now = GetTickCount();
+                        auto& last = nativeHitboxLogTicks[next.address];
+                        if (now - last >= 1000) {
+                            last = now;
+                            Diagnostics::Info(
+                                "[RAY-HITBOX] entity=0x%llX model=0x%llX hitbox=0x%llX spheres=%u capsules=%u "
+                                "shape_count=%zu pose_tick_ms=%u profile=%s",
+                                static_cast<unsigned long long>(next.address),
+                                static_cast<unsigned long long>(next.native_hitboxes.modelBase),
+                                static_cast<unsigned long long>(next.native_hitboxes.hitboxSet),
+                                next.native_hitboxes.sphereCount,next.native_hitboxes.capsuleCount,
+                                next.native_hitboxes.shapes.size(),next.native_hitboxes.tick,
+                                OW::offset::ActiveProfileName());
+                            for (size_t shapeIndex = 0; shapeIndex < next.native_hitboxes.shapes.size(); ++shapeIndex) {
+                                const auto& shape = next.native_hitboxes.shapes[shapeIndex];
+                                const int mapped = shapeIndex < next.native_hitboxes.shapeMapped.size()
+                                    ? next.native_hitboxes.shapeMapped[shapeIndex] : -1;
+                                Diagnostics::Info(
+                                    "[RAY-SHAPE] entity=0x%llX model=0x%llX hitbox=0x%llX index=%zu "
+                                    "shapeMapped=%d bone=%d criticalRaw=0x%llX critical=%s pose_tick_ms=%u",
+                                    static_cast<unsigned long long>(next.address),
+                                    static_cast<unsigned long long>(next.native_hitboxes.modelBase),
+                                    static_cast<unsigned long long>(next.native_hitboxes.hitboxSet),shapeIndex,
+                                    mapped,shape.boneId,
+                                    static_cast<unsigned long long>(shape.criticalRaw),
+                                    OW::ModelShapes::CriticalStateName(shape.critical),
+                                    next.native_hitboxes.tick);
+                            }
+                        }
+                    }
                 }
                 if(item.nativeHitboxes.Complete()) {
                     if(!item.nativeHitboxes.RefreshBindings(cached.nativeHitboxLayout,cached.skeletonCache.boneCount))cached.nativeHitboxLayout={};
@@ -1332,6 +1390,12 @@ void entity_thread() {
                 next.model_shapes.modelIndex=cached.skeletonCache.shapeModelIndex;
                 next.model_shapes.poses.resize(cached.skeletonCache.shapeMapped.size());
                 next.model_shapes.valid.resize(cached.skeletonCache.shapeMapped.size());
+                next.model_shapes.shapeMapped = cached.skeletonCache.shapeMapped;
+                // The model-template path has no native shape record. Keep that
+                // absence explicit so the renderer cannot infer it from a bound
+                // head or from a later conditional damage event.
+                next.model_shapes.critical.assign(next.model_shapes.shapeMapped.size(),
+                    OW::ModelShapes::CriticalState::Unknown);
                 for(size_t s=0;s<next.model_shapes.poses.size();++s) {
                     int mapped=cached.skeletonCache.shapeMapped[s];
                     if(mapped<0 || size_t(mapped+1)*0x30>item.shapeBoneData.size())continue;
@@ -1525,10 +1589,10 @@ void entity_thread() {
             hotTotalMs+=hotMs; hotMaxMs=(std::max)(hotMaxMs,hotMs); ++measuredCycles;
             const double elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-measurementStart).count();
             if(elapsed>=5) {
-                Diagnostics::Info("[UNDMA-V2] target_hz=%d cycles=%zu actual_cycle_hz=%.2f entities=%zu hot_mean_ms=%.3f hot_max_ms=%.3f",
+                Diagnostics::Info("[UNDMA-V3] target_hz=%d cycles=%zu actual_cycle_hz=%.2f entities=%zu hot_mean_ms=%.3f hot_max_ms=%.3f",
                     V2::Acquisition::kTargetHz,measuredCycles,measuredCycles/elapsed,hotFieldBatchItems.size(),hotTotalMs/measuredCycles,hotMaxMs);
                 for(const auto& [address,count]:successfulSamples)
-                    Diagnostics::Info("[UNDMA-V2-SAMPLE] entity=0x%llX samples=%llu hz=%.2f",address,count,count/elapsed);
+                    Diagnostics::Info("[UNDMA-V3-SAMPLE] entity=0x%llX samples=%llu hz=%.2f",address,count,count/elapsed);
                 successfulSamples.clear(); measuredCycles=0; hotTotalMs=0; hotMaxMs=0;
                 measurementStart=std::chrono::steady_clock::now();
             }

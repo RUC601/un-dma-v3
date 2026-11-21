@@ -15,7 +15,7 @@
                     admissionRecord.admissionRejectReason=detail;admissionRecord.admissionRejectTick=now;
                     const auto found=cycleDiscoveries.actors.find(entity.address);
                     const auto* expected=found==cycleDiscoveries.actors.end()?nullptr:&found->second;
-                    Diagnostics::Warn("[V2-ADMISSION] reason=%zu detail=%s live_detail=%s live_hero=0x%llX actor=0x%llX link=0x%llX match=%u hero=0x%llX expected_link=0x%llX expected_match=%u expected_hero=0x%llX proof_age_ms=%u member=%d roster=0x%llX life=%llu hp=%.1f healthDue=%d healthValid=%d healthTick=%u cycleTick=%u fence=%llu absence=%llu",
+                    Diagnostics::Warn("[V3-ADMISSION] reason=%zu detail=%s live_detail=%s live_hero=0x%llX actor=0x%llX link=0x%llX match=%u hero=0x%llX expected_link=0x%llX expected_match=%u expected_hero=0x%llX proof_age_ms=%u member=%d roster=0x%llX life=%llu hp=%.1f healthDue=%d healthValid=%d healthTick=%u cycleTick=%u fence=%llu absence=%llu",
                         reason,detail,liveDetail,liveHero,entity.address,entity.LinkParent,entity.match_id,entity.HeroID,
                         expected?expected->link:0,expected?expected->match:0,expected?expected->hero:0,
                         expected?uint32_t(now-expected->tick):0,latestCompleteActorMembers.contains(entity.address),entity.roster_key,entity.actor_generation,
@@ -37,7 +37,7 @@
                         else {
                             const auto observation=OW::CaptureEntityBodyObservation(entity.address);
                             entity.body_observation_fence=observation.fence;entity.body_absence_revision=observation.absence;
-                            Diagnostics::Info("[V2-LOCAL-BINDING] accepted actor=0x%llX link=0x%llX hero=0x%llX match=%u bypassed=%s",
+                            Diagnostics::Info("[V3-LOCAL-BINDING] accepted actor=0x%llX link=0x%llX hero=0x%llX match=%u bypassed=%s",
                                 entity.address,entity.LinkParent,entity.HeroID,entity.match_id,initialFailure);
                         }
                     }
@@ -189,7 +189,7 @@
                     const auto oldAddress=old->address,oldGeneration=old->actor_generation;
                     if(oldAddress!=entity.address) {
                         retireObservedBody(*old);
-                        if(deadReplacement.Verified())Diagnostics::Info("[V2-DEAD-PARTICIPANT-REPLACEMENT] old=0x%llX actor=0x%llX generation=%llu",
+                        if(deadReplacement.Verified())Diagnostics::Info("[V3-DEAD-PARTICIPANT-REPLACEMENT] old=0x%llX actor=0x%llX generation=%llu",
                             oldAddress,entity.address,entity.actor_generation);
                     }
                     cacheIt->second->cachedSkeletonValid=false;cacheIt->second->skeletonCache={};

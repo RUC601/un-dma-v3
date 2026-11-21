@@ -83,7 +83,7 @@
             static DWORD lastReport=0;
             if(ready || !lastReport || uint32_t(GetTickCount()-lastReport)>=1000) {
                 lastReport=GetTickCount();
-                Diagnostics::Info("[V2-INITIALIZE] actors=%zu ready=%zu requests=%zu bytes=%zu batch_ok=%d elapsed_us=%llu",
+                Diagnostics::Info("[V3-INITIALIZE] actors=%zu ready=%zu requests=%zu bytes=%zu batch_ok=%d elapsed_us=%llu",
                     work.size(),ready,requestsRead,bytesRead,executed?1:0,
                     static_cast<unsigned long long>(RuntimeTrace::NowUs()-batchStartedUs));
             }

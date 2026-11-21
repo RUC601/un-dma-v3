@@ -1,6 +1,6 @@
 # UNDMA V3 Agent Context
 
-`01_PRODUCTS/un-dma-v3` 是 UniCore 的独立 Git 工作区，分支 `v3/unicore`。V2 继续在 `01_PRODUCTS/un-dma-v2` 负责日常功能、版本和库更新。V3 按具体任务吸收所需的 V2 变更，记录来源提交。
+`01_PRODUCTS/un-dma-v3` 是 UniCore 的独立产品 Git 工作区，分支 `v3/unicore`。V2 位于 `01_PRODUCTS/un-dma-v2`，仅作为来源提交和只读对照。V3 自己维护入口、配置、构建、运行库、版本和验证记录，不从 V2 自动继承运行时状态或发布身份。吸收 V2 代码时必须记录来源提交和 V3 侧的适配结论。
 
 V3 的状态、实验资料和恢复入口见 [V3 进度](../docs/un-dma-v3/V3_PROGRESS.zh-CN.md)。产品文档位于 `../docs/un-dma-v3`，研究位于 `../../02_RESEARCH/un-dma-research/v3-product-research`，验证和运行证据位于 `../../04_SCENARIO/un-dma-v3`。各产品的配置、构建和运行产物各自维护。
 

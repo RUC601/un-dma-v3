@@ -9,13 +9,13 @@ $npmVersion=(Get-Content (Join-Path $repo 'launcher\package.json') -Raw | Conver
 $cargoVersion=[regex]::Match((Get-Content (Join-Path $repo 'launcher\src-tauri\Cargo.toml') -Raw),'(?m)^version = "([^"]+)"').Groups[1].Value
 if ($npmVersion -ne $version -or $cargoVersion -ne $version) { throw 'Launcher package versions differ' }
 $runtime=Join-Path $repo 'build\Release'
-$native=Get-Item -LiteralPath (Join-Path $runtime 'UNDMA_V2.exe')
+$native=Get-Item -LiteralPath (Join-Path $runtime 'UNDMA_V3.exe')
 if ($native.VersionInfo.ProductVersion -ne $version) { throw 'Native and launcher versions differ' }
 if (-not $OutputDirectory) { $OutputDirectory=Join-Path $repo ('dist\'+$version) }
 $output=[IO.Path]::GetFullPath($OutputDirectory)
 if ((Test-Path -LiteralPath $output) -and @(Get-ChildItem -LiteralPath $output -Force).Count) { throw 'Package output must be empty; choose a new directory' }
 New-Item -ItemType Directory -Force $output | Out-Null
-$files=@(Get-ChildItem -LiteralPath $runtime -File | Where-Object { $_.Name -in @('UNDMA_V2.exe','unleashed-launcher.exe','info.db') -or $_.Extension -eq '.dll' })
+$files=@(Get-ChildItem -LiteralPath $runtime -File | Where-Object { $_.Name -in @('UNDMA_V3.exe','unleashed-launcher.exe','info.db') -or $_.Extension -eq '.dll' })
 foreach ($file in $files) { Copy-Item -LiteralPath $file.FullName -Destination $output }
 Copy-Item -LiteralPath (Join-Path $runtime 'assets') -Destination (Join-Path $output 'assets') -Recurse
 $voiceRoot=Join-Path $runtime 'alert-voice'
@@ -33,16 +33,16 @@ $manifestFiles=@(Get-ChildItem -LiteralPath $output -File -Recurse | Sort-Object
 })
 if (-not ($manifestFiles.path -contains 'unleashed-launcher.exe')) { throw 'Launcher is missing from runtime' }
 @{ version=$version; files=$manifestFiles } | ConvertTo-Json -Depth 8 | Set-Content (Join-Path $output 'portable-manifest.json') -Encoding utf8NoBOM
-$zip=Join-Path (Split-Path $output -Parent) ('Unleashed-V2-'+$version+'-windows-x86_64.zip')
+$zip=Join-Path (Split-Path $output -Parent) ('Unleashed-V3-'+$version+'-windows-x86_64.zip')
 if (Test-Path -LiteralPath $zip) { throw 'ZIP already exists; choose a new output directory' }
 Add-Type -AssemblyName System.IO.Compression.FileSystem
 [IO.Compression.ZipFile]::CreateFromDirectory($output,$zip,[IO.Compression.CompressionLevel]::Optimal,$false)
-$signingFile=Join-Path ([Environment]::GetFolderPath('Desktop')) 'UnleashedV2-signing\unleashed-v2.key'
+$signingFile=Join-Path ([Environment]::GetFolderPath('Desktop')) 'UnleashedV3-signing\unleashed-v3.key'
 if (-not (Test-Path -LiteralPath $signingFile)) { throw 'The desktop signing key is missing' }
 & (Join-Path $repo 'launcher\node_modules\.bin\tauri.cmd') signer sign -f $signingFile --app-version $version $zip
 if ($LASTEXITCODE) { throw 'Package signing failed' }
 $signature=(Get-Content -LiteralPath ($zip+'.sig') -Raw).Trim()
-$manifest=@{version=$version;notes='UN V2';pub_date=[DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ');platforms=@{'windows-x86_64'=@{url=('https://github.com/RUC601/un-dma-v2/releases/download/v'+$version+'/'+[IO.Path]::GetFileName($zip));signature=$signature}}}
+$manifest=@{version=$version;notes='UN V3';pub_date=[DateTime]::UtcNow.ToString('yyyy-MM-ddTHH:mm:ssZ');platforms=@{'windows-x86_64'=@{url=('https://github.com/RUC601/un-dma-v3/releases/download/v'+$version+'/'+[IO.Path]::GetFileName($zip));signature=$signature}}}
 $manifest | ConvertTo-Json -Depth 8 | Set-Content (Join-Path (Split-Path $output -Parent) 'latest.json') -Encoding utf8NoBOM
 Write-Output ('Local signed package: '+$zip)
 Write-Output 'No GitHub Release was published.'

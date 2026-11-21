@@ -1517,7 +1517,7 @@ namespace OW {
                             (components[0] || components[1]);
                     },incoming);
                 if(resolver.status==EntityRegistry::ResolveStatus::Recovered)
-                    Diagnostics::Info("V2 registry recovered stateRva=0x%llX pages=%llu bytes=%llu.",
+                    Diagnostics::Info("V3 registry recovered stateRva=0x%llX pages=%llu bytes=%llu.",
                         resolver.Location(),resolver.pages,resolver.bytes);
             }
         }

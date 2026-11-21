@@ -695,7 +695,7 @@ bool Overlay::CreateWindows(const wchar_t* overlayTitle, HINSTANCE instance) {
     m_menuHWnd = CreateWindowExW(
         menuExStyle,
         kMenuClassName,
-        L"UNLEASHED V2",
+        L"UNLEASHED V3",
         menuStyle,
         menuX,
         menuY,

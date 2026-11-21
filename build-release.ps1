@@ -19,6 +19,11 @@ try {
     if ($LASTEXITCODE -ne 0) {
         exit $LASTEXITCODE
     }
+
+    $native = Join-Path $PSScriptRoot 'build\Release\UNDMA_V3.exe'
+    if (-not (Test-Path -LiteralPath $native -PathType Leaf)) {
+        throw "V3 native output is missing: $native"
+    }
 }
 finally {
     Pop-Location

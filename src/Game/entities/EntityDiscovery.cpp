@@ -140,7 +140,7 @@ static void AdvancePositiveDiscovery(DiscoveryState& state,DWORD now) {
         if(accepted) {
             ++state.positiveAccepted;
             if(std::find(state.knownLinks.begin(),state.knownLinks.end(),parent)==state.knownLinks.end())state.knownLinks.push_back(parent);
-            Diagnostics::Info("[V2-POSITIVE-DISCOVERY] actor=0x%llX link=0x%llX match=%u hero=0x%llX",
+            Diagnostics::Info("[V3-POSITIVE-DISCOVERY] actor=0x%llX link=0x%llX match=%u hero=0x%llX",
                 proofs.front().address,parent,proofs.front().match,proofs.front().hero);
         }
         state.positive.FinishProbe(parent,accepted,now);
@@ -203,7 +203,7 @@ static void AdvanceDiscovery(DiscoveryState& state) {
         auto pairs=OW::ProbePriorityActor(state.localLink,state.topology,true,&bindings,&complete,&proofs,nullptr,&hotActors,true);
         for(const auto& proof:proofs)if(proof.address!=state.lastLocalIdentity.address ||
             proof.match!=state.lastLocalIdentity.match || proof.hero!=state.lastLocalIdentity.hero) {
-            Diagnostics::Info("[V2-LOCAL-PROBE] actor=0x%llX link=0x%llX hero=0x%llX match=%u binding_complete=%d",
+            Diagnostics::Info("[V3-LOCAL-PROBE] actor=0x%llX link=0x%llX hero=0x%llX match=%u binding_complete=%d",
                 proof.address,proof.link,proof.hero,proof.match,int(complete));
             state.lastLocalIdentity=proof;
         }
@@ -358,7 +358,7 @@ static void AdvanceDiscovery(DiscoveryState& state) {
     }
     const double elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-state.started).count();
     Diagnostics::RecordEntityScanCycle(pairs.size(),elapsed>0?1.0/elapsed:0);
-    Diagnostics::Info("[UNDMA-V2-DISCOVERY] completed=%llu pairs=%zu members=%zu read_complete=%d roster_complete=%d proofs=%zu elapsed_ms=%.1f",
+    Diagnostics::Info("[UNDMA-V3-DISCOVERY] completed=%llu pairs=%zu members=%zu read_complete=%d roster_complete=%d proofs=%zu elapsed_ms=%.1f",
         ++state.completed,pairs.size(),state.topology.members.size(),readComplete,complete,state.validatedProofs.size(),elapsed*1000);
     state.scan.reset();
     state.validating=false;
@@ -375,7 +375,7 @@ void StepAcquisitionDiscovery() {
     static thread_local const char* slowest="idle";
     if(elapsed>maximum){maximum=elapsed;slowest=discoveryOperation;}
     if(started-reportedAt>=std::chrono::seconds(5)) {
-        Diagnostics::Info("[UNDMA-V2-DISCOVERY-TIME] max_ms=%.3f operation=%s positive_members=%zu positive_headers=%zu positive_attempts=%llu positive_index_attempts=%llu positive_accepted=%llu",
+        Diagnostics::Info("[UNDMA-V3-DISCOVERY-TIME] max_ms=%.3f operation=%s positive_members=%zu positive_headers=%zu positive_attempts=%llu positive_index_attempts=%llu positive_accepted=%llu",
             maximum,slowest,state.positive.members.size(),state.positive.entries.size(),
             state.positiveAttempts,state.positiveIndexAttempts,state.positiveAccepted);
         maximum=0;reportedAt=started;

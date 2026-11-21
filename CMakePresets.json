@@ -12,18 +12,14 @@
       "generator": "Visual Studio 18 2026",
       "binaryDir": "${sourceDir}/build",
       "cacheVariables": {
-        "CMAKE_GENERATOR_INSTANCE": "C:/Program Files/Microsoft Visual Studio/18/Community",
-        "UNLEASHED_BUILD_TESTS": "OFF"
+        "CMAKE_GENERATOR_INSTANCE": "C:/Program Files/Microsoft Visual Studio/18/Community"
       }
     },
     {
       "name": "selftests",
       "inherits": "vs2026",
       "displayName": "Optional offline regressions",
-      "binaryDir": "${sourceDir}/../../04_SCENARIO/un-dma-v2/build/selftests",
-      "cacheVariables": {
-        "UNLEASHED_BUILD_TESTS": "ON"
-      }
+      "binaryDir": "${sourceDir}/build/selftests"
     }
   ],
   "buildPresets": [

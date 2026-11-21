@@ -7,7 +7,38 @@
 #include <vector>
 
 namespace OW::ModelShapes {
-struct Shape { int boneId; Vector3 a, b; float radius; };
+enum class CriticalState : uint8_t {
+    Unknown = 0,
+    Ordinary,
+    Critical,
+};
+
+inline const char* CriticalStateName(CriticalState state) {
+    switch (state) {
+        case CriticalState::Ordinary: return "ordinary";
+        case CriticalState::Critical: return "critical";
+        case CriticalState::Unknown: break;
+    }
+    return "unknown";
+}
+
+struct Shape {
+    int boneId = -1;
+    Vector3 a{}, b{};
+    float radius = 0.0f;
+    CriticalState critical = CriticalState::Unknown;
+    // Raw shape-owned activation/critical marker from the native record. A
+    // zero value is an ordinary shape once the field was read successfully.
+    uint64_t criticalRaw = 0;
+};
+
+// 516727's posted hitbox reader treats a successfully read shape marker as a
+// boolean criterion: zero is ordinary and non-zero is critical. Callers must
+// keep Unknown when the field was not read or when the active layout has not
+// been admitted for this version.
+inline CriticalState CriticalStateFromRaw(uint64_t raw) {
+    return raw == 0 ? CriticalState::Ordinary : CriticalState::Critical;
+}
 #include "Game/TracerModelShapes.inl"
 struct Model { uint64_t heroId, modelId; std::span<const Shape> shapes; std::span<const uint32_t> boneIds; };
 #include "Game/HeroModelShapes.inl"
@@ -58,6 +89,13 @@ static_assert(sizeof(Pose)==0x30);
 struct Sample {
     std::vector<Pose> poses;
     std::vector<uint8_t> valid;
+    // Runtime skeleton-array indices are kept separately from the model's source
+    // bone IDs. A -1 entry is an explicitly unbound shape.
+    std::vector<int> shapeMapped;
+    // Shape-owned metadata is independent of the binding result. An empty vector
+    // means the source did not provide this field. Unknown entries preserve an
+    // explicit missing/uncertain value without inventing a label.
+    std::vector<CriticalState> critical;
     int modelIndex=-1;
     uint32_t tick=0;
     uint64_t boneData=0;

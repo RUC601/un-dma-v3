@@ -3,6 +3,7 @@
 #include <d3d11.h>
 #include <imgui.h>
 #include <string>
+#include <span>
 #include <vector>
 #include <cmath>
 #include <cstdint>
@@ -73,6 +74,7 @@ namespace Render {
                      float rotation = 0.0f, int segments = 48, float thickness = 1.0f);
 
     void DrawFilledCircle(const Vector2& center, float radius, const Color& color, int segments = 32);
+    bool DrawFilledConvexPolygon(std::span<const Vector2> clockwise, const Color& color);
 
     void DrawStrokeText(const ImVec2& pos, ImU32 color, const char* text, float fontSize = 15.0f);
     void DrawText(const ImVec2& pos, ImU32 color, const char* text, float fontSize = 15.0f);

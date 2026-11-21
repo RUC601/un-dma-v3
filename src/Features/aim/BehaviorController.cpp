@@ -1131,7 +1131,7 @@ namespace AimbotDetail {
             captureStatus.state==V2::Vision::ServiceState::Faulted?"faulted":"stopped";
         // Keep acquisition evidence distinct from the selected candidate. A zero
         // candidate sequence can mean either missing capture or rejected targets.
-        Diagnostics::Info("[V2 leak-shot] target=0x%llX body=%llu frame=%llu epoch=%llu ageMs=%.1f exposed=%d retained=%d edge=%d inside=%d contact=%d ready=%d hero=0x%llX slot=%d key=%d captureEnabled=%d captureState=%s captureFrame=%llu captureAgeMs=%.1f received=%llu processed=%llu pieces=%zu",
+        Diagnostics::Info("[V3 leak-shot] target=0x%llX body=%llu frame=%llu epoch=%llu ageMs=%.1f exposed=%d retained=%d edge=%d inside=%d contact=%d ready=%d hero=0x%llX slot=%d key=%d captureEnabled=%d captureState=%s captureFrame=%llu captureAgeMs=%.1f received=%llu processed=%llu pieces=%zu",
             static_cast<unsigned long long>(e.identity.entity),static_cast<unsigned long long>(e.identity.body),
             static_cast<unsigned long long>(e.sequence),static_cast<unsigned long long>(e.epoch),
             e.sequence?V2::Vision::MonotonicMs()-e.capturedMs:-1.0,e.exposed?1:0,candidate.contour.retained?1:0,
@@ -1643,7 +1643,7 @@ namespace AimbotDetail {
                 state.releaseAimReportTick=0;state.releaseChargeWaitLogged=false;
                 state.releaseShotLatched=false;ProjectFireCycleShot(state, false);
                 OW::ResetAimSmoothingState();
-                Diagnostics::Info("[V2 shot] release.execute mode=%d slot=%d charge=%.2f chargeMs=%lu",mode,session.slotIndex,
+                Diagnostics::Info("[V3 shot] release.execute mode=%d slot=%d charge=%.2f chargeMs=%lu",mode,session.slotIndex,
                     OW::ReadWeaponChargePercent(LocalEntity(),OW::Config::View_aimbotAttack()),
                     static_cast<unsigned long>(GetTickCount()-state.releaseChargeStarted));
             } else {
@@ -1682,7 +1682,7 @@ namespace AimbotDetail {
         if(!OW::ActionOutputSucceeded(status)) return false;
         state.releaseOwnedDown=true;state.releaseOwnedButton=button;
         state.releaseChargeStarted=GetTickCount();state.releaseOutputGeneration=runtime.generation;
-        Diagnostics::Info("[V2 shot] charge.begin button=%d mode=%d",button,state.releaseMode);return true;
+        Diagnostics::Info("[V3 shot] charge.begin button=%d mode=%d",button,state.releaseMode);return true;
     }
     inline bool SubmitConfiguredAimShot(OW::OutputOwnerSource source,const char* owner,bool requireNewPress,DWORD* submittedAt,
                                         bool releaseAtCrosshair=false) {
@@ -1718,7 +1718,7 @@ namespace AimbotDetail {
                 tuning->minCharge,GetTickCount()-state.releaseChargeStarted,tuning->chargeFallbackMs)) {
                 if(state.releasePending&&!state.releaseChargeWaitLogged) {
                     state.releaseChargeWaitLogged=true;
-                    Diagnostics::Info("[V2 shot] release.wait_charge value=%.2f minimum=%.2f chargeMs=%lu fallbackMs=%.0f",
+                    Diagnostics::Info("[V3 shot] release.wait_charge value=%.2f minimum=%.2f chargeMs=%lu fallbackMs=%.0f",
                         charge,tuning->minCharge,static_cast<unsigned long>(GetTickCount()-state.releaseChargeStarted),tuning->chargeFallbackMs);
                 }
                 return false;
@@ -1743,7 +1743,7 @@ namespace AimbotDetail {
                 state.releasePending=false;chargedAimPreset.reset();
                 state.releaseNeedsActivationUp=IsAimActivationKeyDown();
             }
-            Diagnostics::Info("[V2 shot] submitted action=release automatic=%d button=%d mode=%d",tuning->autoCharge?1:0,button,state.releaseMode);
+            Diagnostics::Info("[V3 shot] submitted action=release automatic=%d button=%d mode=%d",tuning->autoCharge?1:0,button,state.releaseMode);
         }
         return accepted;
     }
@@ -2772,7 +2772,7 @@ namespace AimbotDetail {
         if(SubmitConfiguredAimShot(OW::OutputOwnerSource::GlobalAim,kGlobalAimGeneratedFireOwnerKey,
                                    false,&submittedAt,true)) {
             StampFlickFire(state,submittedAt);MarkAimShot(state);++g_flickFires;
-            Diagnostics::Info("[V2 shot] release.crosshair reason=%s",noTarget?"no_target":"aim_limit");
+            Diagnostics::Info("[V3 shot] release.crosshair reason=%s",noTarget?"no_target":"aim_limit");
         }
         // A rejected submission retains the owned press for cleanup/retry and records no shot.
         return true;
@@ -2784,7 +2784,7 @@ namespace AimbotDetail {
         if(!state.releasePending || (state.releaseAimReportTick && now-state.releaseAimReportTick<100)) return;
         state.releaseAimReportTick=now;
         const float distance=aim.local_pos.DistTo(target);
-        Diagnostics::Info("[V2 shot] release.aim elapsedMs=%lu hit=%d errorDeg=%.4f windowDeg=%.4f charge=%.2f",
+        Diagnostics::Info("[V3 shot] release.aim elapsedMs=%lu hit=%d errorDeg=%.4f windowDeg=%.4f charge=%.2f",
             static_cast<unsigned long>(now-state.releaseActionStarted),hit?1:0,
             RAD2DEG((aim.target_angle-aim.local_angle).Size()),distance>0?RAD2DEG(radius/distance):0,
             OW::ReadWeaponChargePercent(LocalEntity(),OW::Config::View_aimbotAttack()));
@@ -4654,7 +4654,7 @@ namespace AimbotDetail {
             const DWORD now=GetTickCount();
             if(IsAimActivationKeyDown() && (!lastUnsupportedReport || now-lastUnsupportedReport>=1000)) {
                 lastUnsupportedReport=now;
-                Diagnostics::Info("[V2 leak-shot] fallback_unavailable reason=%s; native_visibility_path_remains_active",ContourUnsupportedReason());
+                Diagnostics::Info("[V3 leak-shot] fallback_unavailable reason=%s; native_visibility_path_remains_active",ContourUnsupportedReason());
             }
         }
         MaintainConfiguredAimShot(state);
@@ -4671,7 +4671,7 @@ namespace AimbotDetail {
         if (lastGateReport == 0 || gateNow - lastGateReport >= 5000) {
             lastGateReport = gateNow;
             const auto observedLocal = LocalEntity();
-            Diagnostics::Info("[V2 behavior gates] hero=0x%llX menu=%d tracking=%d flick=%d behavior=%d key=%d input=%d localBody=%d matrix=%d entities=%d dryRun=%d",
+            Diagnostics::Info("[V3 behavior gates] hero=0x%llX menu=%d tracking=%d flick=%d behavior=%d key=%d input=%d localBody=%d matrix=%d entities=%d dryRun=%d",
                 static_cast<unsigned long long>(observedLocal.HeroID), OW::Config::Menu ? 1 : 0,
                 OW::Config::View_Tracking() ? 1 : 0, OW::Config::View_Flick() ? 1 : 0,
                 OW::Config::View_aimBehavior(), OW::Config::View_aim_key(), IsAimKeyPressed() ? 1 : 0,

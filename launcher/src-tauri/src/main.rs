@@ -201,9 +201,9 @@ async fn authorize(app: tauri::AppHandle, username: String) -> Result<(), String
     if !dir.join("config/ui-preferences.json").exists() {
         save_preferences(&prefs()?)?;
     }
-    let binary = dir.join("UNDMA_V2.exe");
+    let binary = dir.join("UNDMA_V3.exe");
     if !binary.is_file() {
-        return Err("UNDMA_V2.exe is missing. Rebuild the portable package.".into());
+        return Err("UNDMA_V3.exe is missing. Rebuild the portable package.".into());
     }
     use std::os::windows::process::CommandExt;
     let mut child = Command::new(binary)

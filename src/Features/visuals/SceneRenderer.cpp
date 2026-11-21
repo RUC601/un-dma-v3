@@ -1,5 +1,6 @@
 #include "features/visuals/EntityVisuals.hpp"
 #include "SceneRenderer.hpp"
+#include "RayScene.hpp"
 #include "Game/Overwatch.hpp"
 #include "Game/map/MapReader.hpp"
 #include "Game/HeroSettings.hpp"
@@ -965,6 +966,7 @@ namespace {
 void V2::Visuals::DrawFrame()
 {
     Diagnostics::RecordFrame();
+    if (V3::RayScene::Draw()) return;
     const bool boxPerfMode = OW::Config::boxPerfMode;
     Diagnostics::BeginRenderWorkloadFrame(boxPerfMode);
 

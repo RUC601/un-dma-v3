@@ -206,6 +206,14 @@ namespace Render {
 
     // ---- DrawFilledCircle ----
 
+    bool DrawFilledConvexPolygon(std::span<const Vector2> clockwise, const Color& color) {
+        auto* draw = DL();
+        if (!draw || color.A == 0 || clockwise.size() < 3) return false;
+        for (const Vector2& p : clockwise) draw->PathLineTo(ToCanvas(p));
+        draw->PathFillConvex(color.ToImU32());
+        return true;
+    }
+
     void DrawFilledCircle(const Vector2& center, float radius, const Color& color, int segments) {
         ImDrawList* d = DL();
         if (!d) return;

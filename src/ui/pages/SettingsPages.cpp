@@ -1,6 +1,8 @@
 #include "ui/FontFile.hpp"
 #include <Windows.h>
 #include <shellapi.h>
+#include <commdlg.h>
+#include "features/visuals/RayScene.hpp"
 
 #include "Features/UI.hpp"
 #include "ui/WorkspaceShell.hpp"
@@ -107,6 +109,31 @@ void UI::MiscPage() {
 // Misc page sections
 // =====================================================================
 void DrawMiscGeneralPage() {
+    const bool zh = OW::Config::uiLanguage == 1;
+    UIGroupBox(zh ? "射线查询" : "Ray queries");
+    SettingRow(zh ? "碰撞检测" : "Collision backend");
+    PushControlWidth();
+    const char* backends[] = {"Native", "Embree", "UniCore"};
+    if (UISelect("##rayBackend", &UI::Preferences::values.rayBackend, backends, 3, false))
+        SetPersistenceStatus(UI::Preferences::Save(), T(UiText::SavedAllChanges));
+    ImGui::PopItemWidth();
+    SettingRow(zh ? "本地场景" : "Local scene");
+    static bool sceneOpenFailed = false;
+    if (ImGui::Button(zh ? "打开文件..." : "Open file...")) {
+        wchar_t path[32768]{};
+        OPENFILENAMEW dialog{};
+        dialog.lStructSize = sizeof(dialog);
+        dialog.hwndOwner = GetActiveWindow();
+        dialog.lpstrFilter = L"Ray scene (*.json)\0*.json\0\0";
+        dialog.lpstrFile = path;
+        dialog.nMaxFile = static_cast<DWORD>(std::size(path));
+        dialog.Flags = OFN_FILEMUSTEXIST | OFN_PATHMUSTEXIST | OFN_NOCHANGEDIR;
+        if (GetOpenFileNameW(&dialog))
+            sceneOpenFailed = !V3::RayScene::Open(path);
+    }
+    if (sceneOpenFailed) ImGui::TextWrapped("%s",zh ? "场景文件无法读取。" : "Could not read the scene file.");
+    CloseGroupBox();
+
     UIGroupBox(T(UiText::GroupConfigProfile));
     {
         static char profileName[kConfigProfileNameBufferSize] = "";

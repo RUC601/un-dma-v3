@@ -47,6 +47,8 @@ bool Load(int legacyLanguage) {
         if (doc.HasMember(name) && doc[name].IsBool()) value = doc[name].GetBool();
     };
     number("language", values.language, 0, 1);
+    if (doc.HasMember("rayBackend") && doc["rayBackend"].IsUint() && doc["rayBackend"].GetUint() < 3)
+        values.rayBackend = doc["rayBackend"].GetInt();
     number("skin", values.skin, 0, 2);
     number("windowWidth", values.windowWidth, 720, 3840);
     number("windowHeight", values.windowHeight, 480, 2160);
@@ -71,6 +73,7 @@ bool Save() {
     w.StartObject();
     w.Key("version"); w.Int(1);
     w.Key("language"); w.Int(std::clamp(values.language, 0, 1));
+    w.Key("rayBackend"); w.Int(values.rayBackend);
     w.Key("skin"); w.Int(std::clamp(values.skin, 0, 2));
     w.Key("reducedMotion"); w.Bool(values.reducedMotion);
     w.Key("loginGlass"); w.Bool(values.loginGlass);

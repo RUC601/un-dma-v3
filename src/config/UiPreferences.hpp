@@ -6,6 +6,7 @@ namespace UI::Preferences {
 struct Values {
     int language = 0;
     int skin = 0;
+    int rayBackend = 0;
     bool reducedMotion = false;
     bool loginGlass = true;
     bool consoleLayers = true;

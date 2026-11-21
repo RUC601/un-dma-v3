@@ -1,7 +1,7 @@
 {
-  "name": "unleashed-v2-launcher",
+  "name": "unleashed-v3-launcher",
   "private": true,
-  "version": "2.0.0",
+  "version": "3.0.0",
   "type": "module",
   "scripts": {
     "build": "vite build",

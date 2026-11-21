@@ -1,12 +1,11 @@
 cmake_minimum_required(VERSION 3.25)
 
-project(Unleashed VERSION 2.0.0 LANGUAGES CXX)
+project(UnleashedV3 VERSION 3.0.0 LANGUAGES CXX)
 
 set(CMAKE_CXX_STANDARD 20)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(UNLEASHED_TEST_SERVER "Build the optional localhost read-only test server" ON)
-option(UNLEASHED_BUILD_TESTS "Build offline regression tests" OFF)
 option(UNLEASHED_OBSERVATION_ONLY "Disable physical output and target writes for visual validation" OFF)
 
 enable_testing()
@@ -51,6 +50,8 @@ set(GAME_HEADERS
     include/output/InputOrchestrator.hpp
     include/Game/LeadPrediction.hpp
     include/Game/Offsets.hpp
+    include/Game/EngineTrace.hpp
+    include/Game/V3Raycast.hpp
     include/Game/Overwatch.hpp
     include/Game/ProductImageIdentity.hpp
     include/output/OutputOwnership.hpp
@@ -146,6 +147,9 @@ set(UNLEASHED_SOURCES
     src/Game/HeroPerkRuntime.cpp
     src/Game/HeroSkills.cpp
     src/Game/Offsets.cpp
+    src/Game/EngineTrace.cpp
+    src/Game/V3Raycast.cpp
+    src/Features/visuals/RayScene.cpp
     src/Game/WeaponCadence.cpp
     src/Game/WeaponSpec.cpp
     vendor/stb/stb_image.cpp
@@ -170,25 +174,25 @@ set(UNLEASHED_SOURCES
 # Executable
 # ============================================================================
 
-add_executable(Unleashed
+add_executable(UnleashedV3
     ${UNLEASHED_SOURCES}
     ${IMGUI_SOURCES}
 )
-set_target_properties(Unleashed PROPERTIES OUTPUT_NAME "UNDMA_V2")
-if(NOT UNLEASHED_BUILD_TESTS)
-    # The desktop product should not launch a foreground console/Terminal window.
-    set_target_properties(Unleashed PROPERTIES WIN32_EXECUTABLE TRUE)
-    target_link_options(Unleashed PRIVATE /ENTRY:mainCRTStartup)
-endif()
+# The desktop product should not launch a foreground console/Terminal window.
+set_target_properties(UnleashedV3 PROPERTIES
+    OUTPUT_NAME "UNDMA_V3"
+    WIN32_EXECUTABLE TRUE
+)
+target_link_options(UnleashedV3 PRIVATE /ENTRY:mainCRTStartup)
 if(UNLEASHED_OBSERVATION_ONLY)
-    target_compile_definitions(Unleashed PRIVATE UNLEASHED_OBSERVATION_ONLY=1)
+    target_compile_definitions(UnleashedV3 PRIVATE UNLEASHED_OBSERVATION_ONLY=1)
 endif()
 
 # ============================================================================
 # Include directories
 # ============================================================================
 
-target_include_directories(Unleashed PRIVATE
+target_include_directories(UnleashedV3 PRIVATE
     src
     include
     vendor/leechcore
@@ -202,7 +206,8 @@ target_include_directories(Unleashed PRIVATE
 # Link libraries
 # ============================================================================
 
-target_link_libraries(Unleashed PRIVATE
+target_link_libraries(UnleashedV3 PRIVATE
+    comdlg32
     UnContourVision
     "${CMAKE_SOURCE_DIR}/vendor/leechcore/leechcore.lib"
     "${CMAKE_SOURCE_DIR}/vendor/leechcore/vmm.lib"
@@ -272,20 +277,20 @@ function(copy_leechcore_runtime target_name)
     )
 endfunction()
 
-copy_leechcore_runtime(Unleashed)
+copy_leechcore_runtime(UnleashedV3)
 
-add_custom_target(V2Assets ALL
+add_custom_target(V3Assets ALL
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_SOURCE_DIR}/assets/icons"
-        "$<TARGET_FILE_DIR:Unleashed>/assets/icons"
+        "$<TARGET_FILE_DIR:UnleashedV3>/assets/icons"
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_SOURCE_DIR}/assets/heroes"
-        "$<TARGET_FILE_DIR:Unleashed>/assets/heroes"
+        "$<TARGET_FILE_DIR:UnleashedV3>/assets/heroes"
     COMMAND ${CMAKE_COMMAND} -E copy_directory
         "${CMAKE_SOURCE_DIR}/assets/ability-icons"
-        "$<TARGET_FILE_DIR:Unleashed>/assets/ability-icons"
-    DEPENDS Unleashed
-    COMMENT "Sync V2 runtime icons and UI/overlay portraits, including asset-only changes"
+        "$<TARGET_FILE_DIR:UnleashedV3>/assets/ability-icons"
+    DEPENDS UnleashedV3
+    COMMENT "Sync V3 runtime icons and UI/overlay portraits, including asset-only changes"
 )
 
 # ============================================================================
@@ -298,18 +303,80 @@ if(MSVC)
         target_link_options(${target_name} PRIVATE "$<$<CONFIG:Release>:/DEBUG:FULL>")
     endfunction()
 
-    enable_release_symbols(Unleashed)
+    enable_release_symbols(UnleashedV3)
 endif()
 
-target_compile_options(Unleashed PRIVATE /W3 /wd4244 /wd4267 /wd4305 /wd4200)
-target_compile_definitions(Unleashed PRIVATE _CRT_SECURE_NO_WARNINGS)
+target_compile_options(UnleashedV3 PRIVATE /W3 /wd4244 /wd4267 /wd4305 /wd4200)
+target_compile_definitions(UnleashedV3 PRIVATE _CRT_SECURE_NO_WARNINGS)
 if(UNLEASHED_TEST_SERVER)
-    target_compile_definitions(Unleashed PRIVATE UNLEASHED_TEST_SERVER=1)
+    target_compile_definitions(UnleashedV3 PRIVATE UNLEASHED_TEST_SERVER=1)
 endif()
 
-if(UNLEASHED_BUILD_TESTS)
-    set(UNLEASHED_TEST_ROOT "${CMAKE_SOURCE_DIR}/../../04_SCENARIO/un-dma-v2" CACHE PATH "Offline regression source root")
-    # Header-level targeting/config consumers use the same vision implementation.
-    link_libraries(UnContourVision)
-    include("${UNLEASHED_TEST_ROOT}/cmake/SelfTests.cmake")
+# V3 raycast geometry and selector regression. This target is pure local/replay
+# work and never opens a game process or an input/output device.
+add_executable(V3RaycastSelfTest
+    tools/v3_raycast_selftest.cpp
+    src/Game/V3Raycast.cpp
+    src/Game/EngineTrace.cpp)
+target_include_directories(V3RaycastSelfTest PRIVATE include vendor/imgui)
+target_compile_definitions(V3RaycastSelfTest PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
+if(MSVC)
+    target_compile_options(V3RaycastSelfTest PRIVATE /W3 /wd4244 /wd4267 /wd4305)
+endif()
+add_test(NAME V3RaycastSelfTest COMMAND V3RaycastSelfTest)
+
+# ============================================================================
+# Optional: UniCore trace bench (experimental, not part of the product binary)
+# ============================================================================
+
+option(UNLEASHED_TRACE_BENCH "Build the UniCore trace bench (requires the Unicorn SDK)" OFF)
+
+if(UNLEASHED_TRACE_BENCH)
+    set(UNICORN_DIR "D:/Desktop/SenseZen/ECS_O/05_SHARED_TOOLS/Unicorn/windows-msvc64-shared"
+        CACHE PATH "Unicorn 2.x MSVC x64 SDK")
+    foreach(required
+            "${UNICORN_DIR}/include/unicorn/unicorn.h"
+            "${UNICORN_DIR}/lib/unicorn.lib"
+            "${CMAKE_SOURCE_DIR}/vendor/leechcore/vmm.lib"
+            "${CMAKE_SOURCE_DIR}/vendor/leechcore/leechcore.lib")
+        if(NOT EXISTS "${required}")
+            message(FATAL_ERROR "UNLEASHED_TRACE_BENCH dependency missing: ${required}")
+        endif()
+    endforeach()
+
+    add_executable(TraceBench
+        tools/trace_bench.cpp
+        tools/trace_bench_offline.cpp
+        src/Game/EngineTrace.cpp
+        src/Game/EngineTrace/UnicornBackend.cpp
+        src/Game/EngineTrace/VisionProbe.cpp
+    )
+    target_include_directories(TraceBench PRIVATE
+        include
+        vendor/leechcore
+        "${UNICORN_DIR}/include")
+    target_compile_definitions(TraceBench PRIVATE _CRT_SECURE_NO_WARNINGS NOMINMAX)
+    target_compile_options(TraceBench PRIVATE /W3 /wd4244 /wd4267)
+    target_link_libraries(TraceBench PRIVATE
+        "${CMAKE_SOURCE_DIR}/vendor/leechcore/vmm.lib"
+        "${CMAKE_SOURCE_DIR}/vendor/leechcore/leechcore.lib"
+        "${UNICORN_DIR}/lib/unicorn.lib"
+        psapi.lib)
+
+    add_custom_command(TARGET TraceBench POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/vendor/leechcore/vmm.dll" "$<TARGET_FILE_DIR:TraceBench>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/vendor/leechcore/leechcore.dll" "$<TARGET_FILE_DIR:TraceBench>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/vendor/leechcore/FTD3XX.dll" "$<TARGET_FILE_DIR:TraceBench>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/vendor/leechcore/FTD3XXWU.dll" "$<TARGET_FILE_DIR:TraceBench>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/vendor/leechcore/Helper64.dll" "$<TARGET_FILE_DIR:TraceBench>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${CMAKE_SOURCE_DIR}/vendor/leechcore/info.db" "$<TARGET_FILE_DIR:TraceBench>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${UNICORN_DIR}/bin/unicorn.dll" "$<TARGET_FILE_DIR:TraceBench>"
+        COMMENT "TraceBench: stage VMM/LeechCore/Unicorn next to the bench")
 endif()

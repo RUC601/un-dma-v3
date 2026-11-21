@@ -204,7 +204,7 @@ void Render(Model& model, const std::function<void()>& save,
     ImGui::SetNextWindowPos(viewport->Pos);
     ImGui::SetNextWindowSize(viewport->Size);
     ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding,ImVec2(20,16));
-    if(ImGui::Begin("UNDMA V2##workspace",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoSavedSettings)) {
+    if(ImGui::Begin("UNDMA V3##workspace",nullptr,ImGuiWindowFlags_NoDecoration|ImGuiWindowFlags_NoMove|ImGuiWindowFlags_NoSavedSettings)) {
         auto* draw=ImGui::GetWindowDrawList();
         const auto origin=ImGui::GetWindowPos();
         const auto size=ImGui::GetWindowSize();
