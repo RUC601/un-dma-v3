@@ -118,13 +118,10 @@ int main(int argc, char** argv) {
     const auto embree = OW::V3Raycast::TraceEmbree(straight, worldShapes);
     std::cout << "embree status=" << OW::V3Raycast::StatusName(embree.status)
               << " nativeDistance=" << std::fixed << std::setprecision(5) << native.distance;
-    if (embree.status == Status::Hit) {
-        std::cout << " embreeDistance=" << embree.distance;
-        if (embree.shapeIndex != native.shapeIndex || !Near(embree.distance, native.distance, 0.08f))
-            return Fail("native and Embree disagree on the same frame");
-    } else if (embree.status != Status::BackendUnavailable) {
-        return Fail("Embree returned an unexpected status");
-    }
+    if (embree.status != Status::Hit) return Fail("Embree runtime unavailable or failed");
+    std::cout << " embreeDistance=" << embree.distance;
+    if (embree.shapeIndex != native.shapeIndex || !Near(embree.distance, native.distance, 0.08f))
+        return Fail("native and Embree disagree on the same frame");
     const auto selectedEmbree = OW::V3Raycast::TraceSelected(Backend::Embree, straight, worldShapes);
     if (selectedEmbree.status != embree.status ||
         (embree.status == Status::Hit && !Near(selectedEmbree.distance, embree.distance, 0.08f))) {
@@ -150,7 +147,6 @@ int main(int argc, char** argv) {
     const WorldShape capsule{{-1,0,5},{1,0,5},0.5f};
     const WorldShape sphere{{0,0,5},{0,0,5},0.5f};
     for (const auto backend : {Backend::NativeHitbox, Backend::Embree}) {
-        if (backend == Backend::Embree && embree.status == Status::BackendUnavailable) continue;
         for (const auto& primitive : {sphere,capsule}) {
             const bool isSphere = primitive.a == primitive.b;
             Query q{{0,0,0},{0,0,1},10,.125f,120};

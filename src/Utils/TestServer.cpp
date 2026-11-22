@@ -13,6 +13,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <charconv>
 #include <cmath>
 #include <cctype>
 #include <cstdio>
@@ -40,6 +41,7 @@
 #include "Utils/Diagnostics.hpp"
 #include "Utils/ProcessConnection.hpp"
 #include "output/Actions.hpp"
+#include "output/FerrumLab.hpp"
 #include "vision/ContourService.hpp"
 
 namespace TestServer {
@@ -1994,6 +1996,8 @@ std::string BuildTestInputJson(const RequestTarget& target, int& statusCode)
     const auto actionIt = target.query.find("action");
     if (actionIt == target.query.end()) return error(400, "Missing diagnostic action");
     const auto& action = actionIt->second;
+    if (V2::Output::FerrumLabMotionEnabled() && action != "move")
+        return error(403, "Ferrum Lab session permits movement only");
     if (action != "left-hold" && action != "mouse-hold" && action != "release" && action != "move")
         return error(400, "Unknown diagnostic action");
     const auto dryIt = target.query.find("dry_run");
@@ -4083,6 +4087,53 @@ std::string BuildTargetHistoryJson(const std::unordered_map<std::string, std::st
     return out.str();
 }
 
+std::string BuildOutputMotionHistoryJson(const RequestTarget& target, int& statusCode)
+{
+    uint64_t after = 0;
+    if (const auto it = target.query.find("after"); it != target.query.end()) {
+        const auto& cursor = it->second;
+        const auto end = cursor.data() + cursor.size();
+        const auto parsed = std::from_chars(cursor.data(), end, after);
+        if (parsed.ec != std::errc{} || parsed.ptr != end) {
+            statusCode = 400;
+            std::ostringstream error;
+            AppendErrorBody(error, statusCode, "after must be an unsigned sequence number");
+            return error.str();
+        }
+    }
+
+    const auto history = OW::OutputMotionTelemetry::SnapshotAfter(after);
+    LARGE_INTEGER frequency{};
+    QueryPerformanceFrequency(&frequency);
+    std::ostringstream out;
+    out.imbue(std::locale::classic());
+    AppendCommonStart(out);
+    out << ",\"timestamp_semantics\":\"output_enqueue_observation_not_device_delivery\""
+        << ",\"qpc_hz\":" << frequency.QuadPart
+        << ",\"oldest_sequence\":" << history.oldestSequence
+        << ",\"latest_sequence\":" << history.latestSequence
+        << ",\"history_gap\":" << (history.oldestSequence > 0 && after < history.oldestSequence - 1 ? "true" : "false")
+        << ",\"cursor_ahead\":" << (after > history.latestSequence ? "true" : "false")
+        << ",\"samples\":[";
+    bool first = true;
+    for (const auto& sample : history.samples) {
+        if (!first) out << ',';
+        first = false;
+        out << "{\"sequence\":" << sample.sequence << ",\"qpc\":" << sample.qpc
+            << ",\"captured_at_ms\":" << sample.capturedAtMs
+            << ",\"count_x\":" << sample.countX << ",\"count_y\":" << sample.countY
+            << ",\"runtime_ms\":" << sample.automoveRuntimeMs << ",\"status\":" << sample.status
+            << ",\"split\":" << (sample.split ? "true" : "false") << ",\"steps\":" << sample.steps
+            << ",\"delta_pitch_rad\":";
+        AppendNumberOrNull(out, sample.deltaPitchRad);
+        out << ",\"delta_yaw_rad\":";
+        AppendNumberOrNull(out, sample.deltaYawRad);
+        out << '}';
+    }
+    out << "]}";
+    return out.str();
+}
+
 std::string BuildJsonForTarget(const RequestTarget& target, int& statusCode)
 {
     statusCode = 200;
@@ -4106,6 +4157,8 @@ std::string BuildJsonForTarget(const RequestTarget& target, int& statusCode)
         return BuildProjectionDebugJson(target.query);
     if (target.path == "/api/target")
         return BuildTargetJson();
+    if (target.path == "/api/output/motion")
+        return BuildOutputMotionHistoryJson(target, statusCode);
     if (target.path == "/api/target/history")
         return BuildTargetHistoryJson(target.query);
 

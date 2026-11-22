@@ -1,5 +1,6 @@
 #include <Windows.h>
 #include "KmTextSession.hpp"
+#include "output/FerrumLab.hpp"
 #include <chrono>
 #include <thread>
 
@@ -23,6 +24,11 @@ bool KmTextSession::ReadInputLocked(SerialChannel& channel, bool allowDeviceErro
         } else if (event.kind == SerialEvent::Kind::BinaryFrame) {
             OnBinaryFrame(event);
         } else {
+            if (FerrumLabMotionEnabled()) {
+                const auto first = event.body.find_first_not_of(" \t\r\n");
+                if (first != std::string::npos && event.body.compare(first, 5, "Axes(") == 0)
+                    continue;
+            }
             if (!allowDeviceError && event.body.find("ERR") != std::string::npos)
                 return false;
             if (responses.size() >= 32) responses.pop_front();

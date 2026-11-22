@@ -169,8 +169,14 @@ struct EmbreeApi {
         if (module) return ready;
         std::vector<std::wstring> paths;
         if (const wchar_t* configured = _wgetenv(L"UNLEASHED_EMBREE_DLL")) paths.emplace_back(configured);
-        paths.emplace_back(L"C:\\EdenDMA\\embree4.dll");
-        paths.emplace_back(L"embree4.dll");
+        wchar_t modulePath[MAX_PATH]{};
+        const DWORD moduleLength = GetModuleFileNameW(nullptr, modulePath, ARRAYSIZE(modulePath));
+        if (moduleLength > 0 && moduleLength < ARRAYSIZE(modulePath)) {
+            std::wstring executablePath(modulePath, moduleLength);
+            const auto separator = executablePath.find_last_of(L"\\/");
+            if (separator != std::wstring::npos)
+                paths.emplace_back(executablePath.substr(0, separator + 1) + L"embree4.dll");
+        }
         for (const auto& path : paths) {
             module = path.find(L'\\') != std::wstring::npos
                 ? LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)

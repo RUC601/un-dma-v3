@@ -4,6 +4,7 @@
 #include "WorkerGroup.hpp"
 #include "Alerts/Service.hpp"
 #include "output/DeviceConnection.hpp"
+#include "output/FerrumLab.hpp"
 #include "Memory/Memory.h"
 #include "Memory/KeyState.hpp"
 #include "Memory/DeviceRecovery.hpp"
@@ -108,9 +109,13 @@ bool StartBackgroundThreads()
             OW::SetRuntimeWorkersRunning(true);
             std::vector<V2::Runtime::Worker> entries{
                 {"acquisition",entity_thread},
-                {"UN behaviors",aimbot_thread},{"configuration",configsavenloadthread},
-                {"hero skills",HeroSkillRuntimeThread}, {"alerts",V2::Alerts::SkillWorker}
             };
+            if (!V2::Output::FerrumLabMotionEnabled()) {
+                entries.push_back({"UN behaviors",aimbot_thread});
+                entries.push_back({"configuration",configsavenloadthread});
+                entries.push_back({"hero skills",HeroSkillRuntimeThread});
+                entries.push_back({"alerts",V2::Alerts::SkillWorker});
+            }
             if(OW::PresentInterpolationEnabled())entries.push_back({"presentation",present_interp_thread});
             g_Workers.Start(entries, [] {
                 OW::SetRuntimeOutputSessionEnabled(false);

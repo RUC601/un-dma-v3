@@ -1,4 +1,5 @@
 #include "output/MotionTelemetry.hpp"
+#include <Windows.h>
 #include <chrono>
 #include <mutex>
 #include <cmath>
@@ -45,6 +46,9 @@ namespace OW::OutputMotionTelemetry {
         Sample sample{};
         sample.sequence = ++Sequence();
         sample.capturedAtMs = nowMs;
+        LARGE_INTEGER counter{};
+        QueryPerformanceCounter(&counter);
+        sample.qpc = static_cast<uint64_t>(counter.QuadPart);
         sample.deltaPitchRad = delta.X;
         sample.deltaYawRad = delta.Y;
         sample.countX = countX;
@@ -71,6 +75,15 @@ namespace OW::OutputMotionTelemetry {
             samples.erase(samples.begin(),
                 samples.begin() + static_cast<std::ptrdiff_t>(samples.size() - kCapacity));
         }
+    }
+
+    SequenceSnapshot SnapshotAfter(uint64_t sequence) {
+        std::lock_guard<std::mutex> lock(Mutex());
+        const auto& samples = Samples();
+        if (samples.empty()) return {};
+        const auto first = std::upper_bound(samples.begin(), samples.end(), sequence,
+            [](uint64_t cursor, const Sample& sample) { return cursor < sample.sequence; });
+        return { samples.front().sequence, samples.back().sequence, {first, samples.end()} };
     }
 
     std::vector<Sample> SnapshotSince(uint64_t capturedAtMs, uint64_t windowMs) {

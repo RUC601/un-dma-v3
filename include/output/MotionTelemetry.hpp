@@ -8,6 +8,7 @@ namespace OW::OutputMotionTelemetry {
     struct Sample {
         uint64_t sequence = 0;
         uint64_t capturedAtMs = 0;
+        uint64_t qpc = 0;
         float deltaPitchRad = 0.0f;
         float deltaYawRad = 0.0f;
         int countX = 0;
@@ -35,6 +36,13 @@ namespace OW::OutputMotionTelemetry {
         int steps);
 
     std::vector<Sample> SnapshotSince(uint64_t capturedAtMs, uint64_t windowMs);
+
+    struct SequenceSnapshot {
+        uint64_t oldestSequence = 0;
+        uint64_t latestSequence = 0;
+        std::vector<Sample> samples;
+    };
+    SequenceSnapshot SnapshotAfter(uint64_t sequence);
 
 
 }

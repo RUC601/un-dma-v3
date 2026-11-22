@@ -8,6 +8,16 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 option(UNLEASHED_TEST_SERVER "Build the optional localhost read-only test server" ON)
 option(UNLEASHED_OBSERVATION_ONLY "Disable physical output and target writes for visual validation" OFF)
 
+set(EMBREE_RUNTIME_DIR "${CMAKE_SOURCE_DIR}/vendor/embree")
+set(EMBREE_RUNTIME_DLLS
+    "${EMBREE_RUNTIME_DIR}/embree4.dll"
+    "${EMBREE_RUNTIME_DIR}/tbb12.dll")
+foreach(embree_runtime_dll IN LISTS EMBREE_RUNTIME_DLLS)
+    if(NOT EXISTS "${embree_runtime_dll}")
+        message(FATAL_ERROR "V3 Embree runtime dependency missing: ${embree_runtime_dll}")
+    endif()
+endforeach()
+
 enable_testing()
 # Product modules are shared by the bounded offline checks.
 include_directories("${CMAKE_SOURCE_DIR}/src")
@@ -277,7 +287,19 @@ function(copy_leechcore_runtime target_name)
     )
 endfunction()
 
+function(copy_embree_runtime target_name)
+    add_custom_command(TARGET ${target_name} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${EMBREE_RUNTIME_DIR}/embree4.dll"
+            "$<TARGET_FILE_DIR:${target_name}>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${EMBREE_RUNTIME_DIR}/tbb12.dll"
+            "$<TARGET_FILE_DIR:${target_name}>"
+        COMMENT "Stage V3 Embree 4.3.3 and TBB runtime")
+endfunction()
+
 copy_leechcore_runtime(UnleashedV3)
+copy_embree_runtime(UnleashedV3)
 
 add_custom_target(V3Assets ALL
     COMMAND ${CMAKE_COMMAND} -E copy_directory
@@ -324,6 +346,7 @@ if(MSVC)
     target_compile_options(V3RaycastSelfTest PRIVATE /W3 /wd4244 /wd4267 /wd4305)
 endif()
 add_test(NAME V3RaycastSelfTest COMMAND V3RaycastSelfTest)
+copy_embree_runtime(V3RaycastSelfTest)
 
 # ============================================================================
 # Optional: UniCore trace bench (experimental, not part of the product binary)
@@ -378,5 +401,9 @@ if(UNLEASHED_TRACE_BENCH)
             "${CMAKE_SOURCE_DIR}/vendor/leechcore/info.db" "$<TARGET_FILE_DIR:TraceBench>"
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${UNICORN_DIR}/bin/unicorn.dll" "$<TARGET_FILE_DIR:TraceBench>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${EMBREE_RUNTIME_DIR}/embree4.dll" "$<TARGET_FILE_DIR:TraceBench>"
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${EMBREE_RUNTIME_DIR}/tbb12.dll" "$<TARGET_FILE_DIR:TraceBench>"
         COMMENT "TraceBench: stage VMM/LeechCore/Unicorn next to the bench")
 endif()

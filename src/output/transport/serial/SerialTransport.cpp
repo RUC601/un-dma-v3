@@ -1,5 +1,6 @@
 #include "SerialTransport.hpp"
 #include "output/OutputServices.hpp"
+#include "output/FerrumLab.hpp"
 #include "Utils/Diagnostics.hpp"
 
 #include <algorithm>
@@ -256,7 +257,14 @@ bool SerialTransport::SendCommandOnce(const std::string& command, bool traceLeft
     {
         std::lock_guard<std::mutex> lock(serialMutex);
         if (hSerial != INVALID_HANDLE_VALUE || writeChunkOverride) {
+            const bool traceMove = V2::Output::FerrumLabMotionEnabled() && command.starts_with("km.move(");
+            const auto before = traceMove ? V2::Output::FerrumLabQpc() : 0;
             written = WriteLocked(command);
+            if (traceMove) {
+                const auto after = V2::Output::FerrumLabQpc();
+                Diagnostics::Info("[LAB-FERRUM] tx %lld %lld %d %.*s", before, after,
+                    written ? 1 : 0, static_cast<int>(command.size()) - 2, command.c_str());
+            }
             sessionOk = written && protocol_.AfterWrite(*this);
         }
     }
@@ -733,8 +741,22 @@ bool SerialTransport::Read(std::string& bytes)
         bytes.clear();
         return true;
     }
+    const bool traceRead = V2::Output::FerrumLabMotionEnabled();
+    const auto before = traceRead ? V2::Output::FerrumLabQpc() : 0;
     if (!ReadFile(hSerial, buffer, (std::min)(DWORD(sizeof(buffer)), stats.cbInQue),
         &count, nullptr)) return false;
+    if (traceRead && count) {
+        const auto after = V2::Output::FerrumLabQpc();
+        constexpr char digits[] = "0123456789abcdef";
+        std::string hex;
+        hex.reserve(count * 2);
+        for (DWORD i = 0; i < count; ++i) {
+            const auto byte = static_cast<unsigned char>(buffer[i]);
+            hex.push_back(digits[byte >> 4]);
+            hex.push_back(digits[byte & 15]);
+        }
+        Diagnostics::Info("[LAB-FERRUM] rx %lld %lld %s", before, after, hex.c_str());
+    }
     bytes.assign(buffer, count);
     return true;
 }
