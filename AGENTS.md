@@ -7,3 +7,7 @@ V3 的状态、实验资料和恢复入口见 [V3 进度](../docs/un-dma-v3/V3_P
 ## 用户指定保留的直接 CD 读取研究（2026-11-05）
 
 `include/Game/DirectCooldownResearch.hpp` 是用户明确要求长期保留、便于分享的完整注释代码档案，记录已跑通的 CN154905N 非本地技能 CD 读取实现、映射及证据。正式版采用 active 状态计时器；该档案不参与编译或运行。禁止 AI 以死代码、实验已退役、清理或精简为由自行删除、缩写或迁出。只有用户明确要求删除此研究成果时才能删除；维护工具或后续重构必须保留注释正文与溯源说明。
+
+## 版本切换 profile 清单
+
+更新 V3 或其支线的版本、地区、offset 或 profile 前，先读 `../docs/VERSION_PROFILE_UPDATE_CHECKLIST.zh-CN.md`。V3 只更新自己的 profile、构建和验证记录，同时记录吸收 V2 的来源提交。游戏分辨率、直接 Viewport、Overlay Canvas、相机投影链、输入缩放、实体发现、context-map/UID 桶和身份守卫必须分别核对，CN、World、Nexon 证据不得互相替代。

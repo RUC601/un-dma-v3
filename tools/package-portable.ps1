@@ -11,6 +11,8 @@ if ($npmVersion -ne $version -or $cargoVersion -ne $version) { throw 'Launcher p
 $runtime=Join-Path $repo 'build\Release'
 $native=Get-Item -LiteralPath (Join-Path $runtime 'UNDMA_V3.exe')
 if ($native.VersionInfo.ProductVersion -ne $version) { throw 'Native and launcher versions differ' }
+$launcher=Get-Item -LiteralPath (Join-Path $runtime 'unleashed-launcher.exe')
+if ($launcher.VersionInfo.ProductVersion -ne $version -or $launcher.VersionInfo.ProductName -ne $config.productName) { throw 'Launcher and package identity differ' }
 $requiredRuntimeDlls=@('embree4.dll','tbb12.dll')
 foreach ($dll in $requiredRuntimeDlls) {
     if (-not (Test-Path -LiteralPath (Join-Path $runtime $dll))) {
@@ -21,7 +23,8 @@ if (-not $OutputDirectory) { $OutputDirectory=Join-Path $repo ('dist\'+$version)
 $output=[IO.Path]::GetFullPath($OutputDirectory)
 if ((Test-Path -LiteralPath $output) -and @(Get-ChildItem -LiteralPath $output -Force).Count) { throw 'Package output must be empty; choose a new directory' }
 New-Item -ItemType Directory -Force $output | Out-Null
-$files=@(Get-ChildItem -LiteralPath $runtime -File | Where-Object { $_.Name -in @('UNDMA_V3.exe','unleashed-launcher.exe','info.db') -or $_.Extension -eq '.dll' })
+$runtimeFiles=@('UNDMA_V3.exe','unleashed-launcher.exe','info.db','embree4.dll','tbb12.dll','FTD2XX.dll','FTD3XX.dll','FTD3XXWU.dll','Helper64.dll','vmsavedstatedumpprovider.dll','leechcore.dll','vmm.dll','leechcore_device_rawtcp.dll','leechcore_device_hvsavedstate.dll','leechcore_driver.dll')
+$files=@(Get-ChildItem -LiteralPath $runtime -File | Where-Object { $_.Name -in $runtimeFiles })
 foreach ($file in $files) { Copy-Item -LiteralPath $file.FullName -Destination $output }
 foreach ($dll in $requiredRuntimeDlls) {
     if (-not (Test-Path -LiteralPath (Join-Path $output $dll))) {

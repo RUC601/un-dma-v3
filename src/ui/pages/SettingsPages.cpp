@@ -131,6 +131,8 @@ void DrawMiscGeneralPage() {
         if (GetOpenFileNameW(&dialog))
             sceneOpenFailed = !V3::RayScene::Open(path);
     }
+    if (V3::RayScene::IsOpen() && ImGui::Button(zh ? "关闭回放，返回实时画面" : "Close replay, return to live"))
+        V3::RayScene::Close();
     if (sceneOpenFailed) ImGui::TextWrapped("%s",zh ? "场景文件无法读取。" : "Could not read the scene file.");
     CloseGroupBox();
 
@@ -293,6 +295,16 @@ void DrawMiscGeneralPage() {
             g_Overlay.MinimizeToTaskbar();
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", T(UiText::TooltipMinimizeOverlay));
+
+        SettingRow(L("Transparent background"));
+        bool transparentBackground = OW::Config::overlayTransparentBackground;
+        if (UICheckbox("##overlayTransparentBackground", &transparentBackground)) {
+            if (!g_Overlay.SetCanvasTransparentBackground(transparentBackground))
+                transparentBackground = g_Overlay.IsCanvasTransparentBackground();
+            OW::Config::overlayTransparentBackground = transparentBackground;
+        }
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", L("Transparent mode shows the game through empty canvas pixels and may reduce canvas throughput."));
 
         SettingRow(L("Overlay frame limit"));
         PushControlWidth();

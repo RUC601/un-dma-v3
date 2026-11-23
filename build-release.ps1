@@ -20,7 +20,7 @@ try {
         exit $LASTEXITCODE
     }
 
-    $native = Join-Path $PSScriptRoot 'build\Release\UNDMA_V3.exe'
+    $native = Join-Path $PSScriptRoot $(if ($Tests) { 'build\selftests\Release\UNDMA_V3.exe' } else { 'build\Release\UNDMA_V3.exe' })
     if (-not (Test-Path -LiteralPath $native -PathType Leaf)) {
         throw "V3 native output is missing: $native"
     }

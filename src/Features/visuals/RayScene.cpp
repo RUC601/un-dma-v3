@@ -13,7 +13,6 @@
 #include <limits>
 #include <memory>
 
-namespace OW { extern float WX, WY; }
 namespace V3::RayScene {
 namespace {
 using namespace OW;
@@ -234,7 +233,7 @@ void DrawShapes(const Scene& input) {
             top = (std::max)(top,vertical(p)+shape.radius);
         }
     }
-    const float width = OW::WX, height = OW::WY;
+    const float width = OW::ScreenWidth(), height = OW::ScreenHeight();
     const float scale = (std::min)(width * .72f / (std::max)(.01f,right-left),
                                   height * .62f / (std::max)(.01f,top-bottom));
     auto project = [&](Vector3 p, Vector2& screen) {
@@ -271,6 +270,19 @@ bool Open(const std::filesystem::path& path) {
     Diagnostics::Info("[RAY-OPEN] scene=%s frame=%llu source=%s",next->id.c_str(),next->frame,path.filename().string().c_str());
     scene = std::move(next);
     return true;
+}
+
+void Close() {
+    if (scene)
+        Diagnostics::Info("[RAY-CLOSE] scene=%s frame=%llu", scene->id.c_str(), scene->frame);
+    scene.reset();
+    lastRuntimeSequence = 0;
+    lastRuntimeProbeTick = 0;
+    lastRuntimeBackend = -1;
+}
+
+bool IsOpen() {
+    return scene != nullptr;
 }
 
 bool Draw() {
