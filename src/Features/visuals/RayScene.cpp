@@ -169,7 +169,7 @@ bool ReadScene(const Json& doc, Scene& out) {
 bool DrawRuntimeProbe() {
     OW::ScopedConsumptionFrame scope;
     const auto& frame = scope.Get();
-    const int selectedValue = (std::clamp)(UI::Preferences::values.rayBackend,0,1);
+    const int selectedValue = UI::Preferences::ActiveRayBackend();
     if (frame.sequence == 0 ||
         (frame.sequence == lastRuntimeSequence && selectedValue == lastRuntimeBackend) ||
         GetTickCount() - lastRuntimeProbeTick < 100) return false;
@@ -290,7 +290,7 @@ bool Draw() {
         DrawRuntimeProbe();
         return false;
     }
-    const int selected = (std::clamp)(UI::Preferences::values.rayBackend,0,1);
+    const int selected = UI::Preferences::ActiveRayBackend();
     if (scene->lastSelection != selected && !scene->hasQuery) {
         scene->lastSelection = selected;
         Diagnostics::Info("[RAY] scene=%s selected=%s call=none result=unknown-data reason=no-recorded-segment",

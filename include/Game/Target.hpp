@@ -37,6 +37,9 @@
 #include "Game/RuntimeState.hpp"
 #include "Game/TrackingContinuityPolicy.hpp"
 #include "Game/TriggerBoneSelection.hpp"
+#include "Game/RayRuntime.hpp"
+#include "Game/V3Raycast.hpp"
+#include "config/UiPreferences.hpp"
 #include "Game/WeaponSpec.hpp"
 #include "output/OutputRuntime.hpp"
 #include "output/Actions.hpp"
@@ -1574,28 +1577,118 @@ namespace OW {
 
     inline RayDecision MakeNativeRayDecision(const c_entity& entity, int boneId,
                                              const Vector3& origin,
-                                             const Vector3& aimPoint,
+                                             const Vector3& rayDirection,
+                                             const Vector3& worldTargetPoint,
                                              const NativeHitWindowInput& input,
                                              uint64_t frame) {
         RayDecision decision{};
         decision.frame = frame;
         decision.connectionEpoch = entity.connection_epoch;
         decision.sceneEpoch = entity.scene_generation;
-        decision.entityKey = StableTargetKey(entity);
+        decision.entityKey = TargetingDetail::StableTargetKey(entity);
         decision.actorGeneration = entity.actor_generation;
         decision.sampleTick = entity.native_hitboxes.tick;
-        if (!NativeHitboxSampleUsable(entity, GetTickCount())) {
+        const uint32_t now = GetTickCount();
+        if (!NativeHitboxSampleUsable(entity, now) || input.projectileRadius < 0.0f) {
             decision.actor = RayDecisionStatus::Unknown;
             return decision;
         }
-        const Vector3 direction = aimPoint - origin;
-        const auto score = NativeHitWindowScore(entity, boneId, GetTickCount(),
-                                                origin, direction, input);
-        if (!score || !std::isfinite(*score)) {
-            decision.actor = RayDecisionStatus::Miss;
+        const auto& sample = entity.native_hitboxes;
+        const float worldScale = (std::min)({
+            sample.world.record.scale[0],
+            sample.world.record.scale[1],
+            sample.world.record.scale[2]});
+        const Vector3 shapeShift = (entity.pos - sample.world.sampleAnchor) + input.displacement;
+        if (!std::isfinite(worldScale) || worldScale <= 0.0f ||
+            !std::isfinite(shapeShift.X) || !std::isfinite(shapeShift.Y) ||
+            !std::isfinite(shapeShift.Z)) {
+            decision.actor = RayDecisionStatus::Unknown;
             return decision;
         }
-        decision.actor = *score <= 1.0f ? RayDecisionStatus::Hit : RayDecisionStatus::Miss;
+        std::vector<V3Raycast::WorldShape> shapes;
+        shapes.reserve(sample.shapes.size());
+        float maxShapeRadius = 0.0f;
+        for (size_t index = 0; index < sample.shapes.size() && index < sample.poses.size(); ++index) {
+            const auto& source = sample.shapes[index];
+            const auto& pose = sample.poses[index];
+            if (source.boneId != boneId || !pose.Valid() ||
+                !std::isfinite(source.radius) || source.radius <= 0.0f) continue;
+            const float poseScale = (std::min)({pose.scale[0], pose.scale[1], pose.scale[2]});
+            if (!std::isfinite(poseScale) || poseScale <= 0.0f) continue;
+            V3Raycast::WorldShape shape{};
+            shape.a = sample.world.TransformPoint(ModelShapes::Transform(source.a, pose)) + shapeShift;
+            shape.b = sample.world.TransformPoint(ModelShapes::Transform(source.b, pose)) + shapeShift;
+            shape.radius = source.radius * poseScale * worldScale;
+            shape.mappedBone = source.boneId;
+            shape.critical = source.critical;
+            if (!std::isfinite(shape.a.X) || !std::isfinite(shape.a.Y) || !std::isfinite(shape.a.Z) ||
+                !std::isfinite(shape.b.X) || !std::isfinite(shape.b.Y) || !std::isfinite(shape.b.Z) ||
+                !std::isfinite(shape.radius) || shape.radius <= 0.0f) continue;
+            maxShapeRadius = (std::max)(maxShapeRadius, shape.radius);
+            shapes.push_back(shape);
+        }
+        if (shapes.empty()) {
+            decision.actor = RayDecisionStatus::Unknown;
+            return decision;
+        }
+        const float clampedScale = Config::ClampHitboxScalePercent(input.hitboxScalePercent);
+        if (input.projectileSpeed > 0.0f) {
+            // Projectile / gravity weapons require the continuous relative-frame
+            // trajectory intersection rather than a straight-line segment.
+            const auto score = NativeHitWindowScore(entity, boneId, now, origin, rayDirection, input);
+            decision.actor = (score && std::isfinite(*score) && *score <= 1.0f)
+                ? RayDecisionStatus::Hit
+                : RayDecisionStatus::Miss;
+        } else {
+            const Vector3 launchDirection = rayDirection + Vector3(0.0f, input.launchUpBias, 0.0f);
+            const float distance = launchDirection.Size();
+            const float safeProjectileRadius = std::isfinite(input.projectileRadius)
+                ? (std::max)(0.0f, input.projectileRadius)
+                : 0.0f;
+            const float maxEffectiveRadius =
+                (maxShapeRadius + safeProjectileRadius) * (clampedScale / 100.0f);
+            const float maxDistance = distance + maxEffectiveRadius + 0.5f;
+            V3Raycast::Query rayQuery{origin, launchDirection, maxDistance,
+                                      safeProjectileRadius, clampedScale};
+            const auto hit = V3Raycast::TraceNative(rayQuery, shapes);
+            decision.actor = hit.status == V3Raycast::Status::Hit
+                ? RayDecisionStatus::Hit
+                : hit.status == V3Raycast::Status::Miss ? RayDecisionStatus::Miss
+                                                        : RayDecisionStatus::Unknown;
+        }
+        if (decision.actor != RayDecisionStatus::Hit)
+            return decision;
+        if (UI::Preferences::ActiveRayBackend() == static_cast<int>(RayDecisionPolicy::NativeOnly)) {
+            decision.world = RayDecisionStatus::Clear;
+            return decision;
+        }
+        if (entity.scene_generation == 0) {
+            decision.world = RayDecisionStatus::Invalid;
+            return decision;
+        }
+
+        RayRuntime::Broker().SetScene(entity.scene_generation);
+        EngineTrace::RayQueryBroker::Query brokerQuery{};
+        brokerQuery.request.start = {origin.X, origin.Y, origin.Z};
+        brokerQuery.request.end = {worldTargetPoint.X, worldTargetPoint.Y, worldTargetPoint.Z};
+        brokerQuery.request.sceneEpoch = entity.scene_generation;
+        brokerQuery.frame = frame;
+        brokerQuery.connectionEpoch = entity.connection_epoch;
+        brokerQuery.sceneEpoch = entity.scene_generation;
+        brokerQuery.entityKey = decision.entityKey;
+        brokerQuery.actorGeneration = decision.actorGeneration;
+        brokerQuery.boneId = boneId;
+        brokerQuery.sampleTick = decision.sampleTick;
+        const auto worldRequest = brokerQuery.request;
+        RayRuntime::Broker().Submit(std::move(brokerQuery));
+        if (const auto world = RayRuntime::Broker().Latest(
+                worldRequest, frame, entity.connection_epoch, entity.scene_generation,
+                decision.entityKey, decision.actorGeneration, boneId, 100)) {
+            decision.world = world->world;
+            decision.ageMs = world->ageMs;
+            decision.latencyUs = world->latencyUs;
+            decision.completedAtUs = world->completedAtUs;
+        }
         return decision;
     }
 
@@ -1868,7 +1961,8 @@ namespace OW {
                             if (!contourFallback && weaponSpec)
                                 next.ray = MakeNativeRayDecision(
                                     entities[i], next.boneId, fovContext.camera,
-                                    next.aimPoint, next.nativeHitWindow, frame.sequence);
+                                    next.predictedAimPoint - fovContext.camera,
+                                    next.predictedAimPoint, next.nativeHitWindow, frame.sequence);
                             if(currentLockedCandidate) { lockedCandidate=next; lockedScore=score; }
                             if(select) { best=std::move(next); origin=score; TarGetIndex=int(i); selectedFovScoreDeg=fovScoreDeg; }
                         }
@@ -1921,6 +2015,13 @@ namespace OW {
         Config::aimbotEffectiveHitWindow = best.valid
             ? best.effectiveHitWindow
             : 0.0f;
+        if (UI::Preferences::ActiveRayBackend() == static_cast<int>(RayDecisionPolicy::Hybrid) &&
+            best.valid && !best.ray.AllowsHybrid()) {
+            best = TargetCandidate{};
+            Config::Targetenemyi = -1;
+            Config::health = 0.0f;
+            Config::aimbotEffectiveHitWindow = 0.0f;
+        }
         TargetingDetail::CommitTargetLockRuntime(
             best,
             origin,
@@ -2116,7 +2217,8 @@ namespace OW {
                         const auto nativeInput = MakeNativeHitWindowInput(
                             lead, weaponSpec->aimClass, hitboxScale);
                         best.ray = MakeNativeRayDecision(
-                            entity, boneId, fovContext.camera, aimPoint,
+                            entity, boneId, fovContext.camera,
+                            fovContext.forward * distance, aimPoint,
                             nativeInput, frame.sequence);
                     }
                 }
@@ -2131,6 +2233,12 @@ namespace OW {
         else
             Config::aimbotEffectiveHitWindow = best.valid ? best.effectiveHitWindow : 0.0f;
 
+        if (UI::Preferences::ActiveRayBackend() == static_cast<int>(RayDecisionPolicy::Hybrid) &&
+            best.valid && !best.ray.AllowsHybrid()) {
+            best = TargetCandidate{};
+            Config::Targetenemyi = -1;
+            Config::health = 0.0f;
+        }
         TargetingDetail::StoreLastTargetCandidate(best);
         Diagnostics::Aim(
             "target.trigger result=%s secondary=%d boneMask=0x%03X entityIndex=%d bone=%d scoreDeg=%.6f hitWindow=%.6f",

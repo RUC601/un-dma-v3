@@ -1,12 +1,17 @@
 #include "Game/V3Raycast.hpp"
+#include "Game/RayDecision.hpp"
+#include "Game/RayQueryBroker.hpp"
 #include "config/RayBackendMigration.hpp"
 
+#include <atomic>
+#include <chrono>
 #include <cmath>
 #include <cstdlib>
 #include <fstream>
 #include <iomanip>
 #include <iostream>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace {
@@ -186,18 +191,184 @@ int main(int argc, char** argv) {
         saved.status = input;
         if (consume(7).status != expected) return Fail("failed world query");
     }
+    if (!OW::RayDecision{OW::RayDecisionStatus::Hit, OW::RayDecisionStatus::Clear}.AllowsHybrid() ||
+        OW::RayDecision{OW::RayDecisionStatus::Hit, OW::RayDecisionStatus::Occluded}.AllowsHybrid() ||
+        OW::RayDecision{OW::RayDecisionStatus::Hit, OW::RayDecisionStatus::Unknown}.AllowsHybrid() ||
+        OW::RayDecision{OW::RayDecisionStatus::Hit, OW::RayDecisionStatus::Stale}.AllowsHybrid() ||
+        OW::RayDecision{OW::RayDecisionStatus::Hit, OW::RayDecisionStatus::Unavailable}.AllowsHybrid() ||
+        OW::RayDecision{OW::RayDecisionStatus::Hit, OW::RayDecisionStatus::Timeout}.AllowsHybrid() ||
+        OW::RayDecision{OW::RayDecisionStatus::Hit, OW::RayDecisionStatus::Invalid}.AllowsHybrid() ||
+        OW::RayDecision{OW::RayDecisionStatus::Miss, OW::RayDecisionStatus::Clear}.AllowsNativeOnly() ||
+        !OW::RayDecisionAllows({OW::RayDecisionStatus::Hit, OW::RayDecisionStatus::Unknown},
+                               static_cast<int>(OW::RayDecisionPolicy::NativeOnly)) ||
+        OW::RayDecisionAllows({OW::RayDecisionStatus::Hit, OW::RayDecisionStatus::Unknown},
+                              static_cast<int>(OW::RayDecisionPolicy::Hybrid)))
+        return Fail("ray decision readiness");
+
+    // RayQueryBroker: async worker-only Service ownership, multi-target/multi-bone cache,
+    // realistic movement drift tolerance, staleness, scene invalidation, and UAF-free Detach.
+    {
+        class ThreadedBackend final : public OW::EngineTrace::IBackend {
+        public:
+            std::atomic<int> activeCalls{0};
+            std::atomic<bool> concurrentViolation{false};
+            std::atomic<bool> traceEntered{false};
+            std::atomic<int> traceDelayMs{0};
+            std::atomic<uint64_t> bindCount{0};
+            std::thread::id bindThreadId{};
+            std::thread::id traceThreadId{};
+
+            const char* Name() const override { return "threaded-fixture"; }
+            bool BindScene(uint64_t epoch) override {
+                if (activeCalls.fetch_add(1) != 0) concurrentViolation.store(true);
+                bindThreadId = std::this_thread::get_id();
+                bindCount.fetch_add(1);
+                activeCalls.fetch_sub(1);
+                return epoch != 0;
+            }
+            void ReleaseScene() override {}
+            OW::EngineTrace::Status Trace(const OW::EngineTrace::Request& req,
+                                          OW::EngineTrace::Result& out) override {
+                if (activeCalls.fetch_add(1) != 0) concurrentViolation.store(true);
+                traceThreadId = std::this_thread::get_id();
+                traceEntered.store(true);
+                const int delay = traceDelayMs.load();
+                if (delay > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+                // Entity B (end.x > 5) is occluded; Entity A is clear.
+                out.fraction = req.end.x > 5.0f ? 0.4f : 1.0f;
+                activeCalls.fetch_sub(1);
+                return OW::EngineTrace::Status::Ok;
+            }
+        } backend;
+
+        OW::EngineTrace::Service brokerService(&backend);
+        OW::EngineTrace::RayQueryBroker broker;
+        const std::thread::id callerThread = std::this_thread::get_id();
+        broker.Start();
+        broker.Attach(&brokerService);
+
+        // sceneEpoch == 0 must be rejected.
+        {
+            OW::EngineTrace::RayQueryBroker::Query zeroScene{};
+            zeroScene.request.start = {0.f, 0.f, 0.f};
+            zeroScene.request.end = {0.f, 0.f, 10.f};
+            zeroScene.request.sceneEpoch = 0;
+            zeroScene.frame = 1;
+            zeroScene.connectionEpoch = 1;
+            zeroScene.sceneEpoch = 0;
+            zeroScene.entityKey = 100;
+            zeroScene.actorGeneration = 1;
+            zeroScene.boneId = 17;
+            broker.Submit(zeroScene);
+            if (broker.Latest(zeroScene.request, 1, 1, 0, 100, 1, 17, 100).has_value())
+                return Fail("broker accepted sceneEpoch 0");
+        }
+
+        broker.SetScene(7);
+        OW::EngineTrace::RayQueryBroker::Query qA{};
+        qA.request.start = {0.f, 1.f, 0.f};
+        qA.request.end = {1.f, 1.f, 10.f};
+        qA.request.sceneEpoch = 7;
+        qA.frame = 10;
+        qA.connectionEpoch = 1;
+        qA.sceneEpoch = 7;
+        qA.entityKey = 0xAA;
+        qA.actorGeneration = 2;
+        qA.boneId = 17;
+
+        OW::EngineTrace::RayQueryBroker::Query qB = qA;
+        qB.request.end = {8.f, 1.f, 10.f};
+        qB.entityKey = 0xBB;
+        qB.boneId = 17;
+
+        OW::EngineTrace::RayQueryBroker::Query qAChest = qA;
+        qAChest.boneId = 5;
+
+        broker.Submit(qA);
+        broker.Submit(qB);
+        broker.Submit(qAChest);
+
+        auto waitResult = [&](const OW::EngineTrace::RayQueryBroker::Query& q,
+                              const OW::EngineTrace::Request& lookupReq,
+                              uint64_t frame, uint32_t maxAgeMs = 500) {
+            for (int attempt = 0; attempt < 100; ++attempt) {
+                if (auto got = broker.Latest(lookupReq, frame, q.connectionEpoch, q.sceneEpoch,
+                                             q.entityKey, q.actorGeneration, q.boneId, maxAgeMs))
+                    return got;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            return std::optional<OW::RayDecision>{};
+        };
+
+        // Multi-target and multi-bone results must all coexist in cache.
+        const auto gotA = waitResult(qA, qA.request, 10);
+        const auto gotB = waitResult(qB, qB.request, 10);
+        const auto gotAChest = waitResult(qAChest, qAChest.request, 10);
+        if (!gotA || gotA->world != OW::RayDecisionStatus::Clear ||
+            !gotB || gotB->world != OW::RayDecisionStatus::Occluded ||
+            !gotAChest || gotAChest->world != OW::RayDecisionStatus::Clear)
+            return Fail("broker multi-target/multi-bone cache");
+
+        // BindScene and Trace must both have run on the worker thread, never on caller thread.
+        if (backend.bindThreadId == callerThread || backend.traceThreadId == callerThread ||
+            backend.bindThreadId != backend.traceThreadId)
+            return Fail("broker did not confine Service calls to worker thread");
+
+        // Realistic movement drift (~15cm) within 0.35m tolerance must still hit cache,
+        // while a blink/teleport (~2m) must miss cache.
+        OW::EngineTrace::Request drifted = qA.request;
+        drifted.start.x += 0.12f;
+        drifted.end.z += 0.15f;
+        const auto gotDrifted = broker.Latest(drifted, 11, 1, 7, 0xAA, 2, 17, 500);
+        if (!gotDrifted || gotDrifted->world != OW::RayDecisionStatus::Clear)
+            return Fail("broker rejected small movement drift");
+        OW::EngineTrace::Request teleported = qA.request;
+        teleported.end.x += 2.0f;
+        if (broker.Latest(teleported, 11, 1, 7, 0xAA, 2, 17, 500).has_value())
+            return Fail("broker reused result past drift tolerance");
+
+        // Expired age must mark world status Stale.
+        std::this_thread::sleep_for(std::chrono::milliseconds(15));
+        const auto stale = broker.Latest(qA.request, 12, 1, 7, 0xAA, 2, 17, 5);
+        if (!stale || stale->world != OW::RayDecisionStatus::Stale)
+            return Fail("broker failed to mark expired result stale");
+
+        // Scene change must immediately invalidate cached entries.
+        broker.SetScene(8);
+        if (broker.Latest(qA.request, 12, 1, 7, 0xAA, 2, 17, 500).has_value())
+            return Fail("broker retained cache across scene change");
+
+        // Detach must synchronously wait for an in-flight Trace so destroying Service is UAF-free.
+        backend.traceDelayMs.store(60);
+        backend.traceEntered.store(false);
+        OW::EngineTrace::RayQueryBroker::Query qSlow = qA;
+        qSlow.request.sceneEpoch = 8;
+        qSlow.sceneEpoch = 8;
+        qSlow.frame = 20;
+        broker.Submit(qSlow);
+        for (int attempt = 0; attempt < 100 && !backend.traceEntered.load(); ++attempt) {
+            std::this_thread::sleep_for(std::chrono::milliseconds(2));
+        }
+        if (!backend.traceEntered.load()) return Fail("slow trace did not start");
+        broker.Detach();
+        if (backend.activeCalls.load() != 0 || backend.concurrentViolation.load())
+            return Fail("broker Detach returned while Service was still in flight");
+
+        broker.Stop();
+    }
+
     // ui-preferences.json rayBackend migration: legacy v1 was 0=Native/1=Embree/2=UniCore,
-    // current v2 is 0=Native/1=UniCore. Legacy Embree must land on Native, not UniCore.
+    // current v2 is 0=Native-only/1=Hybrid. Legacy Embree must land on Native-only.
     {
         using OW_Backend = OW::V3Raycast::Backend;
         struct Case { int version; unsigned saved; bool accepted; int expected; };
         const Case cases[] = {
             {1, 0, true, static_cast<int>(OW_Backend::NativeHitbox)},  // legacy Native
             {1, 1, true, static_cast<int>(OW_Backend::NativeHitbox)},  // legacy Embree -> Native
-            {1, 2, true, static_cast<int>(OW_Backend::UniCore)},       // legacy UniCore
+            {1, 2, true, 1},                                          // legacy UniCore -> Hybrid
             {1, 3, false, -1},                                         // legacy out of range
             {2, 0, true, static_cast<int>(OW_Backend::NativeHitbox)},  // current Native
-            {2, 1, true, static_cast<int>(OW_Backend::UniCore)},       // current UniCore
+            {2, 1, true, 1},                                          // current Hybrid
             {2, 2, false, -1},                                         // current out of range
         };
         for (const auto& c : cases) {

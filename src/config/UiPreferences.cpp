@@ -14,6 +14,7 @@
 #include <rapidjson/writer.h>
 #include <rapidjson/stringbuffer.h>
 #include <algorithm>
+#include <atomic>
 #include <cmath>
 #include <fstream>
 #include <iterator>
@@ -23,10 +24,17 @@ Values values;
 namespace {
 bool loaded = false;
 std::string error;
+std::atomic<int> activeRayBackend{0};
 std::string Path() { return OW::Config::ConfigDirectoryPath() + "/ui-preferences.json"; }
 }
 bool Loaded() { return loaded; }
 const std::string& Error() { return error; }
+int ActiveRayBackend() noexcept { return activeRayBackend.load(std::memory_order_acquire); }
+void SetActiveRayBackend(int value) noexcept {
+    const int clamped = std::clamp(value, 0, kRayBackendCount - 1);
+    values.rayBackend = clamped;
+    activeRayBackend.store(clamped, std::memory_order_release);
+}
 bool Load(int legacyLanguage) {
     if (loaded) return error.empty();
     loaded = true;
@@ -54,7 +62,10 @@ bool Load(int legacyLanguage) {
     number("language", values.language, 0, 1);
     if (doc.HasMember("rayBackend") && doc["rayBackend"].IsUint()) {
         int migrated = 0;
-        if (MigrateRayBackend(fileVersion, doc["rayBackend"].GetUint(), migrated)) values.rayBackend = migrated;
+        if (MigrateRayBackend(fileVersion, doc["rayBackend"].GetUint(), migrated))
+            SetActiveRayBackend(migrated);
+    } else {
+        SetActiveRayBackend(values.rayBackend);
     }
     number("skin", values.skin, 0, 2);
     number("windowWidth", values.windowWidth, 720, 3840);

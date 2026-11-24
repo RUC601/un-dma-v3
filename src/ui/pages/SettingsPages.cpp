@@ -113,9 +113,11 @@ void DrawMiscGeneralPage() {
     UIGroupBox(zh ? "射线查询" : "Ray queries");
     SettingRow(zh ? "碰撞检测" : "Collision backend");
     PushControlWidth();
-    const char* backends[] = {"Native", "UniCore"};
-    if (UISelect("##rayBackend", &UI::Preferences::values.rayBackend, backends, 2, false))
+    const char* backends[] = {"Native-only", "Hybrid"};
+    if (UISelect("##rayBackend", &UI::Preferences::values.rayBackend, backends, 2, false)) {
+        UI::Preferences::SetActiveRayBackend(UI::Preferences::values.rayBackend);
         SetPersistenceStatus(UI::Preferences::Save(), T(UiText::SavedAllChanges));
+    }
     ImGui::PopItemWidth();
     SettingRow(zh ? "本地场景" : "Local scene");
     static bool sceneOpenFailed = false;

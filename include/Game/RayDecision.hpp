@@ -1,6 +1,7 @@
 #pragma once
 
 #include <cstdint>
+#include <chrono>
 
 namespace OW {
 
@@ -34,6 +35,8 @@ struct RayDecision {
     uint64_t actorGeneration = 0;
     uint32_t sampleTick = 0;
     uint32_t ageMs = 0;
+    uint32_t latencyUs = 0;
+    uint64_t completedAtUs = 0;
 
     bool ActorHit() const noexcept { return actor == RayDecisionStatus::Hit; }
     bool WorldClear() const noexcept { return world == RayDecisionStatus::Clear; }
@@ -41,6 +44,17 @@ struct RayDecision {
     bool AllowsNativeOnly() const noexcept { return ActorHit(); }
     bool AllowsHybrid() const noexcept { return ActorHit() && WorldClear() && Fresh(); }
 };
+
+inline bool RayDecisionAllows(const RayDecision& decision, int backend) noexcept {
+    return backend == static_cast<int>(RayDecisionPolicy::Hybrid)
+        ? decision.AllowsHybrid()
+        : decision.AllowsNativeOnly();
+}
+
+inline uint64_t RayDecisionNowUs() noexcept {
+    return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
+        std::chrono::steady_clock::now().time_since_epoch()).count());
+}
 
 inline const char* RayDecisionStatusName(RayDecisionStatus status) noexcept {
     switch (status) {

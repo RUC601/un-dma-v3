@@ -18,6 +18,8 @@ struct Values {
 extern Values values;
 bool Load(int legacyLanguage);
 bool Save();
+int ActiveRayBackend() noexcept;
+void SetActiveRayBackend(int value) noexcept;
 const std::string& Error();
 bool Loaded();
 }

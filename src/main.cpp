@@ -285,6 +285,7 @@ static void LoadRuntimeConfigForDiagnostics()
 #include "Alerts/Service.hpp"
 #include "vision/ContourService.hpp"
 #include "config/ContourSettings.hpp"
+#include "Game/RayRuntime.hpp"
 using V2::Runtime::StartProcessConnectionThread;
 using V2::Runtime::StopProcessConnectionThread;
 using V2::Output::ShutdownOutputRuntime;
@@ -302,6 +303,7 @@ static void ShutdownHeadlessRuntime(const char* reason = "headless_shutdown")
     StopProcessConnectionThread();
     V2::Alerts::Stop();
     V2::Runtime::DrainProcessRuntimeWorkers(reason);
+    OW::RayRuntime::Stop();
     TestServer::Stop();
     KeyState::Stop();
     OW::ProcessConnection::SetStatus(false, false, 0, 0, "Shutting down");
@@ -683,8 +685,12 @@ int main(int argc, char** argv)
             Diagnostics::Warn("--capture-screen could not start capture; inspect capture settings and status.");
     }
     V2::Launcher::Send("{\"event\":\"ready\"}");
-    if (!localScene) StartProcessConnectionThread();
-    else Diagnostics::Info("Local ray scene active; source=%s connector=off", rayScenePath.c_str());
+    if (!localScene) {
+        OW::RayRuntime::Start();
+        StartProcessConnectionThread();
+    } else {
+        Diagnostics::Info("Local ray scene active; source=%s connector=off", rayScenePath.c_str());
+    }
 
     // ---------------------------------------------------------------
     // Step 5 -- Main loop (blocks until overlay / game closes)
@@ -728,6 +734,7 @@ int main(int argc, char** argv)
     Diagnostics::Info("Display closed. Shutting down.");
     Diagnostics::DumpStatus();
     if (localScene) {
+        OW::RayRuntime::Stop();
         Diagnostics::ShutdownAimLog();
         Diagnostics::Shutdown();
         RuntimeTrace::Stop();

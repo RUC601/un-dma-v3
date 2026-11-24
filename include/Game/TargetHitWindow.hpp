@@ -8,6 +8,7 @@
 #include "Game/BoneSlots.hpp"
 #include "Game/HeroGeometrySpec.hpp"
 #include "Game/TriggerBoneSelection.hpp"
+#include "config/UiPreferences.hpp"
 
 namespace OW {
 
@@ -63,6 +64,9 @@ inline bool InSelectedAimHitWindow(const TargetCandidate& candidate,
     if (candidate.ray.actor != RayDecisionStatus::Unknown &&
         candidate.ray.actor != RayDecisionStatus::Hit)
         return false;
+    if (UI::Preferences::ActiveRayBackend() == static_cast<int>(RayDecisionPolicy::Hybrid) &&
+        !candidate.ray.AllowsHybrid())
+        return false;
     if (NativeHitboxSampleUsable(candidate.entitySnapshot, GetTickCount())) {
         const auto score = SelectedAimNativeHitScore(candidate, viewAngle, camera, aimPoint);
         if (!score)
@@ -100,6 +104,9 @@ inline bool InAllowedAimHitWindow(const TargetCandidate& candidate,
         return false;
     if (candidate.ray.actor != RayDecisionStatus::Unknown &&
         candidate.ray.actor != RayDecisionStatus::Hit)
+        return false;
+    if (UI::Preferences::ActiveRayBackend() == static_cast<int>(RayDecisionPolicy::Hybrid) &&
+        !candidate.ray.AllowsHybrid())
         return false;
     if (allowedBoneMask == 0)
         return InSelectedAimHitWindow(candidate, viewAngle, targetAngle, camera, aimPoint);

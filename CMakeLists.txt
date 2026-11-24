@@ -53,6 +53,8 @@ set(GAME_HEADERS
     include/Game/EngineTrace.hpp
     include/Game/V3Raycast.hpp
     include/Game/RayDecision.hpp
+    include/Game/RayQueryBroker.hpp
+    include/Game/RayRuntime.hpp
     include/Game/Overwatch.hpp
     include/Game/ProductImageIdentity.hpp
     include/output/OutputOwnership.hpp
@@ -150,6 +152,8 @@ set(UNLEASHED_SOURCES
     src/Game/Offsets.cpp
     src/Game/EngineTrace.cpp
     src/Game/V3Raycast.cpp
+    src/Game/RayQueryBroker.cpp
+    src/Game/RayRuntime.cpp
     src/Features/visuals/RayScene.cpp
     src/Game/WeaponCadence.cpp
     src/Game/WeaponSpec.cpp
@@ -318,7 +322,8 @@ endif()
 add_executable(V3RaycastSelfTest
     tools/v3_raycast_selftest.cpp
     src/Game/V3Raycast.cpp
-    src/Game/EngineTrace.cpp)
+    src/Game/EngineTrace.cpp
+    src/Game/RayQueryBroker.cpp)
 target_include_directories(V3RaycastSelfTest PRIVATE include vendor/imgui)
 target_compile_definitions(V3RaycastSelfTest PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS)
 if(MSVC)
