@@ -1,6 +1,7 @@
 #define NOMINMAX
 #define _SILENCE_CXX17_ITERATOR_BASE_CLASS_DEPRECATION_WARNING
 #include "UiPreferences.hpp"
+#include "RayBackendMigration.hpp"
 #include "FileTransaction.hpp"
 #include "Utils/Config.hpp"
 #ifdef min
@@ -39,7 +40,11 @@ bool Load(int legacyLanguage) {
     rapidjson::Document doc;
     doc.Parse(data.data(), data.size());
     if (doc.HasParseError() || !doc.IsObject()) { error = "Invalid UI preferences JSON"; return false; }
-    if(doc.HasMember("version")&&(!doc["version"].IsInt()||doc["version"].GetInt()!=1)){error="Invalid UI preferences version";return false;}
+    int fileVersion=kLegacyVersion;
+    if(doc.HasMember("version")){
+        if(!doc["version"].IsInt()||doc["version"].GetInt()<kLegacyVersion||doc["version"].GetInt()>kCurrentVersion){error="Invalid UI preferences version";return false;}
+        fileVersion=doc["version"].GetInt();
+    }
     auto number = [&](const char* name, int& value, int low, int high) {
         if (doc.HasMember(name) && doc[name].IsInt()) value = std::clamp(doc[name].GetInt(), low, high);
     };
@@ -47,8 +52,10 @@ bool Load(int legacyLanguage) {
         if (doc.HasMember(name) && doc[name].IsBool()) value = doc[name].GetBool();
     };
     number("language", values.language, 0, 1);
-    if (doc.HasMember("rayBackend") && doc["rayBackend"].IsUint() && doc["rayBackend"].GetUint() < 3)
-        values.rayBackend = doc["rayBackend"].GetInt();
+    if (doc.HasMember("rayBackend") && doc["rayBackend"].IsUint()) {
+        int migrated = 0;
+        if (MigrateRayBackend(fileVersion, doc["rayBackend"].GetUint(), migrated)) values.rayBackend = migrated;
+    }
     number("skin", values.skin, 0, 2);
     number("windowWidth", values.windowWidth, 720, 3840);
     number("windowHeight", values.windowHeight, 480, 2160);
@@ -71,9 +78,9 @@ bool Save() {
     rapidjson::StringBuffer buffer;
     rapidjson::Writer<rapidjson::StringBuffer> w(buffer);
     w.StartObject();
-    w.Key("version"); w.Int(1);
+    w.Key("version"); w.Int(kCurrentVersion);
     w.Key("language"); w.Int(std::clamp(values.language, 0, 1));
-    w.Key("rayBackend"); w.Int(values.rayBackend);
+    w.Key("rayBackend"); w.Int(std::clamp(values.rayBackend, 0, 1));
     w.Key("skin"); w.Int(std::clamp(values.skin, 0, 2));
     w.Key("reducedMotion"); w.Bool(values.reducedMotion);
     w.Key("loginGlass"); w.Bool(values.loginGlass);

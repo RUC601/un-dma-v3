@@ -2,7 +2,7 @@
   <img src="./assets/unleashed-logo.png" width="96" alt="Unleashed V3 logo" />
   <h1>UNDMA V3 · UniCore</h1>
   <p><strong>Unleashed DMA V3 · Raycast, Multi-Backend Collision &amp; Modular Aim Research Runtime</strong></p>
-  <p>在 V2 可验证四层管线基础上，引入 Native / Embree / UniCore 三后端射线检测、三服碰撞体分类着色与扩展输出模型。</p>
+  <p>在 V2 可验证四层管线基础上，引入 Native / UniCore 双后端射线检测、三服碰撞体分类着色与扩展输出模型。</p>
   <p>
     <a href="./README.en.md">English</a>
     ·
@@ -12,7 +12,7 @@
   </p>
   <p>
     <img src="https://img.shields.io/badge/C%2B%2B-20-111827?style=flat-square&logo=c%2B%2B&logoColor=white" alt="C++20" />
-    <img src="https://img.shields.io/badge/Raycast-Native%20%7C%20Embree%20%7C%20UniCore-E41143?style=flat-square" alt="Raycast Backends" />
+    <img src="https://img.shields.io/badge/Raycast-Native%20%7C%20UniCore-E41143?style=flat-square" alt="Raycast Backends" />
     <img src="https://img.shields.io/badge/Windows-DX11%20%2B%20Tauri-111827?style=flat-square&logo=windows&logoColor=white" alt="Windows DX11 + Tauri" />
     <img src="https://img.shields.io/badge/Regions-CN%20%7C%20World%20%7C%20Nexon-22D3EE?style=flat-square" alt="Regions" />
   </p>
@@ -46,9 +46,8 @@
 V3 将**数据生产**、**几何求交**、**四层瞄准决策**与**设备输出**保持清晰解耦：
 
 - **300 Hz 采集与快照发布**：实体发现、相机合成矩阵、三层 Context Map 解码与原生 Hitbox 几何在同一提交代次发布到只读 `SnapshotFrame`，采集线程与渲染线程完全隔离。
-- **三后端射线与碰撞体服务（V3 核心增量）**：
+- **双后端射线与碰撞体服务（V3 核心增量）**：
   - `Native`：解析几何球体/胶囊求交，零外部依赖；
-  - `Embree`：随包部署 Intel Embree 4.3 BVH 局部对照；
   - `UniCore`：独立场景绑定的 `EngineTrace` + `UnicornBackend` 实验射线服务，并支持 `--ray-scene` 离线场景回放与设置页一键返回实时画面。
 - **三服原生碰撞体分类**：读取球 `+0x28` / 胶囊 `+0x38` 原始字段，区分 `critical`、`ordinary`、`unknown` 三态，支持独立线框/填色 RGBA 自定义。
 - **Overlay 与登录器**：支持不透明黑底或分层透明 Overlay 背景实时切换；Tauri 登录器适配 Win11 原生 Desktop Acrylic 磨砂玻璃与 Win10 无边框暗色玻璃。
@@ -65,7 +64,7 @@ V3 将**数据生产**、**几何求交**、**四层瞄准决策**与**设备输
 ## Key Entry Points
 
 ```text
-include/Game/V3Raycast.hpp              Native / Embree / UniCore unified raycast dispatcher
+include/Game/V3Raycast.hpp              Native / UniCore unified raycast dispatcher
 include/Game/EngineTrace.hpp            Scene-bound EngineTrace contract & UnicornBackend
 include/Game/Target.hpp                 Target eligibility, hit windows & prediction
 src/Features/aim/BehaviorController.cpp Aim behavior state machines & fire gating
@@ -79,7 +78,7 @@ launcher/                               Tauri v2 Acrylic launcher & updater shel
 ## Run Locally
 
 ```powershell
-# 1. 构建原生 Release（含 Embree 4.3 运行时同步）
+# 1. 构建原生 Release
 ./build-release.ps1
 
 # 2. 构建登录器 + 原生程序

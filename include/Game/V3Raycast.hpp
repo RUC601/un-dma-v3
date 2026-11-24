@@ -12,7 +12,6 @@ namespace OW::V3Raycast {
 
 enum class Backend : uint8_t {
     NativeHitbox = 0,
-    Embree,
     UniCore,
 };
 
@@ -79,12 +78,10 @@ const char* StatusName(Status status);
 
 struct TraceCalls {
     unsigned analyticTests = 0;
-    unsigned embreeIntersections = 0;
     unsigned worldRequests = 0;
 };
 
 Hit TraceNative(const Query& query, std::span<const WorldShape> shapes, TraceCalls* calls = nullptr);
-Hit TraceEmbree(const Query& query, std::span<const WorldShape> shapes, TraceCalls* calls = nullptr);
 Hit TraceUniCore(const Query& query, EngineTrace::Service* service, uint64_t sceneEpoch,
                 uint32_t budgetMs = 0, TraceCalls* calls = nullptr);
 Hit TraceSelected(Backend backend, const Query& query, std::span<const WorldShape> shapes,

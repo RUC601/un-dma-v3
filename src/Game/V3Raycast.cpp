@@ -2,13 +2,7 @@
 
 #include <algorithm>
 #include <cmath>
-#include <cstdlib>
 #include <limits>
-#include <string>
-
-#if defined(_WIN32)
-#include <Windows.h>
-#endif
 
 namespace OW::V3Raycast {
 namespace {
@@ -120,99 +114,6 @@ Hit TraceAnalytic(const Query& query, std::span<const WorldShape> shapes, TraceC
     return best;
 }
 
-#if defined(_WIN32)
-struct RTCDeviceTy;
-struct RTCSceneTy;
-struct RTCGeometryTy;
-using RTCDevice = RTCDeviceTy*;
-using RTCScene = RTCSceneTy*;
-using RTCGeometry = RTCGeometryTy*;
-
-enum RTCGeometryType : int { RTC_GEOMETRY_TYPE_ROUND_LINEAR_CURVE = 16, RTC_GEOMETRY_TYPE_SPHERE_POINT = 50 };
-enum RTCBufferType : int { RTC_BUFFER_TYPE_INDEX = 0, RTC_BUFFER_TYPE_VERTEX = 1 };
-enum RTCFormat : int { RTC_FORMAT_UINT = 0x5001, RTC_FORMAT_FLOAT4 = 0x9004 };
-
-struct alignas(16) RTCRay {
-    float org_x, org_y, org_z, tnear;
-    float dir_x, dir_y, dir_z, time;
-    float tfar;
-    unsigned int mask, id, flags;
-};
-struct alignas(16) RTCHit {
-    float Ng_x, Ng_y, Ng_z;
-    float u, v;
-    unsigned int primID, geomID;
-    unsigned int instID[1];
-    unsigned int instPrimID[1];
-};
-// The 4.3.3 build may reserve multiple instance levels. Only the stable prefix is read.
-struct RTCRayHit { RTCRay ray; RTCHit hit; unsigned int instancePadding[256]; };
-
-struct EmbreeApi {
-    HMODULE module = nullptr;
-    RTCDevice (*newDevice)(const char*) = nullptr;
-    void (*releaseDevice)(RTCDevice) = nullptr;
-    RTCScene (*newScene)(RTCDevice) = nullptr;
-    void (*releaseScene)(RTCScene) = nullptr;
-    RTCGeometry (*newGeometry)(RTCDevice, RTCGeometryType) = nullptr;
-    void* (*setNewGeometryBuffer)(RTCGeometry, RTCBufferType, unsigned int, RTCFormat, size_t, size_t) = nullptr;
-    void (*commitGeometry)(RTCGeometry) = nullptr;
-    unsigned int (*attachGeometry)(RTCScene, RTCGeometry) = nullptr;
-    void (*releaseGeometry)(RTCGeometry) = nullptr;
-    void (*commitScene)(RTCScene) = nullptr;
-    void (*intersect1)(RTCScene, RTCRayHit*, void*) = nullptr;
-
-    int (*deviceError)(RTCDevice) = nullptr;
-    intptr_t (*deviceProperty)(RTCDevice,int) = nullptr;
-    bool ready = false;
-    bool Load() {
-        if (module) return ready;
-        std::vector<std::wstring> paths;
-        if (const wchar_t* configured = _wgetenv(L"UNLEASHED_EMBREE_DLL")) paths.emplace_back(configured);
-        wchar_t modulePath[MAX_PATH]{};
-        const DWORD moduleLength = GetModuleFileNameW(nullptr, modulePath, ARRAYSIZE(modulePath));
-        if (moduleLength > 0 && moduleLength < ARRAYSIZE(modulePath)) {
-            std::wstring executablePath(modulePath, moduleLength);
-            const auto separator = executablePath.find_last_of(L"\\/");
-            if (separator != std::wstring::npos)
-                paths.emplace_back(executablePath.substr(0, separator + 1) + L"embree4.dll");
-        }
-        for (const auto& path : paths) {
-            module = path.find(L'\\') != std::wstring::npos
-                ? LoadLibraryExW(path.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH)
-                : LoadLibraryW(path.c_str());
-            if (module) break;
-        }
-        if (!module) return false;
-#define LOAD_EMBREE(member, symbol) \
-        member = reinterpret_cast<decltype(member)>(GetProcAddress(module, #symbol))
-        LOAD_EMBREE(deviceError, rtcGetDeviceError);
-        LOAD_EMBREE(deviceProperty, rtcGetDeviceProperty);
-        LOAD_EMBREE(newDevice, rtcNewDevice);
-        LOAD_EMBREE(releaseDevice, rtcReleaseDevice);
-        LOAD_EMBREE(newScene, rtcNewScene);
-        LOAD_EMBREE(releaseScene, rtcReleaseScene);
-        LOAD_EMBREE(newGeometry, rtcNewGeometry);
-        LOAD_EMBREE(setNewGeometryBuffer, rtcSetNewGeometryBuffer);
-        LOAD_EMBREE(commitGeometry, rtcCommitGeometry);
-        LOAD_EMBREE(attachGeometry, rtcAttachGeometry);
-        LOAD_EMBREE(releaseGeometry, rtcReleaseGeometry);
-        LOAD_EMBREE(commitScene, rtcCommitScene);
-        LOAD_EMBREE(intersect1, rtcIntersect1);
-#undef LOAD_EMBREE
-        ready = deviceError && deviceProperty && newDevice && releaseDevice && newScene && releaseScene && newGeometry &&
-            setNewGeometryBuffer && commitGeometry && attachGeometry && releaseGeometry &&
-            commitScene && intersect1;
-        return ready;
-    }
-};
-
-EmbreeApi& Embree() {
-    static EmbreeApi api;
-    return api;
-}
-#endif
-
 }  // namespace
 
 std::vector<WorldShape> BuildWorldShapes(const ShapeFrame& frame) {
@@ -253,7 +154,6 @@ ShapeVisualState ClassifyVisual(int mappedBone, ModelShapes::CriticalState criti
 const char* BackendName(Backend backend) {
     switch (backend) {
         case Backend::NativeHitbox: return "native-hitbox";
-        case Backend::Embree: return "embree";
         case Backend::UniCore: return "unicore";
     }
     return "unknown";
@@ -275,105 +175,6 @@ const char* StatusName(Status status) {
 
 Hit TraceNative(const Query& query, std::span<const WorldShape> shapes, TraceCalls* calls) {
     return TraceAnalytic(query, shapes, calls);
-}
-
-Hit TraceEmbree(const Query& query, std::span<const WorldShape> shapes, TraceCalls* calls) {
-#if !defined(_WIN32)
-    (void)query; (void)shapes;
-    return {Status::BackendUnavailable};
-#else
-    Vector3 direction{};
-    if (!ValidQuery(query, direction)) return {Status::InvalidInput};
-    if (shapes.empty()) return {Status::UnknownData};
-    auto& api = Embree();
-    if (!api.Load()) return {Status::BackendUnavailable};
-    RTCDevice device = api.newDevice(nullptr);
-    if (!device) return {Status::BackendUnavailable};
-    if (api.deviceProperty(device,0) != 40303) {
-        api.releaseDevice(device);
-        return {Status::BackendUnavailable};
-    }
-    RTCScene scene = api.newScene(device);
-    if (!scene) { api.releaseDevice(device); return {Status::Error}; }
-
-    const auto finish = [&](Hit hit) {
-        api.releaseScene(scene);
-        api.releaseDevice(device);
-        return hit;
-    };
-    if (query.hitboxScalePercent == 0) {
-        Hit miss{Status::Miss}; miss.distance = query.maxDistance;
-        return finish(miss);
-    }
-    int inside = -1;
-    std::vector<unsigned int> geometryToShape;
-    for (size_t index = 0; index < shapes.size(); ++index) {
-        const auto& shape = shapes[index];
-        const float radius = EffectiveRadius(query, shape);
-        if (!ValidShape(shape, radius)) return finish({Status::UnknownData});
-        if (inside < 0 && ContainsOrigin(query.origin, shape.a, shape.b, radius))
-            inside = static_cast<int>(index);
-        const bool sphere = (shape.a - shape.b).Size() <= 1.0e-5f;
-        RTCGeometry geometry = api.newGeometry(device, sphere
-            ? RTC_GEOMETRY_TYPE_SPHERE_POINT : RTC_GEOMETRY_TYPE_ROUND_LINEAR_CURVE);
-        if (!geometry) { api.releaseScene(scene); api.releaseDevice(device); return {Status::Error}; }
-        const size_t vertexCount = sphere ? 1 : 2;
-        auto* vertices = static_cast<float*>(api.setNewGeometryBuffer(
-            geometry, RTC_BUFFER_TYPE_VERTEX, 0, RTC_FORMAT_FLOAT4, sizeof(float) * 4, vertexCount));
-        if (!vertices) {
-            api.releaseGeometry(geometry); api.releaseScene(scene); api.releaseDevice(device);
-            return {Status::Error};
-        }
-        vertices[0] = shape.a.X; vertices[1] = shape.a.Y; vertices[2] = shape.a.Z; vertices[3] = radius;
-        if (!sphere) {
-            vertices[4] = shape.b.X; vertices[5] = shape.b.Y; vertices[6] = shape.b.Z; vertices[7] = radius;
-            auto* indices = static_cast<unsigned int*>(api.setNewGeometryBuffer(
-                geometry, RTC_BUFFER_TYPE_INDEX, 0, RTC_FORMAT_UINT, sizeof(unsigned int), 1));
-            if (!indices) {
-                api.releaseGeometry(geometry); api.releaseScene(scene); api.releaseDevice(device);
-                return {Status::Error};
-            }
-            indices[0] = 0;
-        }
-        api.commitGeometry(geometry);
-        const unsigned int geometryId = api.attachGeometry(scene, geometry);
-        api.releaseGeometry(geometry);
-        if (geometryId == 0xFFFFFFFFu || api.deviceError(device) != 0) return finish({Status::Error});
-        if (geometryId >= geometryToShape.size()) geometryToShape.resize(size_t(geometryId)+1,0xFFFFFFFFu);
-        geometryToShape[geometryId] = static_cast<unsigned int>(index);
-    }
-    if (geometryToShape.empty()) {
-        api.releaseScene(scene); api.releaseDevice(device); return {Status::UnknownData};
-    }
-    api.commitScene(scene);
-    if (api.deviceError(device) != 0) return finish({Status::Error});
-    RTCRayHit rayhit{};
-    rayhit.ray.org_x = query.origin.X; rayhit.ray.org_y = query.origin.Y; rayhit.ray.org_z = query.origin.Z;
-    rayhit.ray.tnear = 0.0f;
-    rayhit.ray.dir_x = direction.X; rayhit.ray.dir_y = direction.Y; rayhit.ray.dir_z = direction.Z;
-    rayhit.ray.time = 0.0f; rayhit.ray.tfar = query.maxDistance; rayhit.ray.mask = 0xFFFFFFFFu;
-    rayhit.ray.id = 0; rayhit.ray.flags = 0;
-    rayhit.hit.geomID = 0xFFFFFFFFu; rayhit.hit.primID = 0xFFFFFFFFu;
-    if (calls) ++calls->embreeIntersections;
-    api.intersect1(scene, &rayhit, nullptr);
-    if (api.deviceError(device) != 0) return finish({Status::Error});
-    if (inside >= 0) return finish({Status::Hit,inside,0,query.origin,EffectiveRadius(query,shapes[inside])});
-    Hit result{Status::Miss};
-    result.distance = query.maxDistance;
-    if (rayhit.hit.geomID != 0xFFFFFFFFu && rayhit.ray.tfar >= 0.0f && rayhit.ray.tfar <= query.maxDistance) {
-        const size_t geometryIndex = rayhit.hit.geomID;
-        if (geometryIndex >= geometryToShape.size() || geometryToShape[geometryIndex] >= shapes.size())
-            return finish({Status::Error});
-        {
-            result.status = Status::Hit;
-            result.shapeIndex = static_cast<int>(geometryToShape[geometryIndex]);
-            result.distance = rayhit.ray.tfar;
-            result.point = query.origin + direction * result.distance;
-            result.effectiveRadius = EffectiveRadius(query, shapes[result.shapeIndex]);
-        }
-    }
-    return finish(result);
-#endif
 }
 
 Hit TraceUniCore(const Query& query, EngineTrace::Service* service, uint64_t sceneEpoch,
@@ -413,8 +214,6 @@ Hit TraceSelected(Backend backend, const Query& query, std::span<const WorldShap
     switch (backend) {
         case Backend::NativeHitbox:
             return TraceNative(query, shapes, calls);
-        case Backend::Embree:
-            return TraceEmbree(query, shapes, calls);
         case Backend::UniCore:
             return TraceUniCore(query, service, sceneEpoch, budgetMs, calls);
     }

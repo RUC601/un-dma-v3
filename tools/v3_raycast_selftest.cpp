@@ -1,4 +1,5 @@
 #include "Game/V3Raycast.hpp"
+#include "config/RayBackendMigration.hpp"
 
 #include <cmath>
 #include <cstdlib>
@@ -114,20 +115,7 @@ int main(int argc, char** argv) {
         !Near(selectedNative.distance, native.distance)) {
         return Fail("native selector dispatch");
     }
-
-    const auto embree = OW::V3Raycast::TraceEmbree(straight, worldShapes);
-    std::cout << "embree status=" << OW::V3Raycast::StatusName(embree.status)
-              << " nativeDistance=" << std::fixed << std::setprecision(5) << native.distance;
-    if (embree.status != Status::Hit) return Fail("Embree runtime unavailable or failed");
-    std::cout << " embreeDistance=" << embree.distance;
-    if (embree.shapeIndex != native.shapeIndex || !Near(embree.distance, native.distance, 0.08f))
-        return Fail("native and Embree disagree on the same frame");
-    const auto selectedEmbree = OW::V3Raycast::TraceSelected(Backend::Embree, straight, worldShapes);
-    if (selectedEmbree.status != embree.status ||
-        (embree.status == Status::Hit && !Near(selectedEmbree.distance, embree.distance, 0.08f))) {
-        return Fail("Embree selector dispatch");
-    }
-    std::cout << '\n';
+    std::cout << "nativeDistance=" << std::fixed << std::setprecision(5) << native.distance << '\n';
 
     const ShapeFrame scaledFrame{shapes, poses, valid, mapped, critical, {}, 1.4512421f};
     const auto scaledShapes = OW::V3Raycast::BuildWorldShapes(scaledFrame);
@@ -146,7 +134,8 @@ int main(int argc, char** argv) {
     // Exercise each primitive independently, including the closed end of the segment.
     const WorldShape capsule{{-1,0,5},{1,0,5},0.5f};
     const WorldShape sphere{{0,0,5},{0,0,5},0.5f};
-    for (const auto backend : {Backend::NativeHitbox, Backend::Embree}) {
+    {
+        const auto backend = Backend::NativeHitbox;
         for (const auto& primitive : {sphere,capsule}) {
             const bool isSphere = primitive.a == primitive.b;
             Query q{{0,0,0},{0,0,1},10,.125f,120};
@@ -197,7 +186,29 @@ int main(int argc, char** argv) {
         saved.status = input;
         if (consume(7).status != expected) return Fail("failed world query");
     }
+    // ui-preferences.json rayBackend migration: legacy v1 was 0=Native/1=Embree/2=UniCore,
+    // current v2 is 0=Native/1=UniCore. Legacy Embree must land on Native, not UniCore.
+    {
+        using OW_Backend = OW::V3Raycast::Backend;
+        struct Case { int version; unsigned saved; bool accepted; int expected; };
+        const Case cases[] = {
+            {1, 0, true, static_cast<int>(OW_Backend::NativeHitbox)},  // legacy Native
+            {1, 1, true, static_cast<int>(OW_Backend::NativeHitbox)},  // legacy Embree -> Native
+            {1, 2, true, static_cast<int>(OW_Backend::UniCore)},       // legacy UniCore
+            {1, 3, false, -1},                                         // legacy out of range
+            {2, 0, true, static_cast<int>(OW_Backend::NativeHitbox)},  // current Native
+            {2, 1, true, static_cast<int>(OW_Backend::UniCore)},       // current UniCore
+            {2, 2, false, -1},                                         // current out of range
+        };
+        for (const auto& c : cases) {
+            int out = -1;
+            const bool ok = UI::Preferences::MigrateRayBackend(c.version, c.saved, out);
+            if (ok != c.accepted || (ok && out != c.expected)) return Fail("rayBackend preference migration");
+        }
+        if (UI::Preferences::kCurrentVersion <= UI::Preferences::kLegacyVersion) return Fail("preference version not bumped");
+    }
+
     if (argc > 1) WriteSvg(argv[1], worldShapes);
-    std::cout << "PASS shapeMapped=bound/unbound critical=unknown/critical/ordinary local+Embree selector\n";
+    std::cout << "PASS shapeMapped=bound/unbound critical=unknown/critical/ordinary local+UniCore selector\n";
     return EXIT_SUCCESS;
 }

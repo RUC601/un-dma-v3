@@ -85,17 +85,14 @@
     <text x="16" y="146" fill="#ff4d79" font-family="Consolas, monospace" font-size="11" font-weight="700">V3 · RAYCAST &amp; UNICORE</text>
     <text x="16" y="165" fill="#f8fafc" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700">Selectable Collision Backends</text>
 
-    <rect x="14" y="176" width="64" height="26" rx="5" fill="#1f2436" stroke="#3b435c"/>
-    <text x="46" y="193" text-anchor="middle" fill="#e2e8f0" font-family="Consolas, monospace" font-size="10.5" font-weight="700">Native</text>
+    <rect x="14" y="176" width="98" height="26" rx="5" fill="#1f2436" stroke="#3b435c"/>
+    <text x="63" y="193" text-anchor="middle" fill="#e2e8f0" font-family="Consolas, monospace" font-size="10.5" font-weight="700">Native</text>
 
-    <rect x="85" y="176" width="64" height="26" rx="5" fill="#182a34" stroke="#0891b2"/>
-    <text x="117" y="193" text-anchor="middle" fill="#38bdf8" font-family="Consolas, monospace" font-size="10.5" font-weight="700">Embree</text>
-
-    <rect x="156" y="176" width="64" height="26" rx="5" fill="#351322" stroke="#e41143"/>
-    <text x="188" y="193" text-anchor="middle" fill="#ff5c84" font-family="Consolas, monospace" font-size="10.5" font-weight="700">UniCore</text>
+    <rect x="122" y="176" width="98" height="26" rx="5" fill="#351322" stroke="#e41143"/>
+    <text x="171" y="193" text-anchor="middle" fill="#ff5c84" font-family="Consolas, monospace" font-size="10.5" font-weight="700">UniCore</text>
 
     <text x="16" y="220" fill="#cbd5e1" font-family="Consolas, monospace" font-size="10">Scene-bound EngineTrace +</text>
-    <text x="16" y="234" fill="#94a3b8" font-family="Consolas, monospace" font-size="10">Embree 4.3 BVH &amp; --ray-scene</text>
+    <text x="16" y="234" fill="#94a3b8" font-family="Consolas, monospace" font-size="10">Analytic Hitbox &amp; --ray-scene</text>
   </g>
 
   <!-- Stage 3: 4-Layer Aim & Behavior -->

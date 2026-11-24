@@ -169,7 +169,7 @@ bool ReadScene(const Json& doc, Scene& out) {
 bool DrawRuntimeProbe() {
     OW::ScopedConsumptionFrame scope;
     const auto& frame = scope.Get();
-    const int selectedValue = (std::clamp)(UI::Preferences::values.rayBackend,0,2);
+    const int selectedValue = (std::clamp)(UI::Preferences::values.rayBackend,0,1);
     if (frame.sequence == 0 ||
         (frame.sequence == lastRuntimeSequence && selectedValue == lastRuntimeBackend) ||
         GetTickCount() - lastRuntimeProbeTick < 100) return false;
@@ -213,9 +213,9 @@ bool DrawRuntimeProbe() {
     const auto selected = static_cast<V3Raycast::Backend>(selectedValue);
     const auto hit = V3Raycast::TraceSelected(selected,query,shapes,nullptr,0,0,&calls);
     lastRuntimeBackend = selectedValue;
-    Diagnostics::Info("[RAY-RUNTIME] sequence=%llu backend=%s analytic=%u rtcIntersect1=%u serviceTrace=%u result=%s shape=%d source=native-hitbox.sample",
+    Diagnostics::Info("[RAY-RUNTIME] sequence=%llu backend=%s analytic=%u serviceTrace=%u result=%s shape=%d source=native-hitbox.sample",
         static_cast<unsigned long long>(frame.sequence),V3Raycast::BackendName(selected),
-        calls.analyticTests,calls.embreeIntersections,calls.worldRequests,V3Raycast::StatusName(hit.status),hit.shapeIndex);
+        calls.analyticTests,calls.worldRequests,V3Raycast::StatusName(hit.status),hit.shapeIndex);
     return false;
 }
 
@@ -290,7 +290,7 @@ bool Draw() {
         DrawRuntimeProbe();
         return false;
     }
-    const int selected = UI::Preferences::values.rayBackend;
+    const int selected = (std::clamp)(UI::Preferences::values.rayBackend,0,1);
     if (scene->lastSelection != selected && !scene->hasQuery) {
         scene->lastSelection = selected;
         Diagnostics::Info("[RAY] scene=%s selected=%s call=none result=unknown-data reason=no-recorded-segment",
@@ -302,11 +302,10 @@ bool Draw() {
         const auto hit = V3Raycast::TraceSelected(backend,scene->query,scene->shapes,&scene->service,scene->epoch,0,&calls);
         scene->lastSelection = selected;
         ++scene->revision;
-        Diagnostics::Info("[RAY] scene=%s frame=%llu epoch=%llu revision=%u selected=%s analytic=%u rtcIntersect1=%u serviceTrace=%u result=%s shape=%d distance=%.8f radius=%.8f reason=%s",
+        Diagnostics::Info("[RAY] scene=%s frame=%llu epoch=%llu revision=%u selected=%s analytic=%u serviceTrace=%u result=%s shape=%d distance=%.8f radius=%.8f reason=%s",
             scene->id.c_str(),scene->frame,scene->epoch,scene->revision,V3Raycast::BackendName(backend),
-            calls.analyticTests,calls.embreeIntersections,calls.worldRequests,V3Raycast::StatusName(hit.status),hit.shapeIndex,hit.distance,hit.effectiveRadius,
+            calls.analyticTests,calls.worldRequests,V3Raycast::StatusName(hit.status),hit.shapeIndex,hit.distance,hit.effectiveRadius,
             backend == V3Raycast::Backend::UniCore ? scene->record.reason :
-            hit.status == V3Raycast::Status::BackendUnavailable ? "embree-runtime-unavailable" :
             hit.status == V3Raycast::Status::UnknownData ? "missing-or-invalid-shapes" : "local-geometry");
     }
     DrawShapes(*scene);

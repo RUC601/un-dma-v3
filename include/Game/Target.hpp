@@ -1539,11 +1539,25 @@ namespace OW {
         bool Passes(const c_entity& e) const {
             if(!active) return true;
             const auto& p=Config::View_aimPlan().selection;
-            return AimPlan::Eligible(p,value,e.HeroID,e.PlayerHealth,e.PlayerHealthMax,TargetingDetail::SelectionVisible(e));
+            return AimPlan::EligiblePreGeometry(p,value,e.HeroID,e.PlayerHealth,e.PlayerHealthMax,TargetingDetail::SelectionVisible(e));
         }
-        bool Preferred(const c_entity& e) const {
+        bool Passes(const c_entity& e, float distance, float angleDeg) const {
+            if(!active) return true;
             const auto& p=Config::View_aimPlan().selection;
-            return active && p.mode==1 && AimPlan::PredicateMatches(p,e.HeroID,e.PlayerHealth,e.PlayerHealthMax,TargetingDetail::SelectionVisible(e));
+            const AimPlan::RuleObservation obs{
+                e.HeroID, e.PlayerHealth, e.PlayerHealthMax,
+                TargetingDetail::SelectionVisible(e), distance, angleDeg};
+            return AimPlan::Eligible(p, value, obs);
+        }
+        bool Preferred(const c_entity& e,
+                       float distance = std::numeric_limits<float>::quiet_NaN(),
+                       float angleDeg = std::numeric_limits<float>::quiet_NaN()) const {
+            if (!active) return false;
+            const auto& p=Config::View_aimPlan().selection;
+            const AimPlan::RuleObservation obs{
+                e.HeroID, e.PlayerHealth, e.PlayerHealthMax,
+                TargetingDetail::SelectionVisible(e), distance, angleDeg};
+            return AimPlan::Preferred(p, obs);
         }
     };
     inline void PublishSelectedAimPlan(const TargetCandidate& candidate) {
@@ -1556,6 +1570,33 @@ namespace OW {
         Config::selectedAimScene=candidate.valid?candidate.entitySnapshot.scene_generation:0;
         Config::selectedAimSample=candidate.valid?(candidate.entitySnapshot.sample_time_us?candidate.entitySnapshot.sample_time_us:uint64_t(candidate.entitySnapshot.anchor_sample_tick_ms)*1000):0;
         static_cast<AimPlan::Motion&>(Config::selectedAimMethod)=Config::selectedAimPlan.motion;
+    }
+
+    inline RayDecision MakeNativeRayDecision(const c_entity& entity, int boneId,
+                                             const Vector3& origin,
+                                             const Vector3& aimPoint,
+                                             const NativeHitWindowInput& input,
+                                             uint64_t frame) {
+        RayDecision decision{};
+        decision.frame = frame;
+        decision.connectionEpoch = entity.connection_epoch;
+        decision.sceneEpoch = entity.scene_generation;
+        decision.entityKey = StableTargetKey(entity);
+        decision.actorGeneration = entity.actor_generation;
+        decision.sampleTick = entity.native_hitboxes.tick;
+        if (!NativeHitboxSampleUsable(entity, GetTickCount())) {
+            decision.actor = RayDecisionStatus::Unknown;
+            return decision;
+        }
+        const Vector3 direction = aimPoint - origin;
+        const auto score = NativeHitWindowScore(entity, boneId, GetTickCount(),
+                                                origin, direction, input);
+        if (!score || !std::isfinite(*score)) {
+            decision.actor = RayDecisionStatus::Miss;
+            return decision;
+        }
+        decision.actor = *score <= 1.0f ? RayDecisionStatus::Hit : RayDecisionStatus::Miss;
+        return decision;
     }
 
     inline float AimRankingFovScale() {
@@ -1661,7 +1702,6 @@ namespace OW {
                 // projectile hero must not lose the candidate merely because
                 // its normal weapon path enables prediction.
                 if(!candidateConfig.Passes(entities[i])) continue;
-                const bool preferred=candidateConfig.Preferred(entities[i]);
                 const bool teamPass = TargetingDetail::TargetTeamMatches(
                     entities[i], Config::View_aimbotTeam(), local_entity);
                 if (TargetingDetail::IsRuntimeTargetValid(entities[i], false) && teamPass) {
@@ -1753,6 +1793,9 @@ namespace OW {
                                 distance,
                                 applyTrackingExitMargin))
                             continue;
+                        if (!candidateConfig.Passes(entities[i], distance, fovScoreDeg))
+                            continue;
+                        const bool preferred = candidateConfig.Preferred(entities[i], distance, fovScoreDeg);
 
                         if (currentLockedCandidate)
                             activeLockCandidateSelectable = true;
@@ -1785,7 +1828,27 @@ namespace OW {
                             next.boneId = candidateBoneId;
                             next.rawAimPoint = rootPosition;
                             next.predictedAimPoint = resolvedAimPoint;
-                            next.aimPoint = fovEvaluation.acceptedAimPoint;
+                            next.effectiveHitWindow = ResolveEffectiveHitWindow(
+                                entities[i],
+                                next.boneId,
+                                weaponSpec,
+                                Config::View_hitbox(),
+                                Config::kLegacyDefaultHitboxRadius,
+                                projectileSpec.projectileRadius);
+                            const Vector3 reverseLateralOffset =
+                                (!contourFallback && !fovEvaluation.acceptedByPrediction && lead.predictionEnabled)
+                                    ? ComputeReverseLateralAimOffset(
+                                          fovContext.camera,
+                                          rootPosition,
+                                          resolvedAimPoint,
+                                          lead.targetVelocity,
+                                          next.effectiveHitWindow,
+                                          projectileSpec.projectileRadius,
+                                          Config::View_hitbox())
+                                    : Vector3{};
+                            next.aimPoint = fovEvaluation.acceptedAimPoint + reverseLateralOffset;
+                            if (reverseLateralOffset.Size() > 0.00001f)
+                                aimViewMatrix.WorldToScreen(next.aimPoint, &Vec2, OW::ScreenSizeSnapshot());
                             next.screenPoint = Vec2;
                             next.distance = distance;
                             next.fovScore = fovScoreDeg;
@@ -1802,13 +1865,10 @@ namespace OW {
                             if (!contourFallback && weaponSpec)
                                 next.nativeHitWindow = MakeNativeHitWindowInput(lead, weaponSpec->aimClass,
                                     Config::View_hitbox());
-                            next.effectiveHitWindow = ResolveEffectiveHitWindow(
-                                entities[i],
-                                next.boneId,
-                                weaponSpec,
-                                Config::View_hitbox(),
-                                Config::kLegacyDefaultHitboxRadius,
-                                projectileSpec.projectileRadius);
+                            if (!contourFallback && weaponSpec)
+                                next.ray = MakeNativeRayDecision(
+                                    entities[i], next.boneId, fovContext.camera,
+                                    next.aimPoint, next.nativeHitWindow, frame.sequence);
                             if(currentLockedCandidate) { lockedCandidate=next; lockedScore=score; }
                             if(select) { best=std::move(next); origin=score; TarGetIndex=int(i); selectedFovScoreDeg=fovScoreDeg; }
                         }
@@ -1827,7 +1887,7 @@ namespace OW {
             best=lockedCandidate; origin=lockedScore; TarGetIndex=best.entityIndex;
         }
         const bool holdAlternateDuringDropout = trackingContinuityEnabled &&
-            (!Config::targetAimPlanEnabled || (planSelection.mode!=2 && planSelection.minHealth==0 && planSelection.maxHealth==0 && Config::View_aimPlan().groups.empty())) &&
+            (!Config::targetAimPlanEnabled || (!AimPlan::HasOnlyFilter(planSelection) && planSelection.minHealth==0 && planSelection.maxHealth==0 && Config::View_aimPlan().groups.empty())) &&
             activeLock.active &&
             activeLock.entityKey != 0 &&
             !activeLockCandidateSelectable &&
@@ -2019,7 +2079,9 @@ namespace OW {
                     if (nativeScore ? *nativeScore > 1.0f : angularScoreDeg > angularWindowDeg + 0.0001f)
                         continue;
                     const float normalizedScore = nativeScore.value_or(fallbackScore);
-                    const bool preferred=candidateConfig.Preferred(entity);
+                    if (!candidateConfig.Passes(entity, distance, angularScoreDeg))
+                        continue;
+                    const bool preferred=candidateConfig.Preferred(entity, distance, angularScoreDeg);
                     if (best.valid && !AimPlan::Better(preferred,normalizedScore,entity.address?entity.address:entity.LinkBase,best.planPreferred,bestNormalizedScore,best.entityKey))
                         continue;
 
@@ -2050,6 +2112,13 @@ namespace OW {
                     best.effectiveHitWindow = hitWindow;
                     best.motion = TargetingDetail::EstimateMotionState(entity, best.screenPoint);
                     best.weaponSpec = weaponSpec;
+                    if (weaponSpec && NativeHitboxSampleUsable(entity, now)) {
+                        const auto nativeInput = MakeNativeHitWindowInput(
+                            lead, weaponSpec->aimClass, hitboxScale);
+                        best.ray = MakeNativeRayDecision(
+                            entity, boneId, fovContext.camera, aimPoint,
+                            nativeInput, frame.sequence);
+                    }
                 }
             }
         }
@@ -2126,12 +2195,16 @@ namespace OW {
                         resolvedPrediction,
                         false);
                     PreditPos = lead.finalAimPoint;
-                    const Vector3 fovPoint = lead.finalAimPoint;
-                    const float distance = TargetingDetail::CameraPosition().DistTo(RootPos);
-                    const float effectiveFovDeg =
-                        Config::ResolveDynamicAimFovForDistance(Config::View_Fov(), distance);
-                    float fovScoreDeg = 0.0f;
-                    if (TargetingDetail::IsWithinFovDeg(fovContext, fovPoint, effectiveFovDeg, &fovScoreDeg)) {
+                    FovGeometry::CandidateFovEvaluation fovEvaluation{};
+                    if (TargetingDetail::EvaluateCandidateFov(
+                            fovContext,
+                            RootPos,
+                            lead.finalAimPoint,
+                            Config::View_Fov(),
+                            &Config::ResolveDynamicAimFovForDistance,
+                            fovEvaluation)) {
+                        const float distance = fovEvaluation.distance;
+                        const float fovScoreDeg = fovEvaluation.scoreDeg;
                         float score;
                         if (Config::View_aimbotPriority() == 0) {
                             score = fovScoreDeg;

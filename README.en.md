@@ -2,7 +2,7 @@
   <img src="./assets/unleashed-logo.png" width="96" alt="Unleashed V3 logo" />
   <h1>UNDMA V3 · UniCore</h1>
   <p><strong>Unleashed DMA V3 · Raycast, Multi-Backend Collision &amp; Modular Aim Research Runtime</strong></p>
-  <p>Built on the verified V2 four-layer pipeline, adding Native / Embree / UniCore raycast backends, tri-class native hitboxes, and pluggable output models.</p>
+  <p>Built on the verified V2 four-layer pipeline, adding Native / UniCore raycast backends, tri-class native hitboxes, and pluggable output models.</p>
   <p>
     <a href="./README.md">简体中文</a>
     ·
@@ -12,7 +12,7 @@
   </p>
   <p>
     <img src="https://img.shields.io/badge/C%2B%2B-20-111827?style=flat-square&logo=c%2B%2B&logoColor=white" alt="C++20" />
-    <img src="https://img.shields.io/badge/Raycast-Native%20%7C%20Embree%20%7C%20UniCore-E41143?style=flat-square" alt="Raycast Backends" />
+    <img src="https://img.shields.io/badge/Raycast-Native%20%7C%20UniCore-E41143?style=flat-square" alt="Raycast Backends" />
     <img src="https://img.shields.io/badge/Windows-DX11%20%2B%20Tauri-111827?style=flat-square&logo=windows&logoColor=white" alt="Windows DX11 + Tauri" />
     <img src="https://img.shields.io/badge/Regions-CN%20%7C%20World%20%7C%20Nexon-22D3EE?style=flat-square" alt="Regions" />
   </p>
@@ -48,7 +48,6 @@ V3 keeps **acquisition**, **geometry intersection**, **four-layer aim decisions*
 - **300 Hz Acquisition &amp; Immutable Snapshots**: Entity discovery, composed view-projection matrices, 3-layer context-map decoding, and native hitbox shapes are published atomically into `SnapshotFrame`.
 - **Multi-Backend Raycast &amp; Collision Service**:
   - `Native`: analytic sphere/capsule ray intersection with zero external dependencies;
-  - `Embree`: bundled Intel Embree 4.3 BVH reference backend;
   - `UniCore`: scene-bound `EngineTrace` + `UnicornBackend` research trace service, paired with `--ray-scene` offline playback and live-view return.
 - **Tri-Class Native Hitboxes**: Reads shape-owned classification fields (`+0x28` sphere / `+0x38` capsule) into `critical`, `ordinary`, and `unknown` with independent wireframe and fill RGBA styling.
 - **Overlay &amp; Launcher**: Runtime-toggleable opaque or transparent DX11 overlay canvas; Tauri v2 launcher with Win11 native Desktop Acrylic glass and Win10 borderless dark glass fallback.
@@ -65,7 +64,7 @@ V3 keeps **acquisition**, **geometry intersection**, **four-layer aim decisions*
 ## Key Entry Points
 
 ```text
-include/Game/V3Raycast.hpp              Native / Embree / UniCore unified raycast dispatcher
+include/Game/V3Raycast.hpp              Native / UniCore unified raycast dispatcher
 include/Game/EngineTrace.hpp            Scene-bound EngineTrace contract & UnicornBackend
 include/Game/Target.hpp                 Target eligibility, hit windows & prediction
 src/Features/aim/BehaviorController.cpp Aim behavior state machines & fire gating
@@ -79,7 +78,7 @@ launcher/                               Tauri v2 Acrylic launcher & updater shel
 ## Run Locally
 
 ```powershell
-# 1. Build native Release (stages bundled Embree 4.3 runtime)
+# 1. Build native Release
 ./build-release.ps1
 
 # 2. Build launcher + native runtime

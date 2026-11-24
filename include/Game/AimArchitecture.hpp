@@ -16,6 +16,7 @@
 #include "Game/AimPlan.hpp"
 #include "Game/ContourTargeting.hpp"
 #include "Game/TargetVisibility.hpp"
+#include "Game/RayDecision.hpp"
 #include "Utils/Types.hpp"
 
 namespace OW {
@@ -218,6 +219,7 @@ struct TargetCandidate {
     EntityMotionState motion{};
     TargetLockPolicy lockPolicy{};
     const WeaponSpec* weaponSpec = nullptr;
+    RayDecision ray{};
 };
 
 inline PredictionOverrideMode ClampPredictionOverride(int value)
