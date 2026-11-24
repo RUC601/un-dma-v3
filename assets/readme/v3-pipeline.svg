@@ -1,0 +1,161 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 1120 430" width="1120" height="430" role="img" aria-label="UNDMA V3 UniCore architecture pipeline">
+  <defs>
+    <linearGradient id="bg" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0b0d13"/>
+      <stop offset="55%" stop-color="#111420"/>
+      <stop offset="100%" stop-color="#0b0c11"/>
+    </linearGradient>
+    <linearGradient id="crimsonBar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#e41143"/>
+      <stop offset="100%" stop-color="#ff3b6b"/>
+    </linearGradient>
+    <linearGradient id="cyanBar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#06b6d4"/>
+      <stop offset="100%" stop-color="#38bdf8"/>
+    </linearGradient>
+    <linearGradient id="amberBar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#d97706"/>
+      <stop offset="100%" stop-color="#fbbf24"/>
+    </linearGradient>
+    <linearGradient id="violetBar" x1="0" y1="0" x2="1" y2="0">
+      <stop offset="0%" stop-color="#7c3aed"/>
+      <stop offset="100%" stop-color="#a78bfa"/>
+    </linearGradient>
+    <marker id="arrowCrimson" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#e41143"/>
+    </marker>
+    <marker id="arrowCyan" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#22d3ee"/>
+    </marker>
+    <marker id="arrowSlate" viewBox="0 0 10 10" refX="8" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse">
+      <path d="M 0 1.5 L 9 5 L 0 8.5 z" fill="#64748b"/>
+    </marker>
+  </defs>
+
+  <rect width="1120" height="430" rx="14" fill="url(#bg)"/>
+  <rect x="0.75" y="0.75" width="1118.5" height="428.5" rx="13.5" fill="none" stroke="#262c3d" stroke-width="1.5"/>
+
+  <!-- Subtle Grid Dots -->
+  <g fill="#ffffff" fill-opacity="0.04">
+    <circle cx="40" cy="40" r="1.2"/><circle cx="120" cy="40" r="1.2"/><circle cx="200" cy="40" r="1.2"/>
+    <circle cx="920" cy="40" r="1.2"/><circle cx="1000" cy="40" r="1.2"/><circle cx="1080" cy="40" r="1.2"/>
+    <circle cx="40" cy="390" r="1.2"/><circle cx="1080" cy="390" r="1.2"/>
+  </g>
+
+  <!-- Header -->
+  <text x="28" y="34" fill="#e41143" font-family="Segoe UI, Arial, sans-serif" font-size="11" font-weight="700" letter-spacing="2.2">UNDMA V3 · UNICORE RUNTIME ARCHITECTURE</text>
+  <text x="1092" y="34" text-anchor="end" fill="#64748b" font-family="Consolas, monospace" font-size="11">CN · World · Nexon  |  300 Hz Acquisition  |  Multi-Backend Raycast</text>
+  <line x1="28" y1="46" x2="1092" y2="46" stroke="#1e2433" stroke-width="1"/>
+
+  <!-- Stage 1: DMA Acquisition -->
+  <g transform="translate(28, 66)">
+    <rect width="230" height="248" rx="10" fill="#141824" stroke="#283044" stroke-width="1.2"/>
+    <rect width="230" height="4" rx="2" fill="url(#cyanBar)"/>
+    <text x="16" y="28" fill="#22d3ee" font-family="Consolas, monospace" font-size="11" font-weight="700">01 · ACQUISITION (300 Hz)</text>
+    <text x="16" y="47" fill="#f1f5f9" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700">DMA Producer &amp; Profiles</text>
+
+    <rect x="14" y="62" width="202" height="44" rx="6" fill="#0d1018" stroke="#222838"/>
+    <text x="24" y="80" fill="#e2e8f0" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600">Camera &amp; Viewport Chain</text>
+    <text x="24" y="96" fill="#94a3b8" font-family="Consolas, monospace" font-size="10.5">View × NormProj · GameRes</text>
+
+    <rect x="14" y="114" width="202" height="54" rx="6" fill="#0d1018" stroke="#222838"/>
+    <text x="24" y="132" fill="#e2e8f0" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600">Entity Discovery &amp; Context Map</text>
+    <text x="24" y="148" fill="#94a3b8" font-family="Consolas, monospace" font-size="10.5">3-layer decode · epoch / gen</text>
+    <text x="24" y="161" fill="#64748b" font-family="Consolas, monospace" font-size="10">100ms body · 13s seat guard</text>
+
+    <rect x="14" y="176" width="202" height="58" rx="6" fill="#0d1018" stroke="#3b1d2b"/>
+    <text x="24" y="194" fill="#ff4d79" font-family="Segoe UI, Arial, sans-serif" font-size="12" font-weight="600">Native Hitbox &amp; QST Geometry</text>
+    <text x="24" y="210" fill="#cbd5e1" font-family="Consolas, monospace" font-size="10.5">Spheres + Capsules + PoseTick</text>
+    <text x="24" y="224" fill="#94a3b8" font-family="Consolas, monospace" font-size="10">critical / ordinary / unknown</text>
+  </g>
+
+  <!-- Stage 2: Shared Snapshot + Raycast Service -->
+  <g transform="translate(296, 66)">
+    <!-- Top box: Snapshot -->
+    <rect width="234" height="104" rx="10" fill="#141824" stroke="#283044" stroke-width="1.2"/>
+    <rect width="234" height="4" rx="2" fill="url(#violetBar)"/>
+    <text x="16" y="28" fill="#a78bfa" font-family="Consolas, monospace" font-size="11" font-weight="700">02 · IMMUTABLE BUS</text>
+    <text x="16" y="47" fill="#f1f5f9" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700">Shared SnapshotFrame</text>
+    <text x="16" y="68" fill="#94a3b8" font-family="Consolas, monospace" font-size="10.5">Atomic camera + entity publish</text>
+    <text x="16" y="85" fill="#94a3b8" font-family="Consolas, monospace" font-size="10.5">Optional 120 Hz presentation</text>
+
+    <!-- Bottom box: V3 Raycast & UniCore -->
+    <rect y="118" width="234" height="130" rx="10" fill="#18131d" stroke="#5b1b32" stroke-width="1.3"/>
+    <rect y="118" width="234" height="4" rx="2" fill="url(#crimsonBar)"/>
+    <text x="16" y="146" fill="#ff4d79" font-family="Consolas, monospace" font-size="11" font-weight="700">V3 · RAYCAST &amp; UNICORE</text>
+    <text x="16" y="165" fill="#f8fafc" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700">Selectable Collision Backends</text>
+
+    <rect x="14" y="176" width="64" height="26" rx="5" fill="#1f2436" stroke="#3b435c"/>
+    <text x="46" y="193" text-anchor="middle" fill="#e2e8f0" font-family="Consolas, monospace" font-size="10.5" font-weight="700">Native</text>
+
+    <rect x="85" y="176" width="64" height="26" rx="5" fill="#182a34" stroke="#0891b2"/>
+    <text x="117" y="193" text-anchor="middle" fill="#38bdf8" font-family="Consolas, monospace" font-size="10.5" font-weight="700">Embree</text>
+
+    <rect x="156" y="176" width="64" height="26" rx="5" fill="#351322" stroke="#e41143"/>
+    <text x="188" y="193" text-anchor="middle" fill="#ff5c84" font-family="Consolas, monospace" font-size="10.5" font-weight="700">UniCore</text>
+
+    <text x="16" y="220" fill="#cbd5e1" font-family="Consolas, monospace" font-size="10">Scene-bound EngineTrace +</text>
+    <text x="16" y="234" fill="#94a3b8" font-family="Consolas, monospace" font-size="10">Embree 4.3 BVH &amp; --ray-scene</text>
+  </g>
+
+  <!-- Stage 3: 4-Layer Aim & Behavior -->
+  <g transform="translate(568, 66)">
+    <rect width="248" height="248" rx="10" fill="#141824" stroke="#283044" stroke-width="1.2"/>
+    <rect width="248" height="4" rx="2" fill="url(#crimsonBar)"/>
+    <text x="16" y="28" fill="#ff4d79" font-family="Consolas, monospace" font-size="11" font-weight="700">03 · 4-LAYER DECISION CORE</text>
+    <text x="16" y="47" fill="#f1f5f9" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700">Target · Behavior · Motion</text>
+
+    <rect x="14" y="60" width="220" height="38" rx="6" fill="#0d1018" stroke="#222838"/>
+    <text x="24" y="76" fill="#fbbf24" font-family="Consolas, monospace" font-size="11" font-weight="700">L1 Target &amp; Ballistics</text>
+    <text x="24" y="91" fill="#94a3b8" font-family="Consolas, monospace" font-size="10">Eligibility · Lead · Continuous Hitbox</text>
+
+    <rect x="14" y="105" width="220" height="38" rx="6" fill="#0d1018" stroke="#222838"/>
+    <text x="24" y="121" fill="#ff4d79" font-family="Consolas, monospace" font-size="11" font-weight="700">L2 Behavior State Machine</text>
+    <text x="24" y="136" fill="#94a3b8" font-family="Consolas, monospace" font-size="10">Track · Flick · 2nd · Reacquire · Mag</text>
+
+    <rect x="14" y="150" width="220" height="38" rx="6" fill="#0d1018" stroke="#222838"/>
+    <text x="24" y="166" fill="#38bdf8" font-family="Consolas, monospace" font-size="11" font-weight="700">L3 Motion Controllers</text>
+    <text x="24" y="181" fill="#94a3b8" font-family="Consolas, monospace" font-size="10">PID · Hybrid · Shuwu · Koi · Curve</text>
+
+    <rect x="14" y="195" width="220" height="40" rx="6" fill="#0d1018" stroke="#222838"/>
+    <text x="24" y="211" fill="#34d399" font-family="Consolas, monospace" font-size="11" font-weight="700">L4 Count Conversion</text>
+    <text x="24" y="226" fill="#94a3b8" font-family="Consolas, monospace" font-size="10">UN (rad) · ED (sin-Y) · PURE (px)</text>
+  </g>
+
+  <!-- Stage 4: Output Devices & Overlay -->
+  <g transform="translate(854, 66)">
+    <!-- Output -->
+    <rect width="238" height="122" rx="10" fill="#141824" stroke="#283044" stroke-width="1.2"/>
+    <rect width="238" height="4" rx="2" fill="url(#amberBar)"/>
+    <text x="16" y="28" fill="#fbbf24" font-family="Consolas, monospace" font-size="11" font-weight="700">04 · OUTPUT LAYER</text>
+    <text x="16" y="47" fill="#f1f5f9" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700">Multi-Device Scheduler</text>
+    <text x="16" y="68" fill="#cbd5e1" font-family="Consolas, monospace" font-size="10.5">KMBox Net/Serial · MAKCU</text>
+    <text x="16" y="84" fill="#cbd5e1" font-family="Consolas, monospace" font-size="10.5">Ferrum · CatBox · DHZ · Mock</text>
+    <text x="16" y="103" fill="#64748b" font-family="Consolas, monospace" font-size="10">Identity gate · residual · safe release</text>
+
+    <!-- Overlay -->
+    <rect y="136" width="238" height="112" rx="10" fill="#141824" stroke="#283044" stroke-width="1.2"/>
+    <rect y="136" width="238" height="4" rx="2" fill="url(#cyanBar)"/>
+    <text x="16" y="164" fill="#22d3ee" font-family="Consolas, monospace" font-size="11" font-weight="700">05 · PRESENTATION</text>
+    <text x="16" y="183" fill="#f1f5f9" font-family="Segoe UI, Arial, sans-serif" font-size="14" font-weight="700">DX11 / ImGui Overlay</text>
+    <text x="16" y="203" fill="#cbd5e1" font-family="Consolas, monospace" font-size="10.5">Opaque or Transparent backdrop</text>
+    <text x="16" y="220" fill="#94a3b8" font-family="Consolas, monospace" font-size="10">Tri-class hitboxes · Contour · HUD</text>
+    <text x="16" y="236" fill="#64748b" font-family="Consolas, monospace" font-size="10">Tauri Acrylic Launcher + TestServer</text>
+  </g>
+
+  <!-- Arrows -->
+  <line x1="258" y1="118" x2="294" y2="118" stroke="#22d3ee" stroke-width="2" marker-end="url(#arrowCyan)"/>
+  <line x1="258" y1="248" x2="294" y2="248" stroke="#e41143" stroke-width="2" marker-end="url(#arrowCrimson)"/>
+  <line x1="530" y1="118" x2="566" y2="118" stroke="#22d3ee" stroke-width="2" marker-end="url(#arrowCyan)"/>
+  <line x1="530" y1="248" x2="566" y2="248" stroke="#e41143" stroke-width="2" marker-end="url(#arrowCrimson)"/>
+  <line x1="816" y1="128" x2="852" y2="128" stroke="#e41143" stroke-width="2" marker-end="url(#arrowCrimson)"/>
+  <path d="M 530 96 C 550 96, 540 342, 700 342 L 973 342 L 973 318" fill="none" stroke="#64748b" stroke-width="1.6" stroke-dasharray="5 4" marker-end="url(#arrowSlate)"/>
+
+  <!-- Bottom Telemetry & Lab Strip -->
+  <g transform="translate(28, 356)">
+    <rect width="1064" height="50" rx="8" fill="#0e111a" stroke="#202636" stroke-width="1"/>
+    <text x="18" y="21" fill="#e41143" font-family="Consolas, monospace" font-size="11" font-weight="700">DIAGNOSTICS &amp; ECOSYSTEM</text>
+    <text x="18" y="38" fill="#94a3b8" font-family="Consolas, monospace" font-size="11">Read-Only TestServer (:19560)  →  /api/local · /api/target · /api/output/motion (QPC)  →  SenseZen Lab Aiming Cookie Analyzer</text>
+    <text x="1046" y="30" text-anchor="end" fill="#64748b" font-family="Consolas, monospace" font-size="10.5">v3/unicore · standalone repo</text>
+  </g>
+</svg>
