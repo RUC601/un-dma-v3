@@ -202,8 +202,26 @@ int main(int argc, char** argv) {
         !OW::RayDecisionAllows({OW::RayDecisionStatus::Hit, OW::RayDecisionStatus::Unknown},
                                static_cast<int>(OW::RayDecisionPolicy::NativeOnly)) ||
         OW::RayDecisionAllows({OW::RayDecisionStatus::Hit, OW::RayDecisionStatus::Unknown},
-                              static_cast<int>(OW::RayDecisionPolicy::Hybrid)))
+                              static_cast<int>(OW::RayDecisionPolicy::Hybrid)) ||
+        !OW::RayDecisionAllowsSelection({OW::RayDecisionStatus::Unknown, OW::RayDecisionStatus::Unknown},
+                                        true, static_cast<int>(OW::RayDecisionPolicy::Hybrid)) ||
+        !OW::RayDecisionAllowsSelection({OW::RayDecisionStatus::Unknown, OW::RayDecisionStatus::Clear},
+                                        false, static_cast<int>(OW::RayDecisionPolicy::Hybrid)) ||
+        OW::RayDecisionAllowsSelection({OW::RayDecisionStatus::Unknown, OW::RayDecisionStatus::Occluded},
+                                       false, static_cast<int>(OW::RayDecisionPolicy::Hybrid)) ||
+        OW::RayDecisionAllowsSelection({OW::RayDecisionStatus::Miss, OW::RayDecisionStatus::Clear},
+                                       false, static_cast<int>(OW::RayDecisionPolicy::Hybrid)) ||
+        !OW::RayDecisionAllowsSelection({OW::RayDecisionStatus::Unknown, OW::RayDecisionStatus::Unknown},
+                                        false, static_cast<int>(OW::RayDecisionPolicy::NativeOnly)) ||
+        OW::RayDecisionAllowsSelection({OW::RayDecisionStatus::Miss, OW::RayDecisionStatus::Clear},
+                                       false, static_cast<int>(OW::RayDecisionPolicy::NativeOnly)))
         return Fail("ray decision readiness");
+    {
+        OW::RayDecision aged{OW::RayDecisionStatus::Hit, OW::RayDecisionStatus::Clear};
+        aged.ageMs = 150;
+        if (aged.Fresh(100) || aged.AllowsHybrid(100) || !aged.Fresh(200))
+            return Fail("ray decision age freshness");
+    }
 
     // RayQueryBroker: async worker-only Service ownership, multi-target/multi-bone cache,
     // realistic movement drift tolerance, staleness, scene invalidation, and UAF-free Detach.
@@ -245,7 +263,9 @@ int main(int argc, char** argv) {
         OW::EngineTrace::RayQueryBroker broker;
         const std::thread::id callerThread = std::this_thread::get_id();
         broker.Start();
+        if (broker.HasService()) return Fail("broker reported service before Attach");
         broker.Attach(&brokerService);
+        if (!broker.HasService()) return Fail("broker did not report service after Attach");
 
         // sceneEpoch == 0 must be rejected.
         {
@@ -351,6 +371,7 @@ int main(int argc, char** argv) {
         }
         if (!backend.traceEntered.load()) return Fail("slow trace did not start");
         broker.Detach();
+        if (broker.HasService()) return Fail("broker still reported service after Detach");
         if (backend.activeCalls.load() != 0 || backend.concurrentViolation.load())
             return Fail("broker Detach returned while Service was still in flight");
 

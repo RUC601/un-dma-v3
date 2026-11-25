@@ -3,6 +3,7 @@
 #include "Game/EngineTrace.hpp"
 #include "Game/RayDecision.hpp"
 
+#include <atomic>
 #include <condition_variable>
 #include <cstddef>
 #include <cstdint>
@@ -43,6 +44,7 @@ public:
     void Stop();
     void Attach(Service* service);
     void Detach();
+    bool HasService() const noexcept;
     void SetScene(uint64_t sceneEpoch);
     void Submit(Query query);
     std::optional<RayDecision> Latest(
@@ -68,6 +70,7 @@ private:
     bool running_ = false;
     bool stopping_ = false;
     bool inFlight_ = false;
+    std::atomic<bool> hasService_{false};
     Service* service_ = nullptr;
     uint64_t serviceGeneration_ = 0;
     uint64_t desiredSceneEpoch_ = 0;

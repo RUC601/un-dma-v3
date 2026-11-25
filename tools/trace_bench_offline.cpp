@@ -110,10 +110,14 @@ int RunTraceBackendSelfTest() {
 
     const auto missingStatus = backend.Trace(request, result);
     check(missingStatus == Status::Error && result.status == missingStatus &&
-        backend.GetStats().lastFailedPage == kData, "missing page fails the trace");
+        backend.GetStats().lastFailedPage == kData &&
+        backend.GetStats().pageReadRetries == config.pageReadRetries &&
+        backend.GetStats().pageUnavailableTraces == 1,
+        "missing page fails after bounded retries");
     fixture.dataAvailable = true;
     check(backend.Trace(request, result) == Status::Ok && result.fraction == 0.25f &&
-        fixture.dataReads == 2, "private cache retries the missing page");
+        fixture.dataReads == 1 + config.pageReadRetries + 1,
+        "private cache retries the missing page on the next request");
     fixture.dataAvailable = false;
     check(backend.Trace(request, result) == Status::Error && result.status == Status::Error,
         "refresh failure cannot return the old result");
@@ -135,7 +139,8 @@ int RunTraceBackendSelfTest() {
     const auto available = probe.Probe({request, request});
     check(available[0].status == Status::Ok && available[1].status == Status::Ok &&
         available[0].fraction == 1.0f && available[1].fraction == 1.0f &&
-        shared.dataReads == 3, "shared cache retries then shares the successful read");
+        shared.dataReads == 2 * (1 + config.pageReadRetries) + 1,
+        "shared cache retries then shares the successful read");
 
     for (const auto code : {std::span<const unsigned char>(kWriteOnlyFlags),
             std::span<const unsigned char>(kPartialFraction)}) {

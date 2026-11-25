@@ -823,9 +823,77 @@ namespace OW {
         if (!raw)
             return false;
 
-        gameAdmin = activeOffsets.clientGameRva ? RegionalLayout::World155284::DecodeGameAdmin(raw)
-                                               : DecryptLiveGameAdmin(raw);
+        uint64_t decoded = 0;
+        switch (activeOffsets.gameAdminMode) {
+        case offset::GameAdminMode::World155284:
+            decoded = RegionalLayout::World155284::DecodeGameAdmin(raw);
+            break;
+        case offset::GameAdminMode::Cn155284:
+            decoded = RegionalLayout::Cn155284::DecodeGameAdmin(raw);
+            break;
+        default:
+            // Legacy World profiles read the encoded admin from GlobalAdmin_RVA.
+            decoded = DecryptLiveGameAdmin(raw);
+            break;
+        }
+        gameAdmin = decoded;
         return IsPlausibleUserPointer(gameAdmin);
+    }
+
+    // Product-side source for the engine ray context that `setup + 0x1F0` must hold.
+    //
+    //   ClientGame = [base + clientGameRva]
+    //   context    = Decode([ClientGame + 0x30])
+    //
+    // The pointer is level-scoped: a new map/match builds a new object and rewrites
+    // +0x30, so callers must re-resolve per scene and drop cached engines afterwards.
+    // Verified live on CN 155284N (2026-11-25): the decoded value was identical to the
+    // context captured from a real `setup + 0x1F0`, including +0x08/+0x10.
+    inline bool TryGetRayContext(uint64_t& context) {
+        context = 0;
+        if (!SDK->dwGameBase)
+            return false;
+
+        const auto& activeOffsets = offset::Active();
+        if (!activeOffsets.clientGameRva ||
+            activeOffsets.gameAdminMode == offset::GameAdminMode::None) {
+            return false;
+        }
+
+        const uint64_t clientGame = SDK->RPM<uint64_t>(
+            SDK->dwGameBase + activeOffsets.clientGameRva);
+        if (!IsPlausibleUserPointer(clientGame))
+            return false;
+
+        const uint64_t raw = SDK->RPM<uint64_t>(
+            clientGame + offset::LiveGameAdmin_InputOffset);
+        if (!raw)
+            return false;
+
+        uint64_t decoded = 0;
+        switch (activeOffsets.gameAdminMode) {
+        case offset::GameAdminMode::World155284:
+            decoded = RegionalLayout::World155284::DecodeGameAdmin(raw);
+            break;
+        case offset::GameAdminMode::Cn155284:
+            decoded = RegionalLayout::Cn155284::DecodeGameAdmin(raw);
+            break;
+        default:
+            return false;
+        }
+        if (!IsPlausibleUserPointer(decoded))
+            return false;
+
+        // Same liveness test the probe uses: the first qword must still be the class
+        // vtable inside the module image. A dead level leaves a heap pointer here.
+        if (activeOffsets.rayContextVtableRva) {
+            const uint64_t vtable = SDK->RPM<uint64_t>(decoded);
+            if (vtable != SDK->dwGameBase + activeOffsets.rayContextVtableRva)
+                return false;
+        }
+
+        context = decoded;
+        return true;
     }
 
     inline uint64_t ResolveSingletonList(uint64_t raw) {

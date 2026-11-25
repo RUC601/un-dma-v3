@@ -117,6 +117,40 @@ public:
 	int GetCurrentProcessId() const { return PROCESS_INITIALIZED.load() ? m_currentPid.load() : 0; }
 	DWORD GetPidFromName(const std::string& process_name);
 	std::vector<int> GetPidListFromName(const std::string& name);
+
+	// Read-only thread inventory for bounded stack probes (ray setup seeding).
+	struct ThreadSnapshot
+	{
+		uint32_t tid = 0;
+		uint64_t teb = 0;
+		uint64_t stackBase = 0;
+		uint64_t stackLimit = 0;
+		uint64_t rip = 0;
+		uint64_t rsp = 0;
+		bool running = false;
+	};
+	bool SnapshotThreads(std::vector<ThreadSnapshot>& out) const;
+
+	// One-time seed for the synthetic ray setup. The game's 0x240 setup lives on the
+	// calling thread's stack only while it is tracing; the three level objects it carries
+	// are stable for the whole scene. Captures them read-only, no template file involved.
+	struct RaySetupSeed
+	{
+		bool found = false;
+		uint64_t setup = 0;
+		uint64_t filterObject = 0;   // setup + 0x1E8
+		uint64_t sceneObject2 = 0;   // setup + 0x1F8
+		uint64_t auxCallback = 0;    // setup + 0x1A0
+		uint64_t localObject = 0;    // setup + 0x40
+		uint32_t filterCount = 0;    // setup + 0x68, items at + 0x70
+		uint64_t filterItems[4] = {};
+		float start[3] = {};
+		float end[3] = {};
+		uint8_t bytes[0x240] = {};
+	};
+	bool CaptureRaySetupSeed(uint64_t context, uint64_t imageBase, uint32_t imageSize,
+		int timeoutMs, RaySetupSeed& out, const float* startHint = nullptr,
+		float startRadius = 3.0f) const;
 	ProcessLookupResult FindProcessByNamePrefix(const std::string& namePrefix);
 	ProcessLookupResult FindProcessByPrefix(const std::string& prefix) { return FindProcessByNamePrefix(prefix); }
 	std::vector<std::string> GetModuleList(const std::string& process_name);

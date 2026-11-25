@@ -9,6 +9,7 @@
 #include "Memory/KeyState.hpp"
 #include "Memory/DeviceRecovery.hpp"
 #include "Game/Overwatch.hpp"
+#include "Game/RayRuntime.hpp"
 #include "Game/map/MapReader.hpp"
 #include "Game/ProductImageIdentity.hpp"
 #include "Game/profiles/ProfileState.hpp"
@@ -199,6 +200,7 @@ void DrainProcessRuntimeWorkers(const char* reason)
     ReleaseOutputMouseStateForShutdown(reason);
     KeyState::Stop();
     StopBackgroundThreads();
+    OW::RayRuntime::DetachProbeForDisconnect();
     OW::CancelActiveSkill();
 }
 

@@ -7,6 +7,7 @@
 #include <mutex>
 #include <algorithm>
 #include <cctype>
+#include <cmath>
 #include <cwctype>
 #include <chrono>
 #include <limits>
@@ -950,6 +951,140 @@ std::vector<int> Memory::GetPidListFromName(const std::string& name)
 
 	VMMDLL_MemFree(process_info);
 	return list;
+}
+
+/* ------------------------------------------------------------------ */
+/*  Thread inventory (read-only, bounded stack probes)                 */
+/* ------------------------------------------------------------------ */
+
+bool Memory::SnapshotThreads(std::vector<ThreadSnapshot>& out) const
+{
+	out.clear();
+	if (!vHandle)
+		return false;
+	const DWORD pid = m_currentPid.load(std::memory_order_acquire);
+	if (!pid)
+		return false;
+	PVMMDLL_MAP_THREAD map = nullptr;
+	if (!VMMDLL_Map_GetThread(vHandle, pid, &map) || !map)
+		return false;
+	out.reserve(map->cMap);
+	for (DWORD i = 0; i < map->cMap; ++i)
+	{
+		const auto& entry = map->pMap[i];
+		ThreadSnapshot snapshot{};
+		snapshot.tid = entry.dwTID;
+		snapshot.teb = entry.vaTeb;
+		snapshot.stackBase = entry.vaStackBaseUser;
+		snapshot.stackLimit = entry.vaStackLimitUser;
+		snapshot.rip = entry.vaRIP;
+		snapshot.rsp = entry.vaRSP;
+		snapshot.running = entry.bRunning != 0;
+		out.push_back(snapshot);
+	}
+	VMMDLL_MemFree(map);
+	return true;
+}
+
+bool Memory::CaptureRaySetupSeed(uint64_t context, uint64_t imageBase, uint32_t imageSize,
+	int timeoutMs, RaySetupSeed& out, const float* startHint, float startRadius) const
+{
+	out = RaySetupSeed{};
+	if (!context || !imageBase || !imageSize)
+		return false;
+	const uint64_t deadline = GetTickCount64() + static_cast<uint64_t>((std::max)(1, timeoutMs));
+	std::vector<ThreadSnapshot> threads;
+	std::vector<uint8_t> raw(0x1000, 0);
+	RaySetupSeed fallback;
+	while (GetTickCount64() < deadline)
+	{
+		if (!SnapshotThreads(threads) || threads.empty())
+		{
+			Sleep(50);
+			continue;
+		}
+		for (const auto& thread : threads)
+		{
+			if (!thread.stackBase || thread.stackBase <= thread.stackLimit)
+				continue;
+			const uint64_t size = (std::min<uint64_t>)(thread.stackBase - thread.stackLimit, 0x10000);
+			const uint64_t begin = (thread.stackBase - size) & ~0xFFFull;
+			for (uint64_t page = begin; page < thread.stackBase; page += 0x1000)
+			{
+				if (!Read(static_cast<uintptr_t>(page), raw.data(), raw.size()))
+					continue;
+				for (size_t off = 0; off + 0x240 <= raw.size(); off += 8)
+				{
+					const uint64_t address = page + off;
+					uint64_t list0 = 0, list1 = 0, list2 = 0, mask = 0, setupContext = 0;
+					uint32_t cap0 = 0;
+					std::memcpy(&list0, raw.data() + off + 0x60, 8);
+					std::memcpy(&cap0, raw.data() + off + 0x6C, 4);
+					std::memcpy(&list1, raw.data() + off + 0x90, 8);
+					std::memcpy(&list2, raw.data() + off + 0xC0, 8);
+					if (list0 != address + 0x70 || cap0 != 0x80000004 ||
+						list1 != address + 0xA0 || list2 != address + 0xD0)
+						continue;
+					std::memcpy(&mask, raw.data() + off + 0x58, 8);
+					if (mask != 0x0690000000000017ull && mask != 0x0690000000000002ull)
+						continue;
+					std::memcpy(&setupContext, raw.data() + off + 0x1F0, 8);
+					if (setupContext != context)
+						continue;
+					uint64_t vtable = 0;
+					if (!Read(static_cast<uintptr_t>(context), &vtable, sizeof(vtable)))
+						continue;
+					if (vtable < imageBase || vtable >= imageBase + imageSize)
+						continue;
+					float start[3] = {};
+					std::memcpy(start, raw.data() + off, sizeof(start));
+					if (startHint && startRadius > 0.0f)
+					{
+						if (!std::isfinite(start[0]) || !std::isfinite(start[1]) || !std::isfinite(start[2]))
+							continue;
+						const double dx = static_cast<double>(start[0]) - startHint[0];
+						const double dy = static_cast<double>(start[1]) - startHint[1];
+						const double dz = static_cast<double>(start[2]) - startHint[2];
+						if (dx * dx + dy * dy + dz * dz >
+							static_cast<double>(startRadius) * startRadius)
+							continue;
+					}
+					RaySetupSeed candidate;
+					candidate.found = true;
+					candidate.setup = address;
+					std::memcpy(&candidate.auxCallback, raw.data() + off + 0x1A0, 8);
+					std::memcpy(&candidate.filterObject, raw.data() + off + 0x1E8, 8);
+					std::memcpy(&candidate.sceneObject2, raw.data() + off + 0x1F8, 8);
+					std::memcpy(&candidate.localObject, raw.data() + off + 0x40, 8);
+					std::memcpy(candidate.bytes, raw.data() + off, sizeof(candidate.bytes));
+					std::memcpy(candidate.start, candidate.bytes, sizeof(candidate.start));
+					std::memcpy(candidate.end, candidate.bytes + 0x10, sizeof(candidate.end));
+					uint32_t filterCount = 0;
+					std::memcpy(&filterCount, raw.data() + off + 0x68, 4);
+					candidate.filterCount = (std::min)(filterCount, 4u);
+					for (uint32_t i = 0; i < candidate.filterCount; ++i)
+						std::memcpy(&candidate.filterItems[i], raw.data() + off + 0x70 + i * 8, 8);
+					// Setups with at least one filter entry are the ones whose world query
+					// answers real geometry; an empty list makes the query hit the local
+					// player's own body first (or return clear for long rays).
+					if (candidate.filterCount > 0)
+					{
+						out = candidate;
+						return true;
+					}
+					if (!fallback.found)
+						fallback = candidate;
+				}
+			}
+		}
+		Sleep(10);
+	}
+	if (fallback.found)
+	{
+		out = fallback;
+		return true;
+	}
+	return false;
 }
 
 Memory::ProcessLookupResult Memory::FindProcessByNamePrefix(const std::string& namePrefix)

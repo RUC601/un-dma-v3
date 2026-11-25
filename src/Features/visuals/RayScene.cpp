@@ -3,6 +3,8 @@
 #include "RayScene.hpp"
 #include "ShapeWire.hpp"
 #include "Game/V3Raycast.hpp"
+#include "Game/RayDecision.hpp"
+#include "Game/RayRuntime.hpp"
 #include "Game/snapshots/SnapshotAccess.hpp"
 #include "config/UiPreferences.hpp"
 #include "Utils/Diagnostics.hpp"
@@ -186,11 +188,10 @@ bool DrawRuntimeProbe() {
     if (!target) return false;
     std::vector<V3Raycast::WorldShape> shapes;
     const auto& sample = target->native_hitboxes;
-    const auto basis = [&](int column) {
-        return Vector3{sample.world.matrix[0][column],sample.world.matrix[1][column],sample.world.matrix[2][column]}.Size();
-    };
-    const float worldScale = (std::min)({basis(0),basis(1),basis(2)});
+    const float worldScale = (std::min)({
+        sample.world.record.scale[0], sample.world.record.scale[1], sample.world.record.scale[2]});
     if (!std::isfinite(worldScale) || worldScale <= 0) return false;
+    const Vector3 anchorDelta = target->pos - sample.world.sampleAnchor;
     shapes.reserve(sample.shapes.size());
     for (size_t i=0; i<sample.shapes.size() && i<sample.poses.size(); ++i) {
         const auto& source = sample.shapes[i];
@@ -198,8 +199,8 @@ bool DrawRuntimeProbe() {
         const float poseScale = (std::min)({pose.scale[0],pose.scale[1],pose.scale[2]});
         if (!pose.Valid() || !std::isfinite(poseScale) || poseScale <= 0) continue;
         V3Raycast::WorldShape shape{};
-        shape.a = sample.world.TransformPoint(ModelShapes::Transform(source.a,pose));
-        shape.b = sample.world.TransformPoint(ModelShapes::Transform(source.b,pose));
+        shape.a = sample.world.TransformPoint(ModelShapes::Transform(source.a,pose)) + anchorDelta;
+        shape.b = sample.world.TransformPoint(ModelShapes::Transform(source.b,pose)) + anchorDelta;
         shape.radius = source.radius * poseScale * worldScale;
         shape.mappedBone = source.boneId;
         shape.critical = source.critical;
@@ -208,14 +209,33 @@ bool DrawRuntimeProbe() {
     const Vector3 delta = target->pos - frame.local.pos;
     const float distance = delta.Size();
     if (!std::isfinite(distance) || distance <= 0) return false;
-    V3Raycast::Query query{frame.local.pos,delta,distance,0,100};
+    V3Raycast::Query query{frame.local.pos,delta,distance + 1.0f,0,100};
     V3Raycast::TraceCalls calls{};
-    const auto selected = static_cast<V3Raycast::Backend>(selectedValue);
-    const auto hit = V3Raycast::TraceSelected(selected,query,shapes,nullptr,0,0,&calls);
+    const auto hit = V3Raycast::TraceNative(query,shapes,&calls);
+    const bool hybrid = selectedValue == static_cast<int>(RayDecisionPolicy::Hybrid);
+    const bool serviceBound = RayRuntime::HasAttachedService();
+    const uint64_t rayScene = RayRuntime::SceneEpoch();
+    RayDecisionStatus worldStatus = hybrid
+        ? (serviceBound ? RayDecisionStatus::Unknown : RayDecisionStatus::Unavailable)
+        : RayDecisionStatus::Clear;
+    if (hybrid && serviceBound && rayScene != 0) {
+        EngineTrace::Request req{};
+        req.start = {frame.local.pos.X, frame.local.pos.Y, frame.local.pos.Z};
+        req.end = {target->pos.X, target->pos.Y, target->pos.Z};
+        req.sceneEpoch = rayScene;
+        const uint64_t targetKey = target->roster_key ? target->roster_key
+            : (target->address ? target->address : target->LinkBase);
+        if (const auto cached = RayRuntime::Broker().Latest(
+                req, frame.sequence, target->connection_epoch, rayScene,
+                targetKey, target->actor_generation, -1, 100)) {
+            worldStatus = cached->world;
+        }
+    }
     lastRuntimeBackend = selectedValue;
-    Diagnostics::Info("[RAY-RUNTIME] sequence=%llu backend=%s analytic=%u serviceTrace=%u result=%s shape=%d source=native-hitbox.sample",
-        static_cast<unsigned long long>(frame.sequence),V3Raycast::BackendName(selected),
-        calls.analyticTests,calls.worldRequests,V3Raycast::StatusName(hit.status),hit.shapeIndex);
+    Diagnostics::Info("[RAY-RUNTIME] sequence=%llu policy=%s serviceBound=%d analytic=%u actorResult=%s worldResult=%s shape=%d source=native-hitbox.sample",
+        static_cast<unsigned long long>(frame.sequence), RayDecisionPolicyName(selectedValue),
+        serviceBound ? 1 : 0, calls.analyticTests, V3Raycast::StatusName(hit.status),
+        RayDecisionStatusName(worldStatus), hit.shapeIndex);
     return false;
 }
 

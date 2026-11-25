@@ -11,6 +11,7 @@
 #include <cstring>
 #include <fstream>
 #include <mutex>
+#include <thread>
 
 namespace OW::EngineTrace {
 namespace {
@@ -23,6 +24,10 @@ constexpr uint64_t kWorkspace = 0x60000000ull;
 constexpr uint64_t kSetup = 0x60000100ull;   // 0x240 bytes
 constexpr uint64_t kResult = 0x60000800ull;  // 0x240 bytes
 constexpr uint64_t kFraction = kResult + 0x30;
+// The core needs setup + 0x1F8 to be a writable scratch pointer; it is not a game
+// object. A zeroed 0x100-byte area in the workspace page is sufficient (verified
+// 2026-11-25: a zero pointer makes the core hit zero_address_without_contract).
+constexpr uint64_t kScratch1f8 = kWorkspace + 0xB00;  // 0x100 bytes
 constexpr uint8_t kFullFractionWrite = 0xF;
 constexpr uint64_t kGsSlot = 0x61000000ull;
 constexpr uint64_t kSetupSize = 0x240;
@@ -181,6 +186,26 @@ bool UnicornBackend::ReadPage(uint64_t page, uint8_t* out) {
     return false;
 }
 
+// A page can be transiently unreadable when the target's working set has been trimmed
+// (paged-out .text after an idle period or a level change). Retrying briefly costs at most
+// a millisecond; a page that stays unreadable is not cached and the request fails with
+// Error, so the next request tries again. Nothing here ever zero-fills a missing page.
+bool UnicornBackend::FetchPageWithRetry(uint64_t page, uint8_t* out) {
+    const uint32_t retries = config_.pageReadRetries;
+    for (uint32_t attempt = 0;; ++attempt) {
+        if (ReadPage(page, out)) return true;
+        if (attempt >= retries) {
+            pageFailure_ = true;
+            return false;
+        }
+        ++stats_.pageReadRetries;
+        if (config_.pageReadRetryDelayUs) {
+            std::this_thread::sleep_for(
+                std::chrono::microseconds(config_.pageReadRetryDelayUs));
+        }
+    }
+}
+
 bool UnicornBackend::InImage(uint64_t address) const {
     return address >= base_ && address < base_ + imageSize_;
 }
@@ -242,7 +267,7 @@ bool UnicornBackend::EnsurePage(uint64_t page) {
             ++sharedStore_->stats.hits;
             ++stats_.cacheHits;
         } else {
-            if (!ReadPage(page, bytes.data())) return false;
+            if (!FetchPageWithRetry(page, bytes.data())) return false;
             sharedStore_->pages.emplace(page, bytes);
             ++sharedStore_->stats.fetches;
         }
@@ -252,7 +277,7 @@ bool UnicornBackend::EnsurePage(uint64_t page) {
             std::memcpy(bytes.data(), it->second.data(), kPage);
             ++stats_.cacheHits;
         } else {
-            if (!ReadPage(page, bytes.data())) return false;
+            if (!FetchPageWithRetry(page, bytes.data())) return false;
             pageBytes_.emplace(page, bytes);
         }
     }
@@ -310,24 +335,65 @@ bool UnicornBackend::PrepareSetup() {
         std::memcpy(bytes.data(), setupTemplate_.data(),
             (std::min)(setupTemplate_.size(), bytes.size()));
     } else {
+        // Template-free 0x240 layout. The field set mirrors the live 0x240 captures of
+        // the game's own initializer (2026-11-21 setup dumps, re-checked 2026-11-25):
+        //   +0x20   1.0f       scalar input read by the core; a zero here made the
+        //                      query return before it wrote the result.
+        //   +0x58   trace mask
+        //   +0x60 / +0x90 / +0xC0 / +0x100
+        //           four inline containers {ptr,count,cap}; count stays 0 because the
+        //           product traces world geometry without entity filter entries.
+        //   +0x1A0  world-trace callback (build constant)
+        //   +0x1B8  ray_cmp (none)
+        //   +0x1C0  gm/local object (none)
+        //   +0x1E8  level/world object (must be non-zero, see UnicornConfig)
+        //   +0x1F0  level context
+        //   +0x1F8  second level object (see UnicornConfig)
+        // 0x200..0x240 is core-owned output state; it stays zero on input and the core
+        // writes it while tracing.
+        const float one = 1.0f;
+        std::memcpy(bytes.data() + 0x20, &one, sizeof(one));
         const uint64_t mask = config_.mask;
         std::memcpy(bytes.data() + 0x58, &mask, sizeof(mask));
         const uint64_t list0 = kSetup + 0x70, list1 = kSetup + 0xA0, list2 = kSetup + 0xD0,
                        list3 = kSetup + 0x110;
-        std::memcpy(bytes.data() + 0x60, &list0, 8);
-        std::memcpy(bytes.data() + 0x90, &list1, 8);
-        std::memcpy(bytes.data() + 0xC0, &list2, 8);
-        std::memcpy(bytes.data() + 0x100, &list3, 8);
         const uint32_t cap4 = 0x80000004, cap8 = 0x80000008;
+        std::memcpy(bytes.data() + 0x60, &list0, 8);
         std::memcpy(bytes.data() + 0x6C, &cap4, 4);
+        std::memcpy(bytes.data() + 0x90, &list1, 8);
         std::memcpy(bytes.data() + 0x9C, &cap4, 4);
+        std::memcpy(bytes.data() + 0xC0, &list2, 8);
         std::memcpy(bytes.data() + 0xCC, &cap4, 4);
+        std::memcpy(bytes.data() + 0x100, &list3, 8);
         std::memcpy(bytes.data() + 0x10C, &cap8, 4);
-        const uint64_t flag = 0x10000;
-        std::memcpy(bytes.data() + 0x198, &flag, 8);
+        // Filter list: one entry excludes the local player's own body. Refresh it per
+        // trace from the live local entity when a resolver is available, so a hero swap
+        // cannot leave a stale parent pointer in the setup.
+        uint64_t filterItem = config_.filterCount ? config_.filterItems[0] : 0;
+        if (config_.filterItemResolver) filterItem = config_.filterItemResolver();
+        if (filterItem) {
+            const uint32_t count = 1;
+            std::memcpy(bytes.data() + 0x68, &count, 4);
+            std::memcpy(bytes.data() + 0x70, &filterItem, 8);
+        }
+        if (config_.localObject)
+            std::memcpy(bytes.data() + 0x40, &config_.localObject, 8);
+        // The core reads setup + 0x1E8 before the world query and skips the query entirely
+        // when it is zero. Live captures always carry a heap object here.
+        std::memcpy(bytes.data() + 0x1E8, &config_.filterObject, 8);
+        if (config_.auxCallback) std::memcpy(bytes.data() + 0x1A0, &config_.auxCallback, 8);
+        // setup + 0x1F8 is a scratch pointer (not a scene object). A zero pointer aborts
+        // the core at zero_address_without_contract; a zeroed workspace area works.
+        const uint64_t scene2 = config_.sceneObject2 ? config_.sceneObject2 : kScratch1f8;
+        std::memcpy(bytes.data() + 0x1F8, &scene2, 8);
         std::memcpy(bytes.data() + 0x1C0, &config_.context2, 8);
+        // Fields the game's setup_ray() always writes before the trace call.
+        const uint32_t field1C8 = 0x10000;
+        std::memcpy(bytes.data() + 0x1C8, &field1C8, sizeof(field1C8));
+        bytes[0x1CD] = 1;
     }
-    // Both paths point their inline lists at the emulated copy.
+    // Both paths point their inline lists at the emulated copy, so a template captured on
+    // the game stack stays self-contained after the copy.
     const uint64_t list0 = kSetup + 0x70, list1 = kSetup + 0xA0, list2 = kSetup + 0xD0,
                    list3 = kSetup + 0x110;
     std::memcpy(bytes.data() + 0x60, &list0, 8);
@@ -336,6 +402,11 @@ bool UnicornBackend::PrepareSetup() {
     std::memcpy(bytes.data() + 0x100, &list3, 8);
     const uint64_t context = context_ ? context_ : config_.context;
     if (context) std::memcpy(bytes.data() + 0x1F0, &context, 8);
+    if (config_.sceneObject2 == 0) {
+        std::vector<uint8_t> scratch(0x100, 0);
+        uc_mem_write(reinterpret_cast<uc_engine*>(uc_), kScratch1f8, scratch.data(),
+            scratch.size());
+    }
     return uc_mem_write(reinterpret_cast<uc_engine*>(uc_), kSetup, bytes.data(), bytes.size()) ==
         UC_ERR_OK;
 }
@@ -430,6 +501,17 @@ bool UnicornBackend::BindScene(uint64_t sceneEpoch) {
         uint64_t peb = 0;
         if (ReadTarget(teb_ + 0x60, &peb, sizeof(peb)) && peb) EnsurePage(AlignDown(peb));
     }
+    // Touch the wrapper page once so a trimmed .text is noticed at bind instead of on the
+    // first request. Failure is not fatal here: the page may come back before the trace,
+    // and Trace retries it and fails explicitly instead of executing zero-filled code.
+    if (config_.entryRva) {
+        const uint64_t entryPage = AlignDown(base_ + config_.entryRva);
+        if (!EnsurePage(entryPage)) {
+            std::fprintf(stderr, "TRACE: entry page 0x%llX unreadable at bind; trace will retry\n",
+                static_cast<unsigned long long>(entryPage));
+        }
+        pageFailure_ = false;
+    }
     bound_ = true;
     sceneEpoch_ = sceneEpoch;
     return true;
@@ -452,8 +534,12 @@ Status UnicornBackend::Trace(const Request& request, Result& result) {
     if (!bound_ || !uc_) return result.status;
     if (request.sceneEpoch != sceneEpoch_) return result.status = Status::InvalidScene;
     const uint64_t started = NowUs();
+    pageFailure_ = false;
 
-    if (config_.refreshTouchedPages && !RefreshTouchedPages()) return result.status = Status::Error;
+    if (config_.refreshTouchedPages && !RefreshTouchedPages()) {
+        if (pageFailure_) ++stats_.pageUnavailableTraces;
+        return result.status = Status::Error;
+    }
 
     const uint64_t tSetup0 = NowUs();
     if (!PrepareSetup()) return result.status = Status::Error;
@@ -515,6 +601,7 @@ Status UnicornBackend::Trace(const Request& request, Result& result) {
     result.instructions = instructionCount_;
 
     if (err != UC_ERR_OK || stop_ || rip != kReturnStub || fractionWritten_ != kFullFractionWrite) {
+        if (pageFailure_) ++stats_.pageUnavailableTraces;
         return result.status = Status::Error;
     }
     uint32_t flags = 0, hitbox = 0xFFFF, entity = 0xFFFF;

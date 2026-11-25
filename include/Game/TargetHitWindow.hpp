@@ -61,11 +61,9 @@ inline bool InSelectedAimHitWindow(const TargetCandidate& candidate,
     const Vector3& viewAngle, const Vector3& targetAngle, const Vector3& camera,
     const Vector3& aimPoint)
 {
-    if (candidate.ray.actor != RayDecisionStatus::Unknown &&
-        candidate.ray.actor != RayDecisionStatus::Hit)
-        return false;
-    if (UI::Preferences::ActiveRayBackend() == static_cast<int>(RayDecisionPolicy::Hybrid) &&
-        !candidate.ray.AllowsHybrid())
+    const bool contourExposed = candidate.contour.evidence.exposed && candidate.contour.evidence.fresh;
+    if (!RayDecisionAllowsSelection(candidate.ray, contourExposed,
+                                    UI::Preferences::ActiveRayBackend()))
         return false;
     if (NativeHitboxSampleUsable(candidate.entitySnapshot, GetTickCount())) {
         const auto score = SelectedAimNativeHitScore(candidate, viewAngle, camera, aimPoint);
@@ -102,11 +100,9 @@ inline bool InAllowedAimHitWindow(const TargetCandidate& candidate,
 {
     if (!candidate.valid)
         return false;
-    if (candidate.ray.actor != RayDecisionStatus::Unknown &&
-        candidate.ray.actor != RayDecisionStatus::Hit)
-        return false;
-    if (UI::Preferences::ActiveRayBackend() == static_cast<int>(RayDecisionPolicy::Hybrid) &&
-        !candidate.ray.AllowsHybrid())
+    const bool contourExposed = candidate.contour.evidence.exposed && candidate.contour.evidence.fresh;
+    if (!RayDecisionAllowsSelection(candidate.ray, contourExposed,
+                                    UI::Preferences::ActiveRayBackend()))
         return false;
     if (allowedBoneMask == 0)
         return InSelectedAimHitWindow(candidate, viewAngle, targetAngle, camera, aimPoint);

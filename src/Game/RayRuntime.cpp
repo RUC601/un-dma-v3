@@ -16,6 +16,8 @@ void Attach(EngineTrace::Service* service) { broker.Attach(service); }
 
 void Detach() { broker.Detach(); }
 
+bool HasAttachedService() noexcept { return broker.HasService(); }
+
 void SetScene(uint64_t sceneEpoch) { broker.SetScene(sceneEpoch); }
 
 EngineTrace::RayQueryBroker& Broker() { return broker; }

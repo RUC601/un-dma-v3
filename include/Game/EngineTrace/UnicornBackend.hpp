@@ -39,9 +39,37 @@ struct UnicornConfig {
     uint64_t mask = 0x0690000000000017ull;
     uint64_t context = 0;
     uint64_t context2 = 0;
+    // setup + 0x1E8: the level/world object the core dereferences before it runs the
+    // query. Every live 0x240 capture carries a non-zero heap pointer here; a zero makes
+    // the core jump straight to its epilogue without writing the result (the 2026-11-21
+    // "synthetic setup never reached the write branch" failure).
+    uint64_t filterObject = 0;
+    // setup + 0x1A0: world-trace callback pointer (build constant, profile RVA).
+    uint64_t auxCallback = 0;
+    // setup + 0x1F8: second level object read by the core before the query.
+    uint64_t sceneObject2 = 0;
+    // setup + 0x68 count / + 0x70 items: the game's ray filter entries (self/team
+    // exclusions). Empty lists make the world query hit the local player's own body.
+    uint32_t filterCount = 0;
+    uint64_t filterItems[4] = {};
+    // Optional per-trace filter item source. The first list entry is refreshed from the
+    // live local entity so a hero swap cannot leave a stale parent pointer behind.
+    std::function<uint64_t()> filterItemResolver;
+    // setup + 0x40: per-call local ray object read by the core. Live setups carry a
+    // non-zero entity object here.
+    uint64_t localObject = 0;
     uint64_t flags = 0;
     uint64_t instructionLimit = 4'000'000;
-    uint64_t timeoutUs = 6'000'000;
+    // 0 means "no timer". A non-zero Unicorn timeout installs a 15 ms host timer whose
+    // only useful effect here is a fixed latency floor; instructionLimit already bounds
+    // a runaway trace, and the module-fetch hook stops execution outside the image.
+    uint64_t timeoutUs = 0;
+    // Paged-out .text policy: a failed page read is never cached and the next request
+    // retries it. A short in-call retry absorbs the page-in race without hiding a real
+    // failure; when the retries are exhausted the request returns Error and the broker's
+    // asynchronous caller simply asks again on its next tick.
+    uint32_t pageReadRetries = 2;
+    uint32_t pageReadRetryDelayUs = 500;
     // Re-read the pages touched by the previous trace before each new one. Off means the
     // scene snapshot is reused (the "warm" case this backend exists to measure).
     bool refreshTouchedPages = false;
@@ -69,6 +97,8 @@ public:
         uint64_t traces = 0;
         uint64_t pageFetches = 0;   // DMA reads performed for pages
         uint64_t pageReadFailures = 0;
+        uint64_t pageReadRetries = 0;       // retries performed after a failed page read
+        uint64_t pageUnavailableTraces = 0; // traces aborted by an unreadable page
         uint64_t lastFailedPage = 0;
         uint64_t cacheHits = 0;     // page already present in the host cache
         uint64_t mappedPages = 0;   // new uc_mem_map calls
@@ -115,6 +145,7 @@ private:
     bool InImage(uint64_t address) const;
     bool ReadTarget(uint64_t address, void* out, size_t size);
     bool ReadPage(uint64_t page, uint8_t* out);
+    bool FetchPageWithRetry(uint64_t page, uint8_t* out);
     void ResetEngineRuntime();
     bool PrepareSetup();
     bool RefreshTouchedPages();
@@ -141,6 +172,7 @@ private:
     bool stop_ = false;
     uint8_t fractionWritten_ = 0;
     uint64_t instructionCount_ = 0;
+    bool pageFailure_ = false;  // this trace tried to read a page and failed
     Stats stats_{};
 };
 

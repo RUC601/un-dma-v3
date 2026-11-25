@@ -7,6 +7,19 @@ set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
 option(UNLEASHED_TEST_SERVER "Build the optional localhost read-only test server" ON)
 option(UNLEASHED_OBSERVATION_ONLY "Disable physical output and target writes for visual validation" OFF)
+# UniCore ray backend. The SDK is a local build artifact, not a package dependency; the
+# product now owns the backend, so a missing SDK is a configuration error instead of a
+# silently dropped feature.
+set(UNICORN_DIR "D:/Desktop/SenseZen/ECS_O/05_SHARED_TOOLS/Unicorn/windows-msvc64-shared"
+    CACHE PATH "Unicorn 2.x MSVC x64 SDK")
+foreach(required
+        "${UNICORN_DIR}/include/unicorn/unicorn.h"
+        "${UNICORN_DIR}/lib/unicorn.lib"
+        "${UNICORN_DIR}/bin/unicorn.dll")
+    if(NOT EXISTS "${required}")
+        message(FATAL_ERROR "UniCore ray backend dependency missing: ${required}")
+    endif()
+endforeach()
 
 enable_testing()
 # Product modules are shared by the bounded offline checks.
@@ -151,9 +164,13 @@ set(UNLEASHED_SOURCES
     src/Game/HeroSkills.cpp
     src/Game/Offsets.cpp
     src/Game/EngineTrace.cpp
-    src/Game/V3Raycast.cpp
+    src/Game/EngineTrace/UnicornBackend.cpp
+    src/Game/EngineTrace/VisionProbe.cpp
     src/Game/RayQueryBroker.cpp
     src/Game/RayRuntime.cpp
+    src/Game/RayProbeRuntime.cpp
+    src/runtime/RayProbeCheck.cpp
+    src/Game/V3Raycast.cpp
     src/Features/visuals/RayScene.cpp
     src/Game/WeaponCadence.cpp
     src/Game/WeaponSpec.cpp
@@ -205,6 +222,7 @@ target_include_directories(UnleashedV3 PRIVATE
     vendor/imgui/backends
     vendor/rapidjson
     vendor/stb
+    "${UNICORN_DIR}/include"
 )
 
 # ============================================================================
@@ -226,6 +244,10 @@ target_link_libraries(UnleashedV3 PRIVATE
     dwmapi
     setupapi
     dbghelp
+    # Import library for bin/unicorn.dll. The SDK also ships a 105 MB static unicorn.lib
+    # (built against the debug CRT); linking that into the release product produces a
+    # 35 MB exe and an MSVCRTD conflict, so the product uses the shared runtime instead.
+    "${UNICORN_DIR}/lib/unicorn-import.lib"
 )
 
 # ============================================================================
@@ -242,6 +264,11 @@ function(copy_leechcore_runtime target_name)
                     "$<TARGET_FILE_DIR:${target_name}>")
         endif()
     endforeach()
+    add_custom_command(TARGET ${target_name} POST_BUILD
+        COMMAND ${CMAKE_COMMAND} -E copy_if_different
+            "${UNICORN_DIR}/bin/unicorn.dll"
+            "$<TARGET_FILE_DIR:${target_name}>"
+        COMMENT "${target_name}: stage unicorn.dll next to the product")
     add_custom_command(TARGET ${target_name} POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different
             "${CMAKE_SOURCE_DIR}/vendor/leechcore/info.db"
@@ -338,8 +365,6 @@ add_test(NAME V3RaycastSelfTest COMMAND V3RaycastSelfTest)
 option(UNLEASHED_TRACE_BENCH "Build the UniCore trace bench (requires the Unicorn SDK)" OFF)
 
 if(UNLEASHED_TRACE_BENCH)
-    set(UNICORN_DIR "D:/Desktop/SenseZen/ECS_O/05_SHARED_TOOLS/Unicorn/windows-msvc64-shared"
-        CACHE PATH "Unicorn 2.x MSVC x64 SDK")
     foreach(required
             "${UNICORN_DIR}/include/unicorn/unicorn.h"
             "${UNICORN_DIR}/lib/unicorn.lib"

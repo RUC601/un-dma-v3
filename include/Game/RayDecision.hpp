@@ -38,17 +38,40 @@ struct RayDecision {
     uint32_t latencyUs = 0;
     uint64_t completedAtUs = 0;
 
+    static constexpr uint32_t kDefaultMaxAgeMs = 100;
+
     bool ActorHit() const noexcept { return actor == RayDecisionStatus::Hit; }
     bool WorldClear() const noexcept { return world == RayDecisionStatus::Clear; }
-    bool Fresh() const noexcept { return world != RayDecisionStatus::Stale; }
+    bool Fresh(uint32_t maxAgeMs = kDefaultMaxAgeMs) const noexcept {
+        return world != RayDecisionStatus::Stale && ageMs <= maxAgeMs;
+    }
     bool AllowsNativeOnly() const noexcept { return ActorHit(); }
-    bool AllowsHybrid() const noexcept { return ActorHit() && WorldClear() && Fresh(); }
+    bool AllowsHybrid(uint32_t maxAgeMs = kDefaultMaxAgeMs) const noexcept {
+        return ActorHit() && WorldClear() && Fresh(maxAgeMs);
+    }
 };
 
-inline bool RayDecisionAllows(const RayDecision& decision, int backend) noexcept {
+inline bool RayDecisionAllows(const RayDecision& decision, int backend,
+                              uint32_t maxAgeMs = RayDecision::kDefaultMaxAgeMs) noexcept {
     return backend == static_cast<int>(RayDecisionPolicy::Hybrid)
-        ? decision.AllowsHybrid()
+        ? decision.AllowsHybrid(maxAgeMs)
         : decision.AllowsNativeOnly();
+}
+
+inline bool RayDecisionAllowsSelection(const RayDecision& decision, bool contourFallback,
+                                       int backend,
+                                       uint32_t maxAgeMs = RayDecision::kDefaultMaxAgeMs) noexcept {
+    if (contourFallback) return true;
+    const bool actorAcceptable = decision.actor == RayDecisionStatus::Hit ||
+                                 decision.actor == RayDecisionStatus::Unknown;
+    if (!actorAcceptable) return false;
+    if (backend == static_cast<int>(RayDecisionPolicy::Hybrid))
+        return decision.WorldClear() && decision.Fresh(maxAgeMs);
+    return true;
+}
+
+inline const char* RayDecisionPolicyName(int backend) noexcept {
+    return backend == static_cast<int>(RayDecisionPolicy::Hybrid) ? "hybrid" : "native-only";
 }
 
 inline uint64_t RayDecisionNowUs() noexcept {

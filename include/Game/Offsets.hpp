@@ -44,6 +44,20 @@ namespace OW {
             World155284,
         };
 
+        // Transform that protects the ClientGame + 0x30 level-context pointer.
+        // Each value names the RegionalLayout decoder that inverts it.
+        enum class GameAdminMode {
+            None,
+            World155284,
+            Cn155284,
+        };
+
+        // Decode variant for the static ray-scene chain (context + 0x220 -> setup + 0x1E8).
+        enum class RaySceneDecode {
+            CnNexon,
+            World155284,
+        };
+
         enum class ViewMatrixMode {
             EncryptedChain,
             EncryptedChainSubXorSub,
@@ -111,6 +125,25 @@ namespace OW {
             uint32_t typeItemTransform = 0;
             uint32_t typeItemTransformAlt = 0;
             ContextMapMode contextMap = ContextMapMode::Plain;
+            // ClientGame + 0x30 level-context protection. rayContextVtableRva is the
+            // expected first qword of the decoded object; 0 means "do not check".
+            GameAdminMode gameAdminMode = GameAdminMode::None;
+            uint64_t rayContextVtableRva = 0;
+            // Ray trace wrapper called as wrapper(setup, result, 0). 0 means the profile
+            // has no verified Unicorn entry and the live probe stays disabled.
+            uint64_t rayEntryRva = 0;
+            // Layer mask written to setup + 0x58. The 155284 builds use the game's
+            // player/world mask for all 17 ray call sites.
+            uint64_t rayMask = 0x0690000000000017ull;
+            // setup + 0x1A0 ray callback. CN visibility/aim captures use base + 0xFDCBF0;
+            // the ground/movement variant base + 0xFF33F0 clears the collision bit at
+            // [rcx+2] and must not be used for world occlusion. 0 means "not established
+            // for this build".
+            uint64_t rayAuxCallbackRva = 0;
+            // Static ray-scene chain: context + 0x220 -> sub60 -> setup + 0x1E8.
+            RaySceneDecode raySceneDecode = RaySceneDecode::CnNexon;
+            // Expected first qword of sub60 (base + RVA); 0 disables the check.
+            uint64_t raySceneSub60VtableRva = 0;
         };
 
         // =========================================================================
@@ -406,6 +439,7 @@ namespace OW {
             .viewMatrixMode = ViewMatrixMode::EncryptedChainXorAdd,
             .typeSkill = 0x36,
             .componentKeyByteRva = Cn155284::keyByteA,
+            .clientGameRva = 0x4DD4B00,
             .pooledHealth = true,
             .componentKeySecondByteRva = Cn155284::keyByteB,
             .registryLockRva = Cn155284::entityLock,
@@ -414,6 +448,12 @@ namespace OW {
             .typeItemTransform = 4,
             .typeItemTransformAlt = 0x2A,
             .contextMap = ContextMapMode::Protected155284,
+            .gameAdminMode = GameAdminMode::Cn155284,
+            .rayContextVtableRva = 0x35933C0,
+            .rayEntryRva = 0x10222E0,
+            .rayAuxCallbackRva = 0xFDCBF0,
+            .raySceneDecode = RaySceneDecode::CnNexon,
+            .raySceneSub60VtableRva = 0x359E1D0,
         };
 
         inline constexpr RuntimeOffsetProfile kWorld155284RuntimeProfile{
@@ -456,6 +496,13 @@ namespace OW {
             .typeItemTransform = 4,
             .typeItemTransformAlt = 0x2A,
             .contextMap = ContextMapMode::World155284,
+            .gameAdminMode = GameAdminMode::World155284,
+            .rayContextVtableRva = 0x2FB25F0,
+            .rayEntryRva = 0xD0E030,
+            // World +0x1A0 callback not established; keep 0 rather than borrowing CN's.
+            .rayAuxCallbackRva = 0,
+            .raySceneDecode = RaySceneDecode::World155284,
+            .raySceneSub60VtableRva = 0x2FBE260,
         };
 
         // 155284KB shares the protected transforms and table layout with 155284N.
@@ -477,6 +524,23 @@ namespace OW {
             // Independently checked in Nexon D0/D4/D8 native getters, not
             // inferred from the shared component transform (2026-11-16).
             profile.contextMap = ContextMapMode::Protected155284;
+            // Ray context source (2026-11-25): the +0x30 transform is the same one
+            // CN uses, but the ClientGame global and the context vtable are Nexon's
+            // own. Must not inherit CN's values - the image ends before them.
+            profile.clientGameRva = 0x409B580;
+            profile.gameAdminMode = GameAdminMode::Cn155284;
+            profile.rayContextVtableRva = 0x357DA58;
+            // Ray wrapper verified in the 155284KB dump (2026-11-25): the function at
+            // 0x100C5E0 is byte-identical to CN 0x10222E0 / World 0xD0E030 apart from its
+            // two call displacements ((ctx) parser 0x1196C10, core 0x100AC70), and has the
+            // same 21 `lea rcx,[rbp+..]` call sites as CN.
+            profile.rayEntryRva = 0x100C5E0;
+            // Nexon is built from a CN copy; never let it inherit CN's +0x1A0 callback
+            // RVA (0xFDCBF0 is CN's address and has not been verified in this image).
+            profile.rayAuxCallbackRva = 0;
+            // Nexon shares CN's context + 0x220 decode, but not its sub60 vtable.
+            profile.raySceneDecode = RaySceneDecode::CnNexon;
+            profile.raySceneSub60VtableRva = 0x3588260;
             return profile;
         }();
 

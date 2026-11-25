@@ -66,6 +66,7 @@ void RayQueryBroker::Attach(Service* service) {
         idleCv_.wait(lock, [&] { return !inFlight_; });
         ++serviceGeneration_;
         service_ = service;
+        hasService_.store(service != nullptr, std::memory_order_release);
         boundSceneEpoch_ = 0;
         sceneDirty_ = (service_ != nullptr && desiredSceneEpoch_ != 0);
         pendingQueue_.clear();
@@ -78,11 +79,16 @@ void RayQueryBroker::Detach() {
     std::unique_lock<std::mutex> lock(mutex_);
     ++serviceGeneration_;
     service_ = nullptr;
+    hasService_.store(false, std::memory_order_release);
     boundSceneEpoch_ = 0;
     sceneDirty_ = false;
     pendingQueue_.clear();
     cache_.clear();
     idleCv_.wait(lock, [&] { return !inFlight_; });
+}
+
+bool RayQueryBroker::HasService() const noexcept {
+    return hasService_.load(std::memory_order_acquire);
 }
 
 void RayQueryBroker::SetScene(uint64_t sceneEpoch) {
@@ -101,22 +107,26 @@ void RayQueryBroker::SetScene(uint64_t sceneEpoch) {
 }
 
 void RayQueryBroker::Submit(Query query) {
+    bool enqueued = false;
     {
         std::lock_guard<std::mutex> lock(mutex_);
         if (!running_ || query.sceneEpoch == 0 || query.sceneEpoch != desiredSceneEpoch_) return;
         for (auto& existing : pendingQueue_) {
             if (SameQuerySlot(existing, query)) {
                 existing = std::move(query);
-                wake_.notify_one();
-                return;
+                enqueued = true;
+                break;
             }
         }
-        if (pendingQueue_.size() >= kMaxPendingEntries) {
-            pendingQueue_.erase(pendingQueue_.begin());
+        if (!enqueued) {
+            if (pendingQueue_.size() >= kMaxPendingEntries) {
+                pendingQueue_.erase(pendingQueue_.begin());
+            }
+            pendingQueue_.push_back(std::move(query));
+            enqueued = true;
         }
-        pendingQueue_.push_back(std::move(query));
     }
-    wake_.notify_one();
+    if (enqueued) wake_.notify_one();
 }
 
 std::optional<RayDecision> RayQueryBroker::Latest(

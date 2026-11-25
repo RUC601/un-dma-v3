@@ -4,6 +4,7 @@ namespace OW {int RunSkillModeScopeSelfTest();}
 #endif
 #include "features/visuals/EntityVisuals.hpp"
 #include "runtime/LauncherBridge.hpp"
+#include "runtime/RayProbeCheck.hpp"
 #include "features/visuals/RayScene.hpp"
 // =============================================================================
 // Unleashed DMA -- Overwatch 2 External Cheat
@@ -303,6 +304,7 @@ static void ShutdownHeadlessRuntime(const char* reason = "headless_shutdown")
     StopProcessConnectionThread();
     V2::Alerts::Stop();
     V2::Runtime::DrainProcessRuntimeWorkers(reason);
+    OW::RayRuntime::StopProbe();
     OW::RayRuntime::Stop();
     TestServer::Stop();
     KeyState::Stop();
@@ -454,7 +456,13 @@ int main(int argc, char** argv)
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index] ? argv[index] : "";
         if (argument == "--help" || argument == "-h") {
-            std::printf("Usage: UNDMA_V3 [--ray-scene FILE] [--config-check] [--test-server]\n"
+            std::printf("Usage: UNDMA_V3 [--ray-scene FILE] [--config-check] [--ray-probe]\n"
+                        "       [--ray-start x,y,z] [--ray-end x,y,z;x,y,z...] [--ray-mask HEX]\n"
+                        "       [--ray-filter-object HEX] [--ray-scene-object HEX] [--ray-aux-callback HEX]\n"
+                        "       [--ray-capture-seed] [--ray-capture-seconds N] [--ray-seed-endpoints]\n"
+                        "       [--ray-chain] [--ray-filter-item HEX] [--ray-seed-save FILE] [--ray-engines N]\n"
+                        "       [--ray-repeat N] [--ray-watch SECONDS] [--ray-setup FILE]\n"
+                        "       [--test-server]\n"
                         "       [--test-server-port 1..65535] [--test-server-cors] [--box-perf-mode]\n       [--run-seconds 1..1800] [--reconnect-after 1..1799] [--canvas-only]\n       [--profile auto|cn|world|nexon] [--capture-screen] [--aim-diagnostics]\n");
             return 0;
         }
@@ -477,14 +485,23 @@ int main(int argc, char** argv)
             V2::Profiles::requestedProfile.store(selected);
             continue;
         }
-        if (argument == "--test-server-port" || argument == "--run-seconds" || argument == "--reconnect-after") {
+        if (argument == "--test-server-port" || argument == "--run-seconds" || argument == "--reconnect-after" ||
+            argument == "--ray-start" || argument == "--ray-end" || argument == "--ray-mask" ||
+            argument == "--ray-filter-object" || argument == "--ray-scene-object" ||
+            argument == "--ray-aux-callback" || argument == "--ray-filter-item" ||
+            argument == "--ray-capture-seconds" ||
+            argument == "--ray-seed-save" || argument == "--ray-seed-file" ||
+            argument == "--ray-engines" || argument == "--ray-repeat" || argument == "--ray-watch" ||
+            argument == "--ray-limit" || argument == "--ray-setup") {
             if (++index >= argc) {
                 std::fprintf(stderr, "[FATAL] %s requires a value.\n", argument.c_str());
                 return 1;
             }
             continue;
         }
-        if (argument == "--config-check" || argument == "--test-server" ||
+        if (argument == "--config-check" || argument == "--test-server" || argument == "--ray-probe" ||
+            argument == "--ray-capture-seed" || argument == "--ray-seed-endpoints" ||
+            argument == "--ray-capture-hint" || argument == "--ray-chain" ||
             argument == "--test-server-cors" || argument == "--box-perf-mode" || argument == "--canvas-only" || argument == "--launcher-stdio" || argument == "--capture-screen" || argument == "--aim-diagnostics")
             continue;
 #ifdef UNLEASHED_SELF_TESTS
@@ -574,6 +591,8 @@ int main(int argc, char** argv)
         Diagnostics::Error("Config load failed: %s", OW::Config::LastPersistenceError().c_str());
         return EXIT_FAILURE;
     }
+    if (HasCommandLineFlag(argc, argv, "--ray-probe"))
+        return RunRayProbeCheck(argc, argv);
     const bool localScene = !rayScenePath.empty();
     if (localScene && !V3::RayScene::Open(rayScenePath)) {
         Diagnostics::Error("Invalid or unreadable ray scene: %s", rayScenePath.c_str());
@@ -687,6 +706,7 @@ int main(int argc, char** argv)
     V2::Launcher::Send("{\"event\":\"ready\"}");
     if (!localScene) {
         OW::RayRuntime::Start();
+        OW::RayRuntime::StartProbe();
         StartProcessConnectionThread();
     } else {
         Diagnostics::Info("Local ray scene active; source=%s connector=off", rayScenePath.c_str());
@@ -734,6 +754,7 @@ int main(int argc, char** argv)
     Diagnostics::Info("Display closed. Shutting down.");
     Diagnostics::DumpStatus();
     if (localScene) {
+        OW::RayRuntime::StopProbe();
         OW::RayRuntime::Stop();
         Diagnostics::ShutdownAimLog();
         Diagnostics::Shutdown();
