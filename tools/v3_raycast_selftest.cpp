@@ -1,6 +1,7 @@
 #include "Game/V3Raycast.hpp"
 #include "Game/RayDecision.hpp"
 #include "Game/RayQueryBroker.hpp"
+#include "Game/GroundClip.hpp"
 #include "config/RayBackendMigration.hpp"
 
 #include <atomic>
@@ -228,6 +229,49 @@ int main(int argc, char** argv) {
             !OW::RayPolicyNeedsServiceNotice(hybrid, true, 0) ||
             !OW::RayPolicyNeedsServiceNotice(hybrid, false, 0))
             return Fail("ray policy service notice");
+    }
+    // Ground-plane clipping. World Y grows upward, so "below the ground" is Y < groundY.
+    {
+        const float ground = 0.0f;
+        // Entirely above: untouched.
+        if (OW::ClipSegmentToGround({0, 1, 0}, {0, 2, 0}, ground).clipped)
+            return Fail("ground clip above");
+        // Ending exactly on the plane is not below it.
+        if (OW::ClipSegmentToGround({0, 1, 0}, {0, 0, 0}, ground).clipped)
+            return Fail("ground clip on plane");
+        // Horizontal segment above the plane.
+        if (OW::ClipSegmentToGround({0, 1, 0}, {4, 1, 0}, ground).clipped)
+            return Fail("ground clip horizontal");
+        // Crossing: clipped at the mid-point.
+        const auto cross = OW::ClipSegmentToGround({0, 2, 0}, {0, -2, 0}, ground);
+        if (!cross.clipped || !Near(cross.point.X, 0.f) || !Near(cross.point.Y, 0.f) ||
+            !Near(cross.point.Z, 0.f))
+            return Fail("ground clip crossing");
+        // Origin already under the plane.
+        const auto under = OW::ClipSegmentToGround({1, -1, 2}, {1, -2, 2}, ground);
+        if (!under.clipped || !Near(under.point.X, 1.f) || !Near(under.point.Y, -1.f) ||
+            !Near(under.point.Z, 2.f))
+            return Fail("ground clip origin below");
+    }
+    {
+        // Straight down with no gravity: t = drop / speed.
+        const auto drop = OW::SolveGroundLanding({0, 5, 0}, {0, -1, 0}, 10.f, 0.f, 0.f);
+        if (!drop.solved || !Near(drop.seconds, 0.5f, 0.001f) || !Near(drop.point.Y, 0.f, 0.001f))
+            return Fail("ground landing no gravity");
+        // Straight up with no gravity never returns to the plane.
+        if (OW::SolveGroundLanding({0, 5, 0}, {0, 1, 0}, 10.f, 0.f, 0.f).solved)
+            return Fail("ground landing upward no gravity");
+        // Launched straight up at g: ballistic flight from and back to the same height.
+        const auto arc = OW::SolveGroundLanding({0, 0, 0}, {0, 1, 0}, 9.8f, 9.8f, 0.f);
+        if (!arc.solved || !Near(arc.seconds, 2.0f, 0.01f) || !Near(arc.point.Y, 0.f, 0.01f))
+            return Fail("ground landing arc");
+        // Origin under the plane resolves to the origin itself.
+        const auto below = OW::SolveGroundLanding({0, -1, 0}, {0, 1, 0}, 5.f, 9.8f, 0.f);
+        if (!below.solved || !Near(below.seconds, 0.f) || !Near(below.point.Y, -1.f))
+            return Fail("ground landing origin below");
+        // Exceeding the time budget leaves the landing unsolved.
+        if (OW::SolveGroundLanding({0, 100, 0}, {0, -1, 0}, 1.f, 0.f, 0.f, 5.f).solved)
+            return Fail("ground landing budget");
     }
     {
         OW::RayDecision aged{OW::RayDecisionStatus::Hit, OW::RayDecisionStatus::Clear};
