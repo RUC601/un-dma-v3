@@ -381,15 +381,18 @@ void Preview(const Settings& settings) {
     if(OW::Config::skillinfo){const float size=style(Element::Skills).size;for(int i=0;i<2;++i){const auto a=position(Element::Skills,right+8+i*(size+3),top+20);draw->AddRect(a,ImVec2(a.x+size,a.y+size),color(Element::Skills),3,0,style(Element::Skills).thickness);draw->AddText(ImGui::GetFont(),size*.67f,ImVec2(a.x+2,a.y+2),color(Element::Skills),i?"--":"4");}}
     if(OW::Config::dist)text(Element::Distance,cx,bottom+4,"14 m");
     if(settings.prediction)draw->AddCircle(position(Element::Prediction,cx+25,top+75),style(Element::Prediction).size*.25f,color(Element::Prediction),20,style(Element::Prediction).thickness);
-    auto sampleShape = [&](float y, float radius, const ImVec4& wire, const ImVec4& fill) {
+    const auto sampleShape = [&](float y, float radius, const ImVec4& wire, const ImVec4& fill) {
+        const auto center = position(Element::Hitbox, cx, y);
         if (settings.hitboxFill) {
-            const auto& st = settings.hitboxFillStyle;
-            const auto& rgba = settings.hitboxFillByClass ? fill : V2::VisualSettings::Color(st,true,visible);
-            draw->AddCircleFilled(ImVec2(cx + st.offsetX, y + st.offsetY), radius, ImGui::ColorConvertFloat4ToU32(rgba));
+            const auto& fillStyle = settings.hitboxFillStyle;
+            const ImVec4& rgba = settings.hitboxFillByClass
+                ? fill : V2::VisualSettings::Color(fillStyle, true, visible);
+            draw->AddCircleFilled(ImVec2(center.x + fillStyle.offsetX, center.y + fillStyle.offsetY),
+                                  radius, ImGui::ColorConvertFloat4ToU32(rgba));
         }
         if (OW::Config::draw_hitbox)
-            draw->AddCircle(position(Element::Hitbox,cx,y),radius,ImGui::ColorConvertFloat4ToU32(wire),
-                            24,style(Element::Hitbox).thickness);
+            draw->AddCircle(center, radius, ImGui::ColorConvertFloat4ToU32(wire),
+                            24, style(Element::Hitbox).thickness);
     };
     sampleShape(top+30, 16, settings.hitboxWireColors.critical, settings.hitboxFillColors.critical);
     sampleShape(top+66, 18, settings.hitboxWireColors.ordinary, settings.hitboxFillColors.ordinary);
