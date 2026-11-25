@@ -17,7 +17,7 @@ if (-not $OutputDirectory) { $OutputDirectory=Join-Path $repo ('dist\'+$version)
 $output=[IO.Path]::GetFullPath($OutputDirectory)
 if ((Test-Path -LiteralPath $output) -and @(Get-ChildItem -LiteralPath $output -Force).Count) { throw 'Package output must be empty; choose a new directory' }
 New-Item -ItemType Directory -Force $output | Out-Null
-$runtimeFiles=@('UNDMA_V3.exe','unleashed-launcher.exe','info.db','FTD2XX.dll','FTD3XX.dll','FTD3XXWU.dll','Helper64.dll','vmsavedstatedumpprovider.dll','leechcore.dll','vmm.dll','leechcore_device_rawtcp.dll','leechcore_device_hvsavedstate.dll','leechcore_driver.dll')
+$runtimeFiles=@('UNDMA_V3.exe','unleashed-launcher.exe','info.db','FTD2XX.dll','FTD3XX.dll','FTD3XXWU.dll','Helper64.dll','vmsavedstatedumpprovider.dll','leechcore.dll','vmm.dll','leechcore_device_rawtcp.dll','leechcore_device_hvsavedstate.dll','leechcore_driver.dll','unicorn.dll')
 $files=@(Get-ChildItem -LiteralPath $runtime -File | Where-Object { $_.Name -in $runtimeFiles })
 foreach ($file in $files) { Copy-Item -LiteralPath $file.FullName -Destination $output }
 Copy-Item -LiteralPath (Join-Path $runtime 'assets') -Destination (Join-Path $output 'assets') -Recurse

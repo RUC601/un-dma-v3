@@ -382,16 +382,15 @@ void Preview(const Settings& settings) {
     if(OW::Config::dist)text(Element::Distance,cx,bottom+4,"14 m");
     if(settings.prediction)draw->AddCircle(position(Element::Prediction,cx+25,top+75),style(Element::Prediction).size*.25f,color(Element::Prediction),20,style(Element::Prediction).thickness);
     const auto sampleShape = [&](float y, float radius, const ImVec4& wire, const ImVec4& fill) {
-        const auto center = position(Element::Hitbox, cx, y);
         if (settings.hitboxFill) {
             const auto& fillStyle = settings.hitboxFillStyle;
             const ImVec4& rgba = settings.hitboxFillByClass
                 ? fill : V2::VisualSettings::Color(fillStyle, true, visible);
-            draw->AddCircleFilled(ImVec2(center.x + fillStyle.offsetX, center.y + fillStyle.offsetY),
+            draw->AddCircleFilled(ImVec2(cx + fillStyle.offsetX, y + fillStyle.offsetY),
                                   radius, ImGui::ColorConvertFloat4ToU32(rgba));
         }
         if (OW::Config::draw_hitbox)
-            draw->AddCircle(center, radius, ImGui::ColorConvertFloat4ToU32(wire),
+            draw->AddCircle(position(Element::Hitbox, cx, y), radius, ImGui::ColorConvertFloat4ToU32(wire),
                             24, style(Element::Hitbox).thickness);
     };
     sampleShape(top+30, 16, settings.hitboxWireColors.critical, settings.hitboxFillColors.critical);
