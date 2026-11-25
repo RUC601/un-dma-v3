@@ -74,6 +74,16 @@ inline const char* RayDecisionPolicyName(int backend) noexcept {
     return backend == static_cast<int>(RayDecisionPolicy::Hybrid) ? "hybrid" : "native-only";
 }
 
+// Hybrid needs BOTH a bound UniCore service and an established ray scene. Either one missing
+// means world occlusion can never be obtained, so RayDecisionAllowsSelection() rejects every
+// non-contour target. The settings page surfaces this state instead of leaving the user with
+// unexplained misses and a Diagnostics::Warn every 5s.
+inline bool RayPolicyNeedsServiceNotice(int backend, bool serviceBound,
+                                        uint64_t sceneEpoch) noexcept {
+    return backend == static_cast<int>(RayDecisionPolicy::Hybrid) &&
+           (!serviceBound || sceneEpoch == 0);
+}
+
 inline uint64_t RayDecisionNowUs() noexcept {
     return static_cast<uint64_t>(std::chrono::duration_cast<std::chrono::microseconds>(
         std::chrono::steady_clock::now().time_since_epoch()).count());

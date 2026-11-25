@@ -216,6 +216,19 @@ int main(int argc, char** argv) {
         OW::RayDecisionAllowsSelection({OW::RayDecisionStatus::Miss, OW::RayDecisionStatus::Clear},
                                        false, static_cast<int>(OW::RayDecisionPolicy::NativeOnly)))
         return Fail("ray decision readiness");
+    // Hybrid without a bound service or without a live scene can never obtain world occlusion,
+    // so the settings page must announce it; Native-only never needs the notice.
+    {
+        const int native = static_cast<int>(OW::RayDecisionPolicy::NativeOnly);
+        const int hybrid = static_cast<int>(OW::RayDecisionPolicy::Hybrid);
+        if (OW::RayPolicyNeedsServiceNotice(native, false, 0) ||
+            OW::RayPolicyNeedsServiceNotice(native, true, 7) ||
+            OW::RayPolicyNeedsServiceNotice(hybrid, true, 7) ||
+            !OW::RayPolicyNeedsServiceNotice(hybrid, false, 7) ||
+            !OW::RayPolicyNeedsServiceNotice(hybrid, true, 0) ||
+            !OW::RayPolicyNeedsServiceNotice(hybrid, false, 0))
+            return Fail("ray policy service notice");
+    }
     {
         OW::RayDecision aged{OW::RayDecisionStatus::Hit, OW::RayDecisionStatus::Clear};
         aged.ageMs = 150;

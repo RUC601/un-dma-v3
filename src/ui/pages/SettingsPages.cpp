@@ -119,6 +119,23 @@ void DrawMiscGeneralPage() {
         SetPersistenceStatus(UI::Preferences::Save(), T(UiText::SavedAllChanges));
     }
     ImGui::PopItemWidth();
+    // Hybrid requires BOTH an attached UniCore service and an established ray scene.
+    // Without them RayDecisionAllowsSelection() rejects every non-contour target, which the
+    // user only experiences as "random missed selections"; the only signal used to be a
+    // Diagnostics::Warn every 5s. Surface the exact cause where the choice is made.
+    {
+        const bool serviceBound = OW::RayRuntime::HasAttachedService();
+        const uint64_t sceneEpoch = OW::RayRuntime::SceneEpoch();
+        if (OW::RayPolicyNeedsServiceNotice(UI::Preferences::values.rayBackend, serviceBound, sceneEpoch)) {
+            ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.72f, 0.30f, 1.0f));
+            ImGui::TextWrapped("%s", !serviceBound
+                ? (zh ? "Hybrid 已选，但没有活动的 UniCore 射线服务：世界遮挡不可用，非轮廓目标会被严格拒绝，表现为漏选。"
+                      : "Hybrid is selected but no UniCore ray service is attached: world occlusion is unavailable and non-contour targets are rejected, so selections are missed.")
+                : (zh ? "Hybrid 已选，射线场景尚未建立（未进入对局或正在切换地图）：世界遮挡不可用，非轮廓目标会被严格拒绝。"
+                      : "Hybrid is selected but the ray scene is not established yet (not in a match, or switching maps): world occlusion is unavailable and non-contour targets are rejected."));
+            ImGui::PopStyleColor();
+        }
+    }
     SettingRow(zh ? "本地场景" : "Local scene");
     static bool sceneOpenFailed = false;
     if (ImGui::Button(zh ? "打开文件..." : "Open file...")) {
