@@ -1,6 +1,7 @@
 #include "Game/V3Raycast.hpp"
 #include "Game/RayDecision.hpp"
 #include "Game/RayQueryBroker.hpp"
+#include "Game/TrajectoryRayPlanner.hpp"
 #include "Game/GroundClip.hpp"
 #include "config/RayBackendMigration.hpp"
 
@@ -290,6 +291,7 @@ int main(int argc, char** argv) {
             std::atomic<bool> traceEntered{false};
             std::atomic<int> traceDelayMs{0};
             std::atomic<uint64_t> bindCount{0};
+            std::atomic<size_t> maxBatchSeen{0};
             std::thread::id bindThreadId{};
             std::thread::id traceThreadId{};
 
@@ -311,8 +313,31 @@ int main(int argc, char** argv) {
                 if (delay > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
                 // Entity B (end.x > 5) is occluded; Entity A is clear.
                 out.fraction = req.end.x > 5.0f ? 0.4f : 1.0f;
+                out.hitFlags = req.end.x > 5.0f ? 0x24u : 0u;
+                out.hitbox = req.end.x > 5.0f ? 7u : 0xFFFFu;
+                out.entityId = req.end.x > 5.0f ? 0x3Au : 0xFFFFFFFFu;
                 activeCalls.fetch_sub(1);
                 return OW::EngineTrace::Status::Ok;
+            }
+            void TraceBatch(std::span<const OW::EngineTrace::Request> reqs,
+                            std::span<OW::EngineTrace::Result> outs) override {
+                if (activeCalls.fetch_add(1) != 0) concurrentViolation.store(true);
+                traceThreadId = std::this_thread::get_id();
+                traceEntered.store(true);
+                size_t prev = maxBatchSeen.load();
+                while (reqs.size() > prev && !maxBatchSeen.compare_exchange_weak(prev, reqs.size())) {}
+                const int delay = traceDelayMs.load();
+                if (delay > 0) std::this_thread::sleep_for(std::chrono::milliseconds(delay));
+                const size_t n = (std::min)(reqs.size(), outs.size());
+                for (size_t i = 0; i < n; ++i) {
+                    outs[i] = OW::EngineTrace::Result{};
+                    outs[i].status = OW::EngineTrace::Status::Ok;
+                    outs[i].fraction = reqs[i].end.x > 5.0f ? 0.4f : 1.0f;
+                    outs[i].hitFlags = reqs[i].end.x > 5.0f ? 0x24u : 0u;
+                    outs[i].hitbox = reqs[i].end.x > 5.0f ? 7u : 0xFFFFu;
+                    outs[i].entityId = reqs[i].end.x > 5.0f ? 0x3Au : 0xFFFFFFFFu;
+                }
+                activeCalls.fetch_sub(1);
             }
         } backend;
 
@@ -377,14 +402,16 @@ int main(int argc, char** argv) {
             return std::optional<OW::RayDecision>{};
         };
 
-        // Multi-target and multi-bone results must all coexist in cache.
+        // Multi-target and multi-bone results must all coexist in cache with full hit metadata (§6.1).
         const auto gotA = waitResult(qA, qA.request, 10);
         const auto gotB = waitResult(qB, qB.request, 10);
         const auto gotAChest = waitResult(qAChest, qAChest.request, 10);
-        if (!gotA || gotA->world != OW::RayDecisionStatus::Clear ||
+        if (!gotA || gotA->world != OW::RayDecisionStatus::Clear || !Near(gotA->fraction, 1.0f, 1e-4f) ||
             !gotB || gotB->world != OW::RayDecisionStatus::Occluded ||
+            !Near(gotB->fraction, 0.4f, 1e-4f) || gotB->hitFlags != 0x24u ||
+            gotB->hitbox != 7u || gotB->hitEntityId != 0x3Au ||
             !gotAChest || gotAChest->world != OW::RayDecisionStatus::Clear)
-            return Fail("broker multi-target/multi-bone cache");
+            return Fail("broker multi-target/multi-bone cache and metadata passthrough");
 
         // BindScene and Trace must both have run on the worker thread, never on caller thread.
         if (backend.bindThreadId == callerThread || backend.traceThreadId == callerThread ||
@@ -392,35 +419,180 @@ int main(int argc, char** argv) {
             return Fail("broker did not confine Service calls to worker thread");
 
         // Realistic movement drift (~15cm) within 0.35m tolerance must still hit cache,
-        // while a blink/teleport (~2m) must miss cache.
+        // while a blink/teleport (~2m) must return explicit Stale(SpatialDrift) (§6.2).
         OW::EngineTrace::Request drifted = qA.request;
         drifted.start.x += 0.12f;
         drifted.end.z += 0.15f;
         const auto gotDrifted = broker.Latest(drifted, 11, 1, 7, 0xAA, 2, 17, 500);
-        if (!gotDrifted || gotDrifted->world != OW::RayDecisionStatus::Clear)
+        if (!gotDrifted || gotDrifted->world != OW::RayDecisionStatus::Clear ||
+            gotDrifted->staleReason != OW::RayStaleReason::None)
             return Fail("broker rejected small movement drift");
         OW::EngineTrace::Request teleported = qA.request;
         teleported.end.x += 2.0f;
-        if (broker.Latest(teleported, 11, 1, 7, 0xAA, 2, 17, 500).has_value())
-            return Fail("broker reused result past drift tolerance");
+        const auto gotTeleported = broker.Latest(teleported, 11, 1, 7, 0xAA, 2, 17, 500);
+        if (!gotTeleported || gotTeleported->world != OW::RayDecisionStatus::Stale ||
+            gotTeleported->staleReason != OW::RayStaleReason::SpatialDrift)
+            return Fail("broker failed to mark spatial drift as explicit Stale(SpatialDrift)");
 
-        // Expired age must mark world status Stale.
+        // Expired age must mark world status Stale(AgeExpired).
         std::this_thread::sleep_for(std::chrono::milliseconds(15));
         const auto stale = broker.Latest(qA.request, 12, 1, 7, 0xAA, 2, 17, 5);
-        if (!stale || stale->world != OW::RayDecisionStatus::Stale)
-            return Fail("broker failed to mark expired result stale");
+        if (!stale || stale->world != OW::RayDecisionStatus::Stale ||
+            stale->staleReason != OW::RayStaleReason::AgeExpired)
+            return Fail("broker failed to mark expired result stale(AgeExpired)");
+
+        // Phase 2 (§6.1-§6.3): SubmitBatch of 6 distinct slots (3 ParabolicChords + 1 GroundClip + 2 EdgeFan)
+        // must execute in a single 6-ray batch without slot collision and coexist in cache.
+        {
+            std::vector<OW::EngineTrace::RayQueryBroker::Query> sixBatch;
+            for (uint8_t s = 0; s < 3; ++s) {
+                auto q = qA;
+                q.frame = 15;
+                q.segmentKind = OW::RaySegmentKind::ParabolicChord;
+                q.segmentIndex = s;
+                q.request.end.x = (s == 1) ? 8.0f : 1.0f; // middle chord blocked, others clear
+                sixBatch.push_back(q);
+            }
+            {
+                auto q = qA;
+                q.frame = 15;
+                q.segmentKind = OW::RaySegmentKind::GroundClip;
+                q.segmentIndex = 0;
+                q.request.end.x = 7.0f; // ground hit at fraction 0.4
+                sixBatch.push_back(q);
+            }
+            for (uint8_t f = 0; f < 2; ++f) {
+                auto q = qA;
+                q.frame = 15;
+                q.segmentKind = OW::RaySegmentKind::EdgeFan;
+                q.segmentIndex = f;
+                q.request.end.x = (f == 0) ? 9.0f : 1.0f;
+                sixBatch.push_back(q);
+            }
+            backend.maxBatchSeen.store(0);
+            broker.SubmitBatch(sixBatch);
+            bool allReady = false;
+            for (int attempt = 0; attempt < 100; ++attempt) {
+                const auto p0 = broker.Latest(sixBatch[0].request, 15, 1, 7, 0xAA, 2, 17, 500, 0.35f,
+                                              OW::RaySegmentKind::ParabolicChord, 0);
+                const auto p1 = broker.Latest(sixBatch[1].request, 15, 1, 7, 0xAA, 2, 17, 500, 0.35f,
+                                              OW::RaySegmentKind::ParabolicChord, 1);
+                const auto p2 = broker.Latest(sixBatch[2].request, 15, 1, 7, 0xAA, 2, 17, 500, 0.35f,
+                                              OW::RaySegmentKind::ParabolicChord, 2);
+                const auto gc = broker.Latest(sixBatch[3].request, 15, 1, 7, 0xAA, 2, 17, 500, 0.35f,
+                                              OW::RaySegmentKind::GroundClip, 0);
+                const auto ef0 = broker.Latest(sixBatch[4].request, 15, 1, 7, 0xAA, 2, 17, 500, 0.35f,
+                                               OW::RaySegmentKind::EdgeFan, 0);
+                const auto ef1 = broker.Latest(sixBatch[5].request, 15, 1, 7, 0xAA, 2, 17, 500, 0.35f,
+                                               OW::RaySegmentKind::EdgeFan, 1);
+                if (p0 && p1 && p2 && gc && ef0 && ef1) {
+                    if (p0->world != OW::RayDecisionStatus::Clear ||
+                        p1->world != OW::RayDecisionStatus::Occluded ||
+                        p2->world != OW::RayDecisionStatus::Clear ||
+                        gc->world != OW::RayDecisionStatus::Occluded ||
+                        ef0->world != OW::RayDecisionStatus::Occluded ||
+                        ef1->world != OW::RayDecisionStatus::Clear) {
+                        return Fail("broker 6-slot segmentKind/segmentIndex coexistence mismatch");
+                    }
+                    allReady = true;
+                    break;
+                }
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            if (!allReady || backend.maxBatchSeen.load() != 6)
+                return Fail("broker failed to dispatch 6-slot batch concurrently");
+        }
 
         // Scene change must immediately invalidate cached entries.
         broker.SetScene(8);
         if (broker.Latest(qA.request, 12, 1, 7, 0xAA, 2, 17, 500).has_value())
             return Fail("broker retained cache across scene change");
 
+        // Scene change during an in-flight broker batch must discard old-scene completions
+        // so stale results never pollute the new scene cache (Finding #16).
+        {
+            backend.traceDelayMs.store(40);
+            backend.traceEntered.store(false);
+            auto qInFlight = qA;
+            qInFlight.frame = 18;
+            qInFlight.request.sceneEpoch = 8;
+            qInFlight.sceneEpoch = 8;
+            broker.Submit(qInFlight);
+            for (int attempt = 0; attempt < 100 && !backend.traceEntered.load(); ++attempt) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(2));
+            }
+            if (!backend.traceEntered.load()) return Fail("in-flight batch did not start");
+            broker.SetScene(9);
+            std::this_thread::sleep_for(std::chrono::milliseconds(60));
+            if (broker.Latest(qInFlight.request, 19, 1, 8, 0xAA, 2, 17, 500).has_value() ||
+                broker.Latest(qInFlight.request, 19, 1, 9, 0xAA, 2, 17, 500).has_value()) {
+                return Fail("in-flight batch leaked across SetScene boundary");
+            }
+            backend.traceDelayMs.store(0);
+            auto qNewScene = qA;
+            qNewScene.frame = 19;
+            qNewScene.request.sceneEpoch = 9;
+            qNewScene.sceneEpoch = 9;
+            broker.Submit(qNewScene);
+            const auto gotNewScene = waitResult(qNewScene, qNewScene.request, 19);
+            if (!gotNewScene || gotNewScene->world != OW::RayDecisionStatus::Clear)
+                return Fail("broker failed to resume cleanly on new scene after in-flight SetScene");
+        }
+
+        // F4/F9 production seam test: EvaluateParabolicBrokerDecision end-to-end on real broker
+        // for 1-segment Hanzo 30m low-arch (impactPoint vs gravity-lifted aimPoint would drift 0.365m
+        // if lookup diverged from submit) AND 3-segment parabolic chord aggregation.
+        {
+            const OW::Vector3 hOrigin{0.0f, 1.5f, 0.0f};
+            const OW::Vector3 hTarget{0.0f, 1.5f, 30.0f};
+            const auto hanzo30Plan = OW::TrajectoryRay::BuildParabolicChordPlan(
+                hOrigin, hTarget, {0.0f, 0.0f, 0.0f}, 110.0f, 9.8f, {0.0f, 1.9f, 30.0f});
+            if (hanzo30Plan.segmentCount != 1)
+                return Fail("Hanzo 30m expected 1-segment plan for seam test");
+            // Submit through EvaluateParabolicBrokerDecision with divergent fallbackEnd (Y=1.9 vs impact Y=1.5).
+            (void)OW::TrajectoryRay::EvaluateParabolicBrokerDecision(
+                broker, &hanzo30Plan, hOrigin, {0.0f, 1.9f, 30.0f},
+                21, 1, 9, 0xCC, 1, 17, 100, OW::EngineTrace::Request{}.mask, 500, true);
+            OW::RayDecision got1Chord{};
+            for (int attempt = 0; attempt < 200; ++attempt) {
+                got1Chord = OW::TrajectoryRay::EvaluateParabolicBrokerDecision(
+                    broker, &hanzo30Plan, hOrigin, {0.0f, 1.9f, 30.0f},
+                    21, 1, 9, 0xCC, 1, 17, 100, OW::EngineTrace::Request{}.mask, 500, false);
+                if (got1Chord.world == OW::RayDecisionStatus::Clear)
+                    break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            if (got1Chord.world != OW::RayDecisionStatus::Clear)
+                return Fail("EvaluateParabolicBrokerDecision 1-chord Hanzo 30m submit/lookup diverged");
+
+            // 3-chord parabolic submit + aggregate through real broker.
+            const auto junkPlan = OW::TrajectoryRay::BuildParabolicChordPlan(
+                hOrigin, {0.0f, 1.5f, 25.0f}, {0.0f, 0.0f, 0.0f}, 25.0f, 9.8f, {0.0f, 4.0f, 25.0f});
+            if (junkPlan.segmentCount != 3)
+                return Fail("Junkrat 25m expected 3-segment plan for seam test");
+            (void)OW::TrajectoryRay::EvaluateParabolicBrokerDecision(
+                broker, &junkPlan, hOrigin, {0.0f, 4.0f, 25.0f},
+                22, 1, 9, 0xCD, 1, 17, 101, OW::EngineTrace::Request{}.mask, 500, true);
+            OW::RayDecision got3Chord{};
+            for (int attempt = 0; attempt < 200; ++attempt) {
+                got3Chord = OW::TrajectoryRay::EvaluateParabolicBrokerDecision(
+                    broker, &junkPlan, hOrigin, {0.0f, 4.0f, 25.0f},
+                    22, 1, 9, 0xCD, 1, 17, 101, OW::EngineTrace::Request{}.mask, 500, false);
+                if (got3Chord.world == OW::RayDecisionStatus::Clear)
+                    break;
+                std::this_thread::sleep_for(std::chrono::milliseconds(5));
+            }
+            if (got3Chord.world != OW::RayDecisionStatus::Clear ||
+                got3Chord.segmentKind != OW::RaySegmentKind::ParabolicChord)
+                return Fail("EvaluateParabolicBrokerDecision 3-chord round-trip failed");
+        }
+
         // Detach must synchronously wait for an in-flight Trace so destroying Service is UAF-free.
         backend.traceDelayMs.store(60);
         backend.traceEntered.store(false);
         OW::EngineTrace::RayQueryBroker::Query qSlow = qA;
-        qSlow.request.sceneEpoch = 8;
-        qSlow.sceneEpoch = 8;
+        qSlow.request.sceneEpoch = 9;
+        qSlow.sceneEpoch = 9;
         qSlow.frame = 20;
         broker.Submit(qSlow);
         for (int attempt = 0; attempt < 100 && !backend.traceEntered.load(); ++attempt) {
@@ -433,6 +605,326 @@ int main(int argc, char** argv) {
             return Fail("broker Detach returned while Service was still in flight");
 
         broker.Stop();
+    }
+
+    // Phase 2 (§6.4, Decision #8): Parabolic arch-height gate, 1/2/3 chord residual & aggregation.
+    {
+        using namespace OW::TrajectoryRay;
+        const OW::Vector3 origin{0.0f, 1.5f, 0.0f};
+        const OW::Vector3 zeroVel{0.0f, 0.0f, 0.0f};
+
+        // Hanzo full draw (110 m/s, 9.82 m/s^2): 30m -> 1 seg (h_max~0.09m), 40m -> 2 segs (h_max~0.16m, res~0.04m).
+        const auto hanzo30 = BuildParabolicChordPlan(origin, {0.0f, 1.5f, 30.0f}, zeroVel, 110.0f, 9.82f, {0.0f, 1.5f, 30.0f});
+        const auto hanzo40 = BuildParabolicChordPlan(origin, {0.0f, 1.5f, 40.0f}, zeroVel, 110.0f, 9.82f, {0.0f, 1.5f, 40.0f});
+        if (hanzo30.segmentCount != 1 || !Near(hanzo30.archHeightMeters, 0.09f, 0.02f) ||
+            hanzo40.segmentCount != 2 || !Near(hanzo40.archHeightMeters, 0.16f, 0.02f) ||
+            !Near(hanzo40.maxChordDeviationMeters, 0.04f, 0.01f)) {
+            return Fail("parabolic chord table: Hanzo 30m/40m");
+        }
+
+        // Torbjorn primary (70 m/s, 9.81 m/s^2): 20m -> 1 seg, 30m -> 2 segs (h_max~0.23m).
+        const auto torb20 = BuildParabolicChordPlan(origin, {0.0f, 1.5f, 20.0f}, zeroVel, 70.0f, 9.81f, {0.0f, 1.5f, 20.0f});
+        const auto torb30 = BuildParabolicChordPlan(origin, {0.0f, 1.5f, 30.0f}, zeroVel, 70.0f, 9.81f, {0.0f, 1.5f, 30.0f});
+        if (torb20.segmentCount != 1 || torb30.segmentCount != 2 || !Near(torb30.archHeightMeters, 0.23f, 0.02f)) {
+            return Fail("parabolic chord table: Torbjorn 20m/30m");
+        }
+
+        // Junkrat primary (30 m/s, 12.35 m/s^2): 10m -> 2 segs (h_max~0.17m), 20m -> 3 segs (h_max~0.70m, res~0.08m).
+        const auto junk10 = BuildParabolicChordPlan(origin, {0.0f, 1.5f, 10.0f}, zeroVel, 30.0f, 12.35f, {0.0f, 1.5f, 10.0f});
+        const auto junk20 = BuildParabolicChordPlan(origin, {0.0f, 1.5f, 20.0f}, zeroVel, 30.0f, 12.35f, {0.0f, 1.5f, 20.0f});
+        if (junk10.segmentCount != 2 || !Near(junk10.archHeightMeters, 0.17f, 0.02f) ||
+            junk20.segmentCount != 3 || !Near(junk20.archHeightMeters, 0.70f, 0.03f) ||
+            !Near(junk20.maxChordDeviationMeters, 0.08f, 0.02f)) {
+            return Fail("parabolic chord table: Junkrat 10m/20m");
+        }
+        // Chords must be continuous end-to-end from origin to physical impact point.
+        if ((junk20.segments[0].first - origin).Size() > 1e-4f ||
+            (junk20.segments[0].second - junk20.segments[1].first).Size() > 1e-4f ||
+            (junk20.segments[1].second - junk20.segments[2].first).Size() > 1e-4f ||
+            (junk20.segments[2].second - OW::Vector3(0.0f, 1.5f, 20.0f)).Size() > 1e-3f) {
+            return Fail("parabolic 3-segment chord continuity");
+        }
+
+        // Zarya alt (25 m/s, 9.84 m/s^2): 10m -> 2 segs, 20m -> 3 segs (h_max~0.81m).
+        const auto zarya10 = BuildParabolicChordPlan(origin, {0.0f, 1.5f, 10.0f}, zeroVel, 25.0f, 9.84f, {0.0f, 1.5f, 10.0f});
+        const auto zarya20 = BuildParabolicChordPlan(origin, {0.0f, 1.5f, 20.0f}, zeroVel, 25.0f, 9.84f, {0.0f, 1.5f, 20.0f});
+        if (zarya10.segmentCount != 2 || zarya20.segmentCount != 3 || !Near(zarya20.archHeightMeters, 0.81f, 0.03f)) {
+            return Fail("parabolic chord table: Zarya 10m/20m");
+        }
+
+        // Decision #8: 3/3 Clear -> Clear; any Occluded -> Occluded with metadata; partial Stale -> Stale.
+        OW::RayDecision c0{OW::RayDecisionStatus::Hit, OW::RayDecisionStatus::Clear};
+        c0.fraction = 1.0f; c0.segmentKind = OW::RaySegmentKind::ParabolicChord; c0.segmentIndex = 0;
+        OW::RayDecision c1 = c0; c1.segmentIndex = 1;
+        OW::RayDecision c2 = c0; c2.segmentIndex = 2;
+        const auto aggAllClear = AggregateParabolicDecisions({c0, c1, c2}, 3);
+        if (aggAllClear.world != OW::RayDecisionStatus::Clear)
+            return Fail("parabolic 3/3 Clear aggregation");
+
+        OW::RayDecision occ = c1;
+        occ.world = OW::RayDecisionStatus::Occluded;
+        occ.fraction = 0.35f;
+        occ.hitFlags = 0x24u;
+        occ.hitEntityId = 0x11u;
+        const auto aggBlocked = AggregateParabolicDecisions({c0, occ, c2}, 3);
+        if (aggBlocked.world != OW::RayDecisionStatus::Occluded ||
+            !Near(aggBlocked.fraction, 0.35f, 1e-4f) || aggBlocked.hitEntityId != 0x11u) {
+            return Fail("parabolic occluded chord aggregation");
+        }
+
+        OW::RayDecision staleSeg = c2;
+        staleSeg.world = OW::RayDecisionStatus::Stale;
+        staleSeg.staleReason = OW::RayStaleReason::SpatialDrift;
+        const auto aggVacuum = AggregateParabolicDecisions({c0, c1, staleSeg}, 3);
+        if (aggVacuum.world != OW::RayDecisionStatus::Stale ||
+            aggVacuum.staleReason != OW::RayStaleReason::SpatialDrift) {
+            return Fail("parabolic vacuum chord must not turn into Clear");
+        }
+
+        // Finding #1 regression: missing (std::nullopt) chord segments MUST NEVER produce Clear!
+        const auto aggMissingTail = AggregateParabolicDecisions({c0, std::nullopt, std::nullopt}, 3);
+        const auto aggMissingLast = AggregateParabolicDecisions({c0, c1, std::nullopt}, 3);
+        const auto aggMissingWithOcc = AggregateParabolicDecisions({std::nullopt, occ, std::nullopt}, 3);
+        if (aggMissingTail.world != OW::RayDecisionStatus::Unknown ||
+            aggMissingTail.segmentIndex != 1 ||
+            aggMissingLast.world != OW::RayDecisionStatus::Unknown ||
+            aggMissingLast.segmentIndex != 2 ||
+            aggMissingWithOcc.world != OW::RayDecisionStatus::Occluded) {
+            return Fail("parabolic missing chord must stay Unknown, never Clear");
+        }
+
+        // Finding #4 regression: 1-segment ballistic chord (Hanzo 30m) ends at physical impactPoint,
+        // so chordPlan.segments[0] is identical for both batch submit and MakeNativeRayDecision lookup.
+        if ((hanzo30.segments[0].first - origin).Size() > 1e-4f ||
+            (hanzo30.segments[0].second - hanzo30.impactPoint).Size() > 1e-4f) {
+            return Fail("1-segment ballistic chord must end at physical impactPoint");
+        }
+
+        // Airborne GroundClip ray (§6.3 Slot 2) & Finding #9 motion-consistent clip.
+        OW::Vector3 gcStart{}, gcEnd{};
+        if (BuildAirborneGroundClipRay({0.0f, 1.0f, 10.0f}, {5.0f, 0.05f, 0.0f}, 0.2f, gcStart, gcEnd))
+            return Fail("grounded actor must not emit airborne GroundClip ray");
+        if (!BuildAirborneGroundClipRay({0.0f, 2.0f, 10.0f}, {0.0f, -6.0f, 0.0f}, 0.3f, gcStart, gcEnd))
+            return Fail("falling actor must emit airborne GroundClip ray");
+        OW::RayDecision groundHit{OW::RayDecisionStatus::Unknown, OW::RayDecisionStatus::Occluded};
+        groundHit.fraction = 0.5f;
+        const float expectedGroundY = gcStart.Y + (gcEnd.Y - gcStart.Y) * 0.5f;
+        OW::Vector3 predHead{0.0f, -1.0f, 10.0f}; // Overshot below terrain
+        const bool clipped = ApplyAirborneGroundClip({0.0f, 3.6f, 10.0f}, {0.0f, 2.0f, 10.0f},
+                                                     gcStart, gcEnd, groundHit, predHead);
+        if (!clipped || !Near(predHead.Y, expectedGroundY + 1.6f, 1e-3f))
+            return Fail("airborne GroundClip failed to clamp bone height above terrain");
+        OW::Vector3 motionPreFire{0.0f, expectedGroundY + 2.0f, 10.0f};
+        OW::Vector3 motionVel{0.0f, -10.0f, 0.0f};
+        if (!ApplyAirborneGroundClipMotion({0.0f, 3.6f, 10.0f}, {0.0f, 2.0f, 10.0f},
+                                           gcStart, gcEnd, groundHit, 0.2f, motionPreFire, motionVel) ||
+            motionPreFire.Y + motionVel.Y * 0.2f < expectedGroundY + 1.6f - 1e-3f) {
+            return Fail("airborne GroundClipMotion failed to keep projected impact above terrain");
+        }
+
+        // F6 exact regression: retreating airborne target at 20m, speed=25m/s, retreat=5.5m/s
+        // has actual solved flight T > 1.025s (> approx 0.8s). GroundClip must guarantee terrain
+        // clearance (>= 1.6m) at the ACTUAL solved flight time and in BuildParabolicChordPlan.
+        {
+            OW::RayDecision floorHit{OW::RayDecisionStatus::Unknown, OW::RayDecisionStatus::Occluded};
+            floorHit.fraction = 0.5f; // groundY = 0.0, rawBone=3.6, root=2.0 -> minBoneY = 1.6
+            OW::Vector3 f6Origin{0.0f, 1.5f, 0.0f};
+            OW::Vector3 f6PreFire{0.0f, 2.0f, 20.0f};
+            OW::Vector3 f6Vel{0.0f, -2.0f, 5.5f}; // Retreating +Z at 5.5 m/s while falling
+            OW::BallisticIntercept f6Solved{};
+            if (!ApplyAirborneGroundClipAndSolveIntercept(
+                    f6Origin, {0.0f, 3.6f, 20.0f}, {0.0f, 2.0f, 20.0f},
+                    {0.0f, 2.0f, 20.0f}, {0.0f, -2.0f, 20.0f}, floorHit,
+                    25.0f, 9.8f, f6PreFire, f6Vel, &f6Solved)) {
+                return Fail("F6 GroundClipAndSolveIntercept failed to cap descending retreating target");
+            }
+            if (!f6Solved.solved || f6Solved.flightSeconds <= 1.025f) {
+                return Fail("F6 solved flight time should exceed 1.025s for retreating target");
+            }
+            const float solvedImpactY = f6PreFire.Y + f6Vel.Y * f6Solved.flightSeconds;
+            const auto f6Chords = BuildParabolicChordPlan(
+                f6Origin, f6PreFire, f6Vel, 25.0f, 9.8f, f6Solved.aimPoint);
+            if (solvedImpactY < 1.6f - 1e-3f || f6Chords.impactPoint.Y < 1.6f - 1e-3f) {
+                return Fail("F6 solved impact or parabolic chord sank below minBoneY=1.6m");
+            }
+
+            // F6 reachable-to-unreachable regression (Codex Round 3 exact numerical case):
+            // Launch (0,0,0), pre-fire (60,10,0), speed 25 m/s, gravity 9.84 m/s^2, initial v_y=-10 m/s,
+            // minBoneY=9.6 m. Initial intercept succeeds (~2.478s), but after clipping v_y (~-0.161 m/s)
+            // the shot becomes unreachable -> MUST return clipped=true and outIntercept.solved=false!
+            const OW::Vector3 uOrigin{0.0f, 0.0f, 0.0f};
+            OW::Vector3 uPreFire{60.0f, 10.0f, 0.0f};
+            OW::Vector3 uVel{0.0f, -10.0f, 0.0f};
+            const auto initialReachable = OW::SolveBallisticIntercept(uOrigin, uPreFire, uVel, 25.0f, 9.84f);
+            if (!initialReachable.solved) {
+                return Fail("F6 reachable-to-unreachable fixture precondition failed");
+            }
+            OW::RayDecision highFloorHit{OW::RayDecisionStatus::Unknown, OW::RayDecisionStatus::Occluded};
+            highFloorHit.fraction = 0.5f; // groundRayStart.Y=10, groundRayEnd.Y=6 -> groundY=8.0; boneHeight=10.0-8.4=1.6 -> minBoneY=9.6
+            OW::BallisticIntercept uSolved{};
+            uSolved.solved = true; // Pre-seed to verify helper explicitly invalidates it!
+            const bool uClipped = ApplyAirborneGroundClipAndSolveIntercept(
+                uOrigin, {60.0f, 10.0f, 0.0f}, {60.0f, 8.4f, 0.0f},
+                {60.0f, 10.0f, 0.0f}, {60.0f, 6.0f, 0.0f}, highFloorHit,
+                25.0f, 9.84f, uPreFire, uVel, &uSolved);
+            if (!uClipped || uSolved.solved) {
+                return Fail("F6 reachable-to-unreachable clip must invalidate stale intercept (solved=false)");
+            }
+        }
+
+        // 6-slot RayBatchPlanner quota, Barrier yield, EdgeFan borrow, AND F2 sustained saturation (§6.3).
+        auto makeQ = [](uint64_t key, int bone, OW::RaySegmentKind kind, uint8_t idx) {
+            OW::EngineTrace::RayQueryBroker::Query q{};
+            q.sceneEpoch = 7;
+            q.entityKey = key;
+            q.actorGeneration = 1;
+            q.boneId = bone;
+            q.segmentKind = kind;
+            q.segmentIndex = idx;
+            return q;
+        };
+        RayBatchPlanInput in{};
+        in.top1Primary.PushUrgent(makeQ(1, 17, OW::RaySegmentKind::ParabolicChord, 0));
+        in.top1Primary.PushUrgent(makeQ(1, 17, OW::RaySegmentKind::ParabolicChord, 1));
+        in.top1FallbackOrWarmup.PushUrgent(makeQ(1, 5, OW::RaySegmentKind::Direct, 0));
+        in.top1GroundClip = makeQ(1, 17, OW::RaySegmentKind::GroundClip, 0);
+        in.top1GroundClipUrgent = true;
+        in.barrierPolicy = OW::BarrierPolicy::IgnoreBarrier;
+        in.top1WorldClear = true;
+        in.top1BarrierQuery = makeQ(1, 17, OW::RaySegmentKind::Barrier, 0);
+        in.top1BarrierUrgent = true;
+        in.top2Primary.PushUrgent(makeQ(2, 17, OW::RaySegmentKind::ParabolicChord, 0));
+        in.top2Primary.PushUrgent(makeQ(2, 17, OW::RaySegmentKind::ParabolicChord, 1));
+        const auto planIgnoreBarrier = PlanRayBatch(in);
+        // IgnoreBarrier yields Slot 3 -> 2 primary + 1 groundClip + 1 fallback + 2 Top2 parabolic chords = 6!
+        if (planIgnoreBarrier.count != 6 || planIgnoreBarrier.edgeFanBorrowed)
+            return Fail("RayBatchPlanner 6-slot normal quota");
+        int top2ChordsScheduled = 0;
+        for (size_t k = 0; k < planIgnoreBarrier.count; ++k) {
+            if (planIgnoreBarrier.queries[k].segmentKind == OW::RaySegmentKind::Barrier)
+                return Fail("IgnoreBarrier policy must not schedule Barrier slot");
+            if (planIgnoreBarrier.queries[k].entityKey == 2 &&
+                planIgnoreBarrier.queries[k].segmentKind == OW::RaySegmentKind::ParabolicChord)
+                ++top2ChordsScheduled;
+        }
+        if (top2ChordsScheduled != 2)
+            return Fail("RayBatchPlanner must schedule complete multi-chord set for Top-2 when slots fit");
+        in.barrierPolicy = OW::BarrierPolicy::WaitBarrierDrop;
+        const auto planWaitBarrier = PlanRayBatch(in);
+        bool hasBarrier = false;
+        for (size_t k = 0; k < planWaitBarrier.count; ++k) {
+            if (planWaitBarrier.queries[k].segmentKind == OW::RaySegmentKind::Barrier)
+                hasBarrier = true;
+        }
+        if (planWaitBarrier.count != 6 || !hasBarrier)
+            return Fail("WaitBarrierDrop policy must schedule Barrier slot when world Clear");
+
+        // F2 persistent urgent-saturation & steady-state refresh regression (Codex Round 3 Finding 1):
+        // Even when ALL 7 sources (3-chord Top-1 primary, GroundClip, 3-chord Top-1 fallback, Barrier,
+        // 3-chord Top-2 primary, 3-chord Top-2 fallback, 3-chord Top-3 primary = 17 urgent queries)
+        // stay PERMANENTLY urgent across 6 ticks, every single source and every chord index {0,1,2}
+        // must make sustained progress (ZERO starvation!).
+        {
+            RayBatchPlanInput persistentUrgent{};
+            for (uint8_t s = 0; s < 3; ++s) {
+                persistentUrgent.top1Primary.PushUrgent(makeQ(1, 17, OW::RaySegmentKind::ParabolicChord, s));
+                persistentUrgent.top1FallbackOrWarmup.PushUrgent(makeQ(1, 5, OW::RaySegmentKind::ParabolicChord, s));
+                persistentUrgent.top2Primary.PushUrgent(makeQ(2, 17, OW::RaySegmentKind::ParabolicChord, s));
+                persistentUrgent.top2Fallback.PushUrgent(makeQ(2, 5, OW::RaySegmentKind::ParabolicChord, s));
+                persistentUrgent.top3Primary.PushUrgent(makeQ(3, 17, OW::RaySegmentKind::ParabolicChord, s));
+            }
+            persistentUrgent.top1GroundClip = makeQ(1, 17, OW::RaySegmentKind::GroundClip, 0);
+            persistentUrgent.top1GroundClipUrgent = true;
+            persistentUrgent.barrierPolicy = OW::BarrierPolicy::WaitBarrierDrop;
+            persistentUrgent.top1WorldClear = true;
+            persistentUrgent.top1BarrierQuery = makeQ(1, 17, OW::RaySegmentKind::Barrier, 0);
+            persistentUrgent.top1BarrierUrgent = true;
+
+            uint32_t uT1P = 0, uT1F = 0, uT2P = 0, uT2F = 0, uT3P = 0;
+            int uGc = 0, uBarrier = 0;
+            for (uint32_t tick = 0; tick < 6; ++tick) {
+                persistentUrgent.rotationCursor = tick;
+                const auto p = PlanRayBatch(persistentUrgent);
+                if (p.count != 6)
+                    return Fail("F2 persistent urgent saturation must utilize all 6 slots");
+                for (size_t k = 0; k < p.count; ++k) {
+                    const auto& q = p.queries[k];
+                    if (q.segmentKind == OW::RaySegmentKind::GroundClip) ++uGc;
+                    else if (q.segmentKind == OW::RaySegmentKind::Barrier) ++uBarrier;
+                    else if (q.entityKey == 1 && q.boneId == 17) uT1P |= (1u << q.segmentIndex);
+                    else if (q.entityKey == 1 && q.boneId == 5) uT1F |= (1u << q.segmentIndex);
+                    else if (q.entityKey == 2 && q.boneId == 17) uT2P |= (1u << q.segmentIndex);
+                    else if (q.entityKey == 2 && q.boneId == 5) uT2F |= (1u << q.segmentIndex);
+                    else if (q.entityKey == 3 && q.boneId == 17) uT3P |= (1u << q.segmentIndex);
+                }
+            }
+            if (uT1P != 0x7u || uT1F != 0x7u || uT2P != 0x7u || uT2F != 0x7u || uT3P != 0x7u ||
+                uGc < 5 || uBarrier < 5) {
+                return Fail("F2 persistent urgent saturation starved GroundClip, Barrier, Top-2, or Top-3");
+            }
+
+            // Steady-state refresh saturation (all 7 sources fresh): across 6 ticks, zero starvation.
+            RayBatchPlanInput steady{};
+            for (uint8_t s = 0; s < 3; ++s) {
+                steady.top1Primary.PushRefresh(makeQ(1, 17, OW::RaySegmentKind::ParabolicChord, s));
+                steady.top1FallbackOrWarmup.PushRefresh(makeQ(1, 5, OW::RaySegmentKind::ParabolicChord, s));
+                steady.top2Primary.PushRefresh(makeQ(2, 17, OW::RaySegmentKind::ParabolicChord, s));
+                steady.top2Fallback.PushRefresh(makeQ(2, 5, OW::RaySegmentKind::ParabolicChord, s));
+                steady.top3Primary.PushRefresh(makeQ(3, 17, OW::RaySegmentKind::ParabolicChord, s));
+            }
+            steady.top1GroundClip = makeQ(1, 17, OW::RaySegmentKind::GroundClip, 0);
+            steady.top1GroundClipUrgent = false;
+
+            uint32_t maskT1P = 0, maskT1F = 0, maskT2P = 0, maskT2F = 0, maskT3P = 0;
+            int gcCount = 0;
+            for (uint32_t tick = 0; tick < 6; ++tick) {
+                steady.rotationCursor = tick;
+                const auto p = PlanRayBatch(steady);
+                if (p.count != 6)
+                    return Fail("F2 steady-state saturation must utilize all 6 slots");
+                for (size_t k = 0; k < p.count; ++k) {
+                    const auto& q = p.queries[k];
+                    if (q.segmentKind == OW::RaySegmentKind::GroundClip) ++gcCount;
+                    else if (q.entityKey == 1 && q.boneId == 17) maskT1P |= (1u << q.segmentIndex);
+                    else if (q.entityKey == 1 && q.boneId == 5) maskT1F |= (1u << q.segmentIndex);
+                    else if (q.entityKey == 2 && q.boneId == 17) maskT2P |= (1u << q.segmentIndex);
+                    else if (q.entityKey == 2 && q.boneId == 5) maskT2F |= (1u << q.segmentIndex);
+                    else if (q.entityKey == 3 && q.boneId == 17) maskT3P |= (1u << q.segmentIndex);
+                }
+            }
+            if (maskT1P != 0x7u || maskT1F != 0x7u || maskT2P != 0x7u || maskT2F != 0x7u ||
+                maskT3P != 0x7u || gcCount < 5) {
+                return Fail("F2 steady-state saturation starved a chord group or GroundClip");
+            }
+        }
+
+        // EdgeFan borrow claims all 6 slots exclusively.
+        in.edgeFanBorrowActive = true;
+        in.edgeFanCount = 6;
+        for (uint8_t f = 0; f < 6; ++f) {
+            in.edgeFanQueries[f] = makeQ(1, 17, OW::RaySegmentKind::EdgeFan, f);
+        }
+        const auto planEdgeFan = PlanRayBatch(in);
+        if (planEdgeFan.count != 6 || !planEdgeFan.edgeFanBorrowed)
+            return Fail("RayBatchPlanner EdgeFan 6-slot borrow");
+        for (size_t k = 0; k < 6; ++k) {
+            if (planEdgeFan.queries[k].segmentKind != OW::RaySegmentKind::EdgeFan ||
+                planEdgeFan.queries[k].segmentIndex != k)
+                return Fail("EdgeFan borrowed slot mismatch");
+        }
+
+        // Decision #7: Hybrid vacuum tracking grace (<=60ms with Vis==true) vs strict auto-fire block.
+        OW::RayDecision vacuum{OW::RayDecisionStatus::Hit, OW::RayDecisionStatus::Stale};
+        vacuum.staleReason = OW::RayStaleReason::SpatialDrift;
+        const int hybrid = static_cast<int>(OW::RayDecisionPolicy::Hybrid);
+        if (OW::RayDecisionAllowsAutoFire(vacuum, false, hybrid))
+            return Fail("Hybrid auto-fire must reject Stale vacuum");
+        if (!OW::RayDecisionAllowsTrackingGrace(vacuum, true, false, hybrid, 25, 60))
+            return Fail("Hybrid tracking grace must allow <=60ms vacuum when Vis==true");
+        if (OW::RayDecisionAllowsTrackingGrace(vacuum, true, false, hybrid, 65, 60))
+            return Fail("Hybrid tracking grace must reject >60ms vacuum");
+        if (OW::RayDecisionAllowsTrackingGrace(vacuum, false, false, hybrid, 0, 60))
+            return Fail("Hybrid tracking grace must immediately exit when Vis==false");
     }
 
     // ui-preferences.json rayBackend migration: legacy v1 was 0=Native/1=Embree/2=UniCore,

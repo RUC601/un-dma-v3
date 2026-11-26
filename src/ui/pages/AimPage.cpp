@@ -244,21 +244,46 @@ void UI::AimbotPage() {
         ImGui::PopItemWidth();
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", L("Choose All or combine groups, for example Head + Feet."));
-        SettingRow(L("Bone selection"));
-        const char* boneSelectionModes[] = { L("Only"), L("Prefer"), L("Closest") };
-        activePreset.boneSelectionMode = std::clamp(activePreset.boneSelectionMode, 0, 2);
+        SettingRow(L("Aim priority"));
+        const char* aimPriorities[] = {
+            L("Head only"), L("Head then body"), L("Neck spread"), L("Body center"), L("Nearest hitbox")
+        };
+        activePreset.aimPriority = static_cast<int>(OW::ClampAimPriority(activePreset.aimPriority));
         PushControlWidth();
-        presetChanged |= UISelect("##aimBoneSelectionMode", &activePreset.boneSelectionMode,
-                                  boneSelectionModes, IM_ARRAYSIZE(boneSelectionModes));
+        presetChanged |= UISelect("##aimGuidancePriority", &activePreset.aimPriority,
+                                  aimPriorities, IM_ARRAYSIZE(aimPriorities));
         ImGui::PopItemWidth();
-        if (activePreset.boneSelectionMode == 1) {
-            SettingRow(L("Preferred bone"));
-            const char* preferredBones[] = { L("Chest"), L("Head"), L("Neck") };
-            activePreset.preferredBone = OW::Config::NormalizeAimBone(activePreset.preferredBone);
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", L("Controls where crosshair guidance pulls, decoupled from hit acceptance."));
+
+        SettingRow(L("Hit acceptance"));
+        const char* hitAcceptances[] = { L("Selected only"), L("Any valid hitbox") };
+        activePreset.hitAcceptance = static_cast<int>(OW::ClampHitAcceptance(activePreset.hitAcceptance));
+        PushControlWidth();
+        presetChanged |= UISelect("##aimHitAcceptance", &activePreset.hitAcceptance,
+                                  hitAcceptances, IM_ARRAYSIZE(hitAcceptances));
+        ImGui::PopItemWidth();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", L("Controls whether firing requires the selected guidance bone or accepts any allowed hitbox."));
+
+        // Legacy NearestHitbox velocity tie-breaker: only visible when Aim priority is Nearest hitbox (Finding #13).
+        if (activePreset.aimPriority == static_cast<int>(OW::AimPriority::NearestHitbox)) {
+            SettingRow(L("Nearest tie-breaker"));
+            const char* boneSelectionModes[] = { L("Only"), L("Prefer"), L("Closest") };
+            activePreset.boneSelectionMode = std::clamp(activePreset.boneSelectionMode, 0, 2);
             PushControlWidth();
-            presetChanged |= UISelect("##aimPreferredBone", &activePreset.preferredBone,
-                                      preferredBones, IM_ARRAYSIZE(preferredBones));
+            presetChanged |= UISelect("##aimBoneSelectionMode", &activePreset.boneSelectionMode,
+                                      boneSelectionModes, IM_ARRAYSIZE(boneSelectionModes));
             ImGui::PopItemWidth();
+            if (activePreset.boneSelectionMode == 1) {
+                SettingRow(L("Preferred bone"));
+                const char* preferredBones[] = { L("Chest"), L("Head"), L("Neck") };
+                activePreset.preferredBone = OW::Config::NormalizeAimBone(activePreset.preferredBone);
+                PushControlWidth();
+                presetChanged |= UISelect("##aimPreferredBone", &activePreset.preferredBone,
+                                          preferredBones, IM_ARRAYSIZE(preferredBones));
+                ImGui::PopItemWidth();
+            }
         }
     });
 

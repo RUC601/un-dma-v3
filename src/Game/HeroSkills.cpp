@@ -2349,6 +2349,7 @@ namespace {
                 accepted={sent.countY/pitch,-sent.countX/yaw,0};
                 motion.Record(aim.local_angle,accepted,now);
                 CommitAimSmoothingOutput(accepted);
+                TargetingDetail::RecordIntentProgramSent(accepted);
             }
             CommitAimMotionCommand(accepted);
             hitAfterMove = OW::in_range(

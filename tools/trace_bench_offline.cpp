@@ -36,6 +36,13 @@ constexpr unsigned char kConditionallyWriteFraction[] = {
 };
 constexpr unsigned char kWriteOnlyFlags[] = {0xC7, 0x42, 0x28, 0, 0, 0, 0, 0xC3};
 constexpr unsigned char kPartialFraction[] = {0xC6, 0x42, 0x30, 0, 0xC3};
+// Echoes dword [rcx+0x00] (request.start.x) into [rdx+0x30] (result.fraction) to verify
+// exact per-slot ordering across multi-engine waves of varying sizes.
+constexpr unsigned char kEchoStartXToFraction[] = {
+    0x8B, 0x01,             // mov eax, [rcx]
+    0x89, 0x42, 0x30,       // mov [rdx+0x30], eax
+    0xC3
+};
 
 struct Fixture {
     std::span<const unsigned char> code;
@@ -141,6 +148,80 @@ int RunTraceBackendSelfTest() {
         available[0].fraction == 1.0f && available[1].fraction == 1.0f &&
         shared.dataReads == 2 * (1 + config.pageReadRetries) + 1,
         "shared cache retries then shares the successful read");
+
+    // Phase 2 (§6.1): 6-engine concurrent VisionProbe batch sharing one PageStore.
+    VisionProbe::Config sixConfig;
+    sixConfig.context = kContext;
+    sixConfig.entryRva = 0;
+    sixConfig.engines = 6;
+    sixConfig.timeoutUs = 0;
+    Fixture sixFixture{kReadFraction};
+    sixFixture.fractionBits = std::bit_cast<uint32_t>(0.375f);
+    VisionProbe sixProbe(sixConfig, sixFixture.Reader(), kImage, kPageSize);
+    if (!sixProbe.Start(kScene)) return 2;
+    std::vector<Request> sixRequests(6, request);
+    const auto sixResults = sixProbe.Probe(sixRequests);
+    bool sixOk = sixProbe.EngineCount() == 6 && sixResults.size() == 6 && sixFixture.dataReads == 1;
+    for (const auto& r : sixResults) {
+        if (r.status != Status::Ok || r.fraction != 0.375f) sixOk = false;
+    }
+    check(sixOk, "6-engine VisionProbe batch shares page cache and returns all 6 fractions");
+    sixProbe.Stop();
+
+    // Finding #16 regression: distinct-result repeated waves of sizes 1, 2, 6, 7 across
+    // persistent 6-engine worker pool + clean Stop()/Start() restart recovery.
+    {
+        VisionProbe::Config waveConfig;
+        waveConfig.context = kContext;
+        waveConfig.entryRva = 0;
+        waveConfig.engines = 6;
+        waveConfig.timeoutUs = 0;
+        Fixture waveFixture{kEchoStartXToFraction};
+        VisionProbe waveProbe(waveConfig, waveFixture.Reader(), kImage, kPageSize);
+        if (!waveProbe.Start(kScene)) return 2;
+        const std::array<float, 7> distinctFractions{
+            0.125f, 0.25f, 0.375f, 0.5f, 0.625f, 0.75f, 0.875f};
+        bool wavesOrderedOk = true;
+        for (size_t waveSize : {size_t{1}, size_t{2}, size_t{6}, size_t{7}, size_t{6}}) {
+            std::vector<Request> reqs(waveSize, request);
+            for (size_t i = 0; i < waveSize; ++i) {
+                reqs[i].start.x = distinctFractions[i];
+            }
+            const auto res = waveProbe.Probe(reqs);
+            if (res.size() != waveSize) {
+                wavesOrderedOk = false;
+                break;
+            }
+            for (size_t i = 0; i < waveSize; ++i) {
+                if (res[i].status != Status::Ok || res[i].fraction != distinctFractions[i]) {
+                    wavesOrderedOk = false;
+                    break;
+                }
+            }
+        }
+        check(wavesOrderedOk,
+              "6-engine VisionProbe preserves exact distinct result ordering across waves 1/2/6/7");
+
+        // Serialized Stop() -> Start(newScene) restart recovery.
+        waveProbe.Stop();
+        bool restartOk = !waveProbe.Started() && waveProbe.Start(kScene + 1);
+        if (restartOk) {
+            std::vector<Request> nextReqs(6, request);
+            for (size_t i = 0; i < 6; ++i) {
+                nextReqs[i].sceneEpoch = kScene + 1;
+                nextReqs[i].start.x = distinctFractions[5 - i];
+            }
+            const auto res = waveProbe.Probe(nextReqs);
+            for (size_t i = 0; i < 6; ++i) {
+                if (res[i].status != Status::Ok || res[i].fraction != distinctFractions[5 - i]) {
+                    restartOk = false;
+                    break;
+                }
+            }
+        }
+        waveProbe.Stop();
+        check(restartOk, "6-engine VisionProbe restarts cleanly on new sceneEpoch");
+    }
 
     for (const auto code : {std::span<const unsigned char>(kWriteOnlyFlags),
             std::span<const unsigned char>(kPartialFraction)}) {

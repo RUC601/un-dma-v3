@@ -11,11 +11,15 @@
 
 #include <Windows.h>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdlib>
 #include <memory>
 #include <mutex>
+#include <span>
 #include <thread>
+#include <vector>
 
 namespace OW::RayRuntime {
 namespace {
@@ -23,11 +27,23 @@ namespace {
 constexpr DWORD kWatchIntervalMs = 250;
 constexpr DWORD kBindRetryMs = 1000;
 
-// The broker executes Service::BindScene/Trace/ReleaseScene strictly on its own worker
-// thread and hands it one request at a time, so a single engine answers every request.
-// Keeping one engine also keeps the soft-MMU footprint minimal; VisionProbe still
-// supports batches for the offline tools.
-constexpr int kProbeEngines = 1;
+// Phase 2 (§6.1, §6.3): default to 6 concurrent Unicorn engines sharing one PageStore so
+// a 6-slot batch (Top-1/Top-2/parabolic chords/ground-clip/EdgeFan) finishes in one ~5-7 ms wave.
+// Overridable via UN_DMA_RAY_ENGINES in [1, 8].
+constexpr int kDefaultProbeEngines = 6;
+constexpr int kMinProbeEngines = 1;
+constexpr int kMaxProbeEngines = 8;
+
+int ResolveConfiguredProbeEngines() noexcept {
+    char buffer[32]{};
+    const DWORD len = GetEnvironmentVariableA("UN_DMA_RAY_ENGINES", buffer,
+        static_cast<DWORD>(sizeof(buffer)));
+    if (len == 0 || len >= sizeof(buffer)) return kDefaultProbeEngines;
+    char* end = nullptr;
+    const long parsed = std::strtol(buffer, &end, 10);
+    if (end == buffer || parsed <= 0) return kDefaultProbeEngines;
+    return std::clamp(static_cast<int>(parsed), kMinProbeEngines, kMaxProbeEngines);
+}
 
 class VisionProbeBackend final : public EngineTrace::IBackend {
 public:
@@ -41,6 +57,21 @@ public:
                               EngineTrace::Result& result) override {
         result = probe_.ProbeOne(request);
         return result.status;
+    }
+
+    void TraceBatch(std::span<const EngineTrace::Request> requests,
+                    std::span<EngineTrace::Result> results) override {
+        const size_t count = (std::min)(requests.size(), results.size());
+        if (count == 0) return;
+        if (count == 1) {
+            results[0] = probe_.ProbeOne(requests[0]);
+            return;
+        }
+        std::vector<EngineTrace::Request> batch(requests.begin(), requests.begin() + count);
+        const auto batchResults = probe_.Probe(batch);
+        for (size_t i = 0; i < count && i < batchResults.size(); ++i) {
+            results[i] = batchResults[i];
+        }
     }
 
     void ReleaseScene() override { probe_.Stop(); }
@@ -73,6 +104,7 @@ struct ProbeRuntime {
     std::atomic<uint64_t> publishedEpoch{0};
     std::atomic<uint64_t> publishedContext{0};
     std::atomic<uint64_t> rebinds{0};
+    std::atomic<int> configuredEngines{kDefaultProbeEngines};
 };
 
 ProbeRuntime& Runtime() {
@@ -94,7 +126,8 @@ void AdvanceScene(const char* reason) {
         "[RAY-PROBE] scene_epoch=%llu reason=%s previous_context=0x%llX entry_rva=0x%llX engines=%d",
         static_cast<unsigned long long>(epoch), reason,
         static_cast<unsigned long long>(context),
-        static_cast<unsigned long long>(offset::Active().rayEntryRva), kProbeEngines);
+        static_cast<unsigned long long>(offset::Active().rayEntryRva),
+        runtime.configuredEngines.load(std::memory_order_acquire));
     Broker().SetScene(epoch);
 }
 
@@ -162,7 +195,9 @@ bool AttachProbe() {
     config.sceneObject2 = 0;
     config.localObject = 0;
     config.auxCallback = 0;
-    config.engines = kProbeEngines;
+    const int engines = ResolveConfiguredProbeEngines();
+    runtime.configuredEngines.store(engines, std::memory_order_release);
+    config.engines = engines;
     config.instructionLimit = 4'000'000;
     config.timeoutUs = 0;  // instructionLimit is the only bound; no 15 ms timer floor
     config.refreshTouchedPages = false;  // static world pages stay cached for the scene
@@ -263,9 +298,11 @@ void StartProbe() {
     runtime.lastBindAttemptMs = 0;
     runtime.publishedEpoch.store(0, std::memory_order_release);
     runtime.publishedContext.store(0, std::memory_order_release);
+    const int engines = ResolveConfiguredProbeEngines();
+    runtime.configuredEngines.store(engines, std::memory_order_release);
     runtime.worker = std::thread(WatchThread);
     Diagnostics::Info("[RAY-PROBE] owner started (interval_ms=%lu engines=%d)",
-        static_cast<unsigned long>(kWatchIntervalMs), kProbeEngines);
+        static_cast<unsigned long>(kWatchIntervalMs), engines);
 }
 
 void StopProbe() {
@@ -294,6 +331,10 @@ bool ProbeRunning() noexcept { return Runtime().running.load(std::memory_order_a
 
 uint64_t SceneEpoch() noexcept {
     return Runtime().publishedEpoch.load(std::memory_order_acquire);
+}
+
+int ProbeEngineCount() noexcept {
+    return Runtime().configuredEngines.load(std::memory_order_acquire);
 }
 
 }  // namespace OW::RayRuntime

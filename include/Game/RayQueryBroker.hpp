@@ -9,20 +9,22 @@
 #include <cstdint>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <thread>
 #include <vector>
 
 namespace OW::EngineTrace {
 
 // Owns the asynchronous world-query handoff. All Service::OnSceneChanged and
-// Service::Trace calls execute strictly on the broker's worker thread so the
+// Service::TraceBatch calls execute strictly on the broker's worker thread so the
 // aim loop never blocks on Unicorn bind/trace and Detach() can synchronously
 // drain any in-flight call before the caller destroys the Service.
 class RayQueryBroker final {
 public:
     static constexpr float kDefaultMaxEndpointDriftMeters = 0.35f;
-    static constexpr size_t kMaxPendingEntries = 4;
-    static constexpr size_t kMaxCacheEntries = 32;
+    static constexpr size_t kMaxBatchSize = 6;
+    static constexpr size_t kMaxPendingEntries = 16;
+    static constexpr size_t kMaxCacheEntries = 64;
 
     struct Query {
         Request request{};
@@ -33,6 +35,8 @@ public:
         uint64_t actorGeneration = 0;
         int boneId = -1;
         uint32_t sampleTick = 0;
+        RaySegmentKind segmentKind = RaySegmentKind::Direct;
+        uint8_t segmentIndex = 0;
     };
 
     RayQueryBroker() = default;
@@ -47,20 +51,26 @@ public:
     bool HasService() const noexcept;
     void SetScene(uint64_t sceneEpoch);
     void Submit(Query query);
+    void SubmitBatch(std::span<const Query> queries);
     std::optional<RayDecision> Latest(
         const Request& request, uint64_t frame, uint64_t connectionEpoch,
         uint64_t sceneEpoch, uint64_t entityKey, uint64_t actorGeneration,
         int boneId = -1, uint32_t maxAgeMs = 100,
-        float maxEndpointDriftMeters = kDefaultMaxEndpointDriftMeters) const;
+        float maxEndpointDriftMeters = kDefaultMaxEndpointDriftMeters,
+        RaySegmentKind segmentKind = RaySegmentKind::Direct,
+        uint8_t segmentIndex = 0) const;
 
 private:
     struct CacheEntry {
         RayDecision decision{};
         Request request{};
         int boneId = -1;
+        RaySegmentKind segmentKind = RaySegmentKind::Direct;
+        uint8_t segmentIndex = 0;
     };
 
     void Run();
+    void EnqueueLocked(Query query);
     void StoreResultLocked(const CacheEntry& entry);
 
     mutable std::mutex mutex_;

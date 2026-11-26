@@ -66,9 +66,9 @@ bool NativeHitboxSampleUsable(const c_entity& entity, uint32_t now);
 // A score of 1 is contact. An absent score means the caller should use its bone fallback.
 std::optional<float> NativeHitWindowScore(const c_entity& entity, int boneId, uint32_t now,
     const Vector3& origin, const Vector3& direction, const Vector3& predictedDisplacement,
-    float projectileRadius, float hitboxScalePercent);
+    float projectileRadius, float hitboxScalePercent, bool requireExplicitCritical = false);
 std::optional<float> NativeHitWindowScore(const c_entity& entity, int boneId, uint32_t now,
     const Vector3& origin, const Vector3& direction, const NativeHitWindowInput& input,
-    const Vector3& extraDisplacement = {});
+    const Vector3& extraDisplacement = {}, bool requireExplicitCritical = false);
 
 } // namespace OW

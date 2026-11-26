@@ -73,7 +73,19 @@ inline NativeHitWindowInput MakeNativeHitWindowInput(const LeadPredictionResult&
     if (straightProjectile) {
         // A moving target reduces to a stationary capsule in the projectile's
         // relative frame after advancing the target through the pre-fire delay.
-        input.displacement = lead.targetVelocity * (lead.timing.targetExtrapolationMs / 1000.0f);
+        // Derive displacement from (preFireAimPoint - rawAimPoint) so GroundClip
+        // terrain adjustments to preFireAimPoint stay consistent in native geometry (F5 fix).
+        const bool hasExplicitPreFire =
+            std::isfinite(lead.preFireAimPoint.X) &&
+            std::isfinite(lead.preFireAimPoint.Y) &&
+            std::isfinite(lead.preFireAimPoint.Z) &&
+            std::isfinite(lead.rawAimPoint.X) &&
+            std::isfinite(lead.rawAimPoint.Y) &&
+            std::isfinite(lead.rawAimPoint.Z) &&
+            !(lead.preFireAimPoint == Vector3(0, 0, 0) && !(lead.rawAimPoint == Vector3(0, 0, 0)));
+        input.displacement = hasExplicitPreFire
+            ? (lead.preFireAimPoint - lead.rawAimPoint)
+            : (lead.targetVelocity * (lead.timing.targetExtrapolationMs / 1000.0f));
         input.targetVelocity = lead.targetVelocity;
         input.launchUpBias = projectile.launchDirectionUpBias;
     } else {

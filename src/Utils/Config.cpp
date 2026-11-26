@@ -9,6 +9,7 @@
 #include "vision/ContourDetection.hpp"
 #include "config/AimPlanJson.hpp"
 #include "config/AimModeJson.hpp"
+#include "config/AimTargetMigration.hpp"
 #include "config/AlertJson.hpp"
 #include "config/SlotStorageInternal.hpp"
 #include "output/settings/OutputProfilesJson.hpp"
@@ -1888,6 +1889,8 @@ namespace OW { namespace Config {
             preset.aimBoneMask = NormalizeSkeletonBoneMask(preset.aimBoneMask);
             preset.boneSelectionMode = std::clamp(preset.boneSelectionMode, 0, 2);
             preset.preferredBone = NormalizeAimBone(preset.preferredBone);
+            preset.aimPriority = static_cast<int>(ClampAimPriority(preset.aimPriority));
+            preset.hitAcceptance = static_cast<int>(ClampHitAcceptance(preset.hitAcceptance));
             preset.hitbox = ClampHitboxScalePercent(preset.hitbox);
             preset.aimMode = std::clamp(preset.aimMode, 0, 1);
             if (preset.aimMode == 1 && preset.aimBehavior == 0)
@@ -2137,6 +2140,10 @@ namespace OW { namespace Config {
                 ResetHeroPresetSlot(slot, slotIndex);
                 slot.preset.autoBone = autoBone;
                 slot.preset.aimBoneMask = AimBoneMaskFromLegacy(slot.preset.bone, autoBone);
+                slot.preset.aimPriority = static_cast<int>(DeriveAimPriorityFromLegacy(
+                    slot.preset.aimBoneMask, slot.preset.boneSelectionMode, slot.preset.preferredBone));
+                slot.preset.hitAcceptance = static_cast<int>(DeriveHitAcceptanceFromLegacy(
+                    slot.preset.aimBoneMask, slot.preset.boneSelectionMode));
                 if (slotIndex < presentCount) {
                     slot.present = true;
                     slot.enabled = enabled;
@@ -2291,6 +2298,8 @@ namespace OW { namespace Config {
                 lhs.aimBoneMask == rhs.aimBoneMask &&
                 lhs.boneSelectionMode == rhs.boneSelectionMode &&
                 lhs.preferredBone == rhs.preferredBone &&
+                lhs.aimPriority == rhs.aimPriority &&
+                lhs.hitAcceptance == rhs.hitAcceptance &&
                 SameFloatForDefaultMigration(lhs.hitbox, rhs.hitbox) &&
                 lhs.aimMode == rhs.aimMode &&
                 lhs.aimBehavior == rhs.aimBehavior &&
@@ -2827,6 +2836,10 @@ namespace OW { namespace Config {
             autobone2 = false;            // default: false
             aimbotBoneMask = kDefaultAimBoneMask;
             aimbotBoneMask2 = kDefaultAimBoneMask;
+            aimBoneSelectionMode = 2;
+            aimPreferredBone = kAimBoneChest;
+            aimPriority = static_cast<int>(AimPriority::HeadOnly);
+            aimHitAcceptance = static_cast<int>(HitAcceptance::SelectedOnly);
             switch_team = false;          // default: false
             switch_team2 = false;         // default: false
             BoneName = "Head";            // default: Head
@@ -3138,6 +3151,10 @@ namespace OW { namespace Config {
             preset.bone = NormalizeAimBone(Bone);
             preset.autoBone = autobone;
             preset.aimBoneMask = aimbotBoneMask;
+            preset.boneSelectionMode = aimBoneSelectionMode;
+            preset.preferredBone = aimPreferredBone;
+            preset.aimPriority = aimPriority;
+            preset.hitAcceptance = aimHitAcceptance;
             preset.hitbox = hitbox;
             preset.aimMode = CurrentAimMode();
             if (preset.aimMode < 0 || preset.aimMode > 1)
@@ -3242,6 +3259,8 @@ namespace OW { namespace Config {
             aimbotBoneMask = preset.aimBoneMask;
             aimBoneSelectionMode = preset.boneSelectionMode;
             aimPreferredBone = preset.preferredBone;
+            aimPriority = preset.aimPriority;
+            aimHitAcceptance = preset.hitAcceptance;
             hitbox = preset.hitbox;
             Prediction = true;
             aimbotPredictionMode = 0;
@@ -3436,6 +3455,8 @@ namespace OW { namespace Config {
             AddJsonInt(value, "aimBoneMask", static_cast<int>(preset.aimBoneMask), allocator);
             AddJsonInt(value, "boneSelectionMode", preset.boneSelectionMode, allocator);
             AddJsonInt(value, "preferredBone", preset.preferredBone, allocator);
+            AddJsonInt(value, "aimPriority", preset.aimPriority, allocator);
+            AddJsonInt(value, "hitAcceptance", preset.hitAcceptance, allocator);
             AddJsonFloat(value, "hitboxScale", preset.hitbox, allocator);
             AddJsonInt(value, "aimMode", preset.aimMode, allocator);
             AddJsonInt(value, "aimBehavior", preset.aimBehavior, allocator);
@@ -4562,6 +4583,24 @@ namespace OW { namespace Config {
                 : AimBoneMaskFromLegacy(defaults.bone, defaults.autoBone);
             defaults.boneSelectionMode = std::clamp(ReadJsonInt(value, "boneSelectionMode", defaults.boneSelectionMode), 0, 2);
             defaults.preferredBone = NormalizeAimBone(ReadJsonInt(value, "preferredBone", defaults.preferredBone));
+            {
+                const bool hasAimPriority = value.HasMember("aimPriority") && value["aimPriority"].IsInt();
+                const bool hasHitAcceptance = value.HasMember("hitAcceptance") && value["hitAcceptance"].IsInt();
+                AimPriority migratedPriority = ClampAimPriority(defaults.aimPriority);
+                HitAcceptance migratedAcceptance = ClampHitAcceptance(defaults.hitAcceptance);
+                MigrateAimTargetFields(
+                    hasAimPriority,
+                    hasAimPriority ? value["aimPriority"].GetInt() : defaults.aimPriority,
+                    hasHitAcceptance,
+                    hasHitAcceptance ? value["hitAcceptance"].GetInt() : defaults.hitAcceptance,
+                    defaults.aimBoneMask,
+                    defaults.boneSelectionMode,
+                    defaults.preferredBone,
+                    migratedPriority,
+                    migratedAcceptance);
+                defaults.aimPriority = static_cast<int>(migratedPriority);
+                defaults.hitAcceptance = static_cast<int>(migratedAcceptance);
+            }
             defaults.hitbox = ReadJsonHitboxScaleCompat(
                 value,
                 "hitboxScale",
@@ -4976,6 +5015,22 @@ namespace OW { namespace Config {
                 ? static_cast<SkeletonBoneMask>(ReadInt(
                     ini, section, "aimBoneMask", static_cast<int>(preset.aimBoneMask)))
                 : AimBoneMaskFromLegacy(preset.bone, preset.autoBone);
+            {
+                AimPriority migratedPriority = ClampAimPriority(preset.aimPriority);
+                HitAcceptance migratedAcceptance = ClampHitAcceptance(preset.hitAcceptance);
+                MigrateAimTargetFields(
+                    KeyExists(ini, section, "aimPriority"),
+                    ReadInt(ini, section, "aimPriority", preset.aimPriority),
+                    KeyExists(ini, section, "hitAcceptance"),
+                    ReadInt(ini, section, "hitAcceptance", preset.hitAcceptance),
+                    preset.aimBoneMask,
+                    preset.boneSelectionMode,
+                    preset.preferredBone,
+                    migratedPriority,
+                    migratedAcceptance);
+                preset.aimPriority = static_cast<int>(migratedPriority);
+                preset.hitAcceptance = static_cast<int>(migratedAcceptance);
+            }
             preset.hitbox = ReadHitboxScaleCompat(
                 ini,
                 section,
@@ -5100,6 +5155,22 @@ namespace OW { namespace Config {
                 ? static_cast<SkeletonBoneMask>(ReadInt(
                     ini, section, "aimBoneMask", static_cast<int>(slot.preset.aimBoneMask)))
                 : AimBoneMaskFromLegacy(slot.preset.bone, slot.preset.autoBone);
+            {
+                AimPriority migratedPriority = ClampAimPriority(slot.preset.aimPriority);
+                HitAcceptance migratedAcceptance = ClampHitAcceptance(slot.preset.hitAcceptance);
+                MigrateAimTargetFields(
+                    KeyExists(ini, section, "aimPriority"),
+                    ReadInt(ini, section, "aimPriority", slot.preset.aimPriority),
+                    KeyExists(ini, section, "hitAcceptance"),
+                    ReadInt(ini, section, "hitAcceptance", slot.preset.hitAcceptance),
+                    slot.preset.aimBoneMask,
+                    slot.preset.boneSelectionMode,
+                    slot.preset.preferredBone,
+                    migratedPriority,
+                    migratedAcceptance);
+                slot.preset.aimPriority = static_cast<int>(migratedPriority);
+                slot.preset.hitAcceptance = static_cast<int>(migratedAcceptance);
+            }
             slot.preset.hitbox = ReadHitboxScaleCompat(
                 ini,
                 section,
@@ -7407,6 +7478,22 @@ namespace OW { namespace Config {
                 aimbotBoneMask = AimBoneMaskFromLegacy(Bone, autobone);
             if (!KeyExists(ini, kAimbotSection, "aimbotBoneMask2"))
                 aimbotBoneMask2 = AimBoneMaskFromLegacy(Bone2, autobone2);
+            {
+                AimPriority migratedPriority = ClampAimPriority(aimPriority);
+                HitAcceptance migratedAcceptance = ClampHitAcceptance(aimHitAcceptance);
+                MigrateAimTargetFields(
+                    KeyExists(ini, kAimbotSection, "aimPriority"),
+                    ReadInt(ini, kAimbotSection, "aimPriority", aimPriority),
+                    KeyExists(ini, kAimbotSection, "hitAcceptance"),
+                    ReadInt(ini, kAimbotSection, "hitAcceptance", aimHitAcceptance),
+                    aimbotBoneMask,
+                    aimBoneSelectionMode,
+                    aimPreferredBone,
+                    migratedPriority,
+                    migratedAcceptance);
+                aimPriority = static_cast<int>(migratedPriority);
+                aimHitAcceptance = static_cast<int>(migratedAcceptance);
+            }
             LoadOutputSettingsUnlocked(ini);
             V2::HeroSettings::Migrate(V2::Alerts::GetSettings());
             rapidjson::Document defaults;
@@ -7912,7 +7999,7 @@ namespace OW { namespace Config {
             const HeroPreset preset = ValidateHeroPresetValue(rawPreset);
             slotTargetRules={true,preset.ignoreInvisible,preset.requireTargetable,preset.allyHealthMaxPercent,
                 preset.maxTargetSpeedMps,preset.allyBoneMask,preset.predictionAlgorithm,
-                preset.boneSelectionMode,preset.preferredBone};
+                preset.boneSelectionMode,preset.preferredBone,preset.aimPriority,preset.hitAcceptance};
             View_aimModeState()={true,static_cast<const AimBehaviorTuning&>(preset),preset.aimPlan.motion,preset.behaviorConfigs};
             View_Fov() = preset.fov;
             View_minFov1() = preset.fov;

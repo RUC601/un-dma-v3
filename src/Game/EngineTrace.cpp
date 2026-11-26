@@ -85,4 +85,68 @@ Result Service::Trace(const Request& request) {
     return result;
 }
 
+std::vector<Result> Service::TraceBatch(std::span<const Request> requests) {
+    std::vector<Result> results(requests.size());
+    if (requests.empty()) return results;
+
+    stats_.requests += requests.size();
+    if (!backend_ || backend_ == &Null()) {
+        for (auto& result : results) {
+            result.status = Status::Unavailable;
+        }
+        stats_.unavailable += requests.size();
+        return results;
+    }
+
+    std::vector<size_t> validIndices;
+    std::vector<Request> validRequests;
+    validIndices.reserve(requests.size());
+    validRequests.reserve(requests.size());
+
+    for (size_t i = 0; i < requests.size(); ++i) {
+        if (!bound_ || requests[i].sceneEpoch != boundEpoch_) {
+            results[i].status = Status::InvalidScene;
+            ++stats_.invalidScene;
+        } else {
+            validIndices.push_back(i);
+            validRequests.push_back(requests[i]);
+        }
+    }
+
+    if (validRequests.empty()) return results;
+
+    std::vector<Result> validResults(validRequests.size());
+    const uint64_t started = NowUs();
+    backend_->TraceBatch(validRequests, validResults);
+    const uint32_t batchElapsed = static_cast<uint32_t>(NowUs() - started);
+
+    stats_.lastLatencyUs = batchElapsed;
+    if (batchElapsed > stats_.maxLatencyUs) stats_.maxLatencyUs = batchElapsed;
+
+    for (size_t i = 0; i < validIndices.size(); ++i) {
+        const size_t dst = validIndices[i];
+        Result& out = results[dst];
+        out = validResults[i];
+        if (out.latencyUs == 0) {
+            out.latencyUs = batchElapsed;
+        }
+        if (out.latencyUs > stats_.maxLatencyUs) {
+            stats_.maxLatencyUs = out.latencyUs;
+        }
+        const uint32_t budgetCheckUs = out.latencyUs > batchElapsed ? out.latencyUs : batchElapsed;
+        if (validRequests[i].budgetMs && budgetCheckUs > validRequests[i].budgetMs * 1000u) {
+            out.overBudget = true;
+            ++stats_.overBudget;
+        }
+        switch (out.status) {
+            case Status::Ok: ++stats_.ok; break;
+            case Status::Unavailable: ++stats_.unavailable; break;
+            case Status::Timeout: ++stats_.timeouts; break;
+            case Status::InvalidScene: ++stats_.invalidScene; break;
+            case Status::Error: ++stats_.errors; break;
+        }
+    }
+    return results;
+}
+
 }  // namespace OW::EngineTrace

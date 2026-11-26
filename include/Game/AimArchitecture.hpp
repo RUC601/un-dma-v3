@@ -16,6 +16,8 @@
 #include "Game/AimPlan.hpp"
 #include "Game/ContourTargeting.hpp"
 #include "Game/TargetVisibility.hpp"
+#include "Game/TargetSolutionTypes.hpp"
+#include "Game/TriggerBoneSelection.hpp"
 #include "Game/RayDecision.hpp"
 #include "Utils/Types.hpp"
 
@@ -197,10 +199,25 @@ struct TargetCandidate {
     AimPlan::Effective plan{};
     bool planPreferred = false;
     bool valid = false;
+    VisibilityTier tier = VisibilityTier::Ignored;
+    PreAimPhase preAimPhase = PreAimPhase::None;
+    bool preAimParkPointValid = false;
+    TransitionKind transition = TransitionKind::None;
+    float reactionRemainingMs = 0.0f;
+    bool targetReversalActive = false;
+    float targetReversalElapsedMs = 0.0f;
+
     int entityIndex = -1;
     uint64_t entityKey = 0;
+    uint64_t actorGeneration = 0;
     c_entity entitySnapshot{};
+
+    AimPriority aimPriority = AimPriority::HeadThenBody;
+    HitAcceptance hitAcceptance = HitAcceptance::SelectedOnly;
     int boneId = 0;
+    bool requireExplicitCritical = false;
+    SkeletonBoneMask acceptanceMask = 0;
+    uint32_t worldClearSlotMask = 0;
     Vector3 rawAimPoint{};
     Vector3 predictedAimPoint{};
     Vector3 aimPoint{};
@@ -208,6 +225,12 @@ struct TargetCandidate {
     float distance = 0.0f;
     float fovScore = (std::numeric_limits<float>::max)();
     float effectiveFovDeg = 0.0f;
+    float peekGateDeg = 0.0f;
+    float utilityScore = 0.0f;
+    float commitment = 0.0f;
+    float intentAlignment = 0.0f;
+    float intentGain = 1.0f;
+    InputStance stance = InputStance::ActiveDrag;
     int dynamicFovPresetId = -1;
     bool dynamicFov = false;
     bool predictedFovEntry = false;
@@ -220,6 +243,178 @@ struct TargetCandidate {
     TargetLockPolicy lockPolicy{};
     const WeaponSpec* weaponSpec = nullptr;
     RayDecision ray{};
+    TraceHitKind hitKind = TraceHitKind::Unknown;
+    uint8_t trajectorySegments = 1;
+};
+
+// Stage 2 -> Stage 3 authoritative target solution contract (§8.1).
+struct TargetSolution {
+    bool valid = false;
+    VisibilityTier tier = VisibilityTier::Ignored;
+    PreAimPhase preAimPhase = PreAimPhase::None;
+    bool preAimParkPointValid = false;
+    TransitionKind transition = TransitionKind::None;
+    float reactionRemainingMs = 0.0f;
+    bool targetReversalActive = false;
+    float targetReversalElapsedMs = 0.0f;
+
+    // Entity identity and generation guards
+    int entityIndex = -1;
+    uint64_t entityKey = 0;
+    uint64_t actorGeneration = 0;
+    c_entity entitySnapshot{};
+
+    // Decoupled guidance (where to pull) vs hit acceptance (where to fire)
+    AimPriority aimPriority = AimPriority::HeadThenBody;
+    HitAcceptance hitAcceptance = HitAcceptance::SelectedOnly;
+    int guidanceBoneId = -1;
+    bool requireExplicitCritical = false;
+    Vector3 rawGuidancePoint{};
+    Vector3 predictedGuidancePoint{};
+    Vector3 guidanceAimPoint{};
+    Vector2 guidanceScreenPoint{};
+    SkeletonBoneMask acceptanceMask = 0;
+    uint32_t worldClearSlotMask = 0;
+    float effectiveHitWindow = 0.0f;
+    NativeHitWindowInput nativeHitWindow{};
+
+    // Utility scoring, commitment, and intent evidence snapshot
+    float utilityScore = 0.0f;
+    float commitment = 0.0f;
+    float intentAlignment = 0.0f;
+    float intentGain = 1.0f;
+    InputStance stance = InputStance::ActiveDrag;
+    float distance = 0.0f;
+    float angularErrorDeg = 0.0f;
+    float effectiveFovDeg = 0.0f;
+    float peekGateDeg = 0.0f;
+
+    // Path and occlusion evidence
+    RayDecision ray{};
+    TraceHitKind hitKind = TraceHitKind::Unknown;
+    uint8_t trajectorySegments = 1;
+    Contour::Observation contour{};
+
+    // Policy and motion context
+    AimPlan::Effective plan{};
+    bool planPreferred = false;
+    int dynamicFovPresetId = -1;
+    bool dynamicFov = false;
+    bool predictedFovEntry = false;
+    float fovEntryHorizonMs = 0.0f;
+    float currentFovScore = (std::numeric_limits<float>::max)();
+    float projectedFovScore = (std::numeric_limits<float>::max)();
+    TargetLockPolicy lockPolicy{};
+    EntityMotionState motion{};
+    const WeaponSpec* weaponSpec = nullptr;
+
+    TargetCandidate ToCandidate() const
+    {
+        TargetCandidate c{};
+        c.contour = contour;
+        c.plan = plan;
+        c.planPreferred = planPreferred;
+        c.valid = valid;
+        c.tier = tier;
+        c.preAimPhase = preAimPhase;
+        c.preAimParkPointValid = preAimParkPointValid;
+        c.transition = transition;
+        c.reactionRemainingMs = reactionRemainingMs;
+        c.targetReversalActive = targetReversalActive;
+        c.targetReversalElapsedMs = targetReversalElapsedMs;
+        c.entityIndex = entityIndex;
+        c.entityKey = entityKey;
+        c.actorGeneration = actorGeneration;
+        c.entitySnapshot = entitySnapshot;
+        c.aimPriority = aimPriority;
+        c.hitAcceptance = hitAcceptance;
+        c.boneId = guidanceBoneId;
+        c.requireExplicitCritical = requireExplicitCritical;
+        c.acceptanceMask = acceptanceMask;
+        c.worldClearSlotMask = worldClearSlotMask;
+        c.rawAimPoint = rawGuidancePoint;
+        c.predictedAimPoint = predictedGuidancePoint;
+        c.aimPoint = guidanceAimPoint;
+        c.screenPoint = guidanceScreenPoint;
+        c.distance = distance;
+        c.fovScore = angularErrorDeg;
+        c.effectiveFovDeg = effectiveFovDeg;
+        c.peekGateDeg = peekGateDeg;
+        c.utilityScore = utilityScore;
+        c.commitment = commitment;
+        c.intentAlignment = intentAlignment;
+        c.intentGain = intentGain;
+        c.stance = stance;
+        c.dynamicFovPresetId = dynamicFovPresetId;
+        c.dynamicFov = dynamicFov;
+        c.predictedFovEntry = predictedFovEntry;
+        c.fovEntryHorizonMs = fovEntryHorizonMs;
+        c.currentFovScore = currentFovScore;
+        c.projectedFovScore = projectedFovScore;
+        c.effectiveHitWindow = effectiveHitWindow;
+        c.nativeHitWindow = nativeHitWindow;
+        c.motion = motion;
+        c.lockPolicy = lockPolicy;
+        c.weaponSpec = weaponSpec;
+        c.ray = ray;
+        c.hitKind = hitKind;
+        c.trajectorySegments = trajectorySegments;
+        return c;
+    }
+
+    static TargetSolution FromCandidate(const TargetCandidate& c)
+    {
+        TargetSolution s{};
+        s.valid = c.valid;
+        s.tier = c.valid && c.tier == VisibilityTier::Ignored ? VisibilityTier::Engageable : c.tier;
+        s.preAimPhase = c.preAimPhase;
+        s.preAimParkPointValid = c.preAimParkPointValid;
+        s.transition = c.transition;
+        s.reactionRemainingMs = c.reactionRemainingMs;
+        s.targetReversalActive = c.targetReversalActive;
+        s.targetReversalElapsedMs = c.targetReversalElapsedMs;
+        s.entityIndex = c.entityIndex;
+        s.entityKey = c.entityKey;
+        s.actorGeneration = c.actorGeneration != 0 ? c.actorGeneration : c.entitySnapshot.actor_generation;
+        s.entitySnapshot = c.entitySnapshot;
+        s.aimPriority = c.aimPriority;
+        s.hitAcceptance = c.hitAcceptance;
+        s.guidanceBoneId = c.boneId;
+        s.requireExplicitCritical = c.requireExplicitCritical;
+        s.rawGuidancePoint = c.rawAimPoint;
+        s.predictedGuidancePoint = c.predictedAimPoint;
+        s.guidanceAimPoint = c.aimPoint;
+        s.guidanceScreenPoint = c.screenPoint;
+        s.acceptanceMask = c.acceptanceMask;
+        s.worldClearSlotMask = c.worldClearSlotMask;
+        s.effectiveHitWindow = c.effectiveHitWindow;
+        s.nativeHitWindow = c.nativeHitWindow;
+        s.utilityScore = c.utilityScore;
+        s.commitment = c.commitment;
+        s.intentAlignment = c.intentAlignment;
+        s.intentGain = c.intentGain;
+        s.stance = c.stance;
+        s.distance = c.distance;
+        s.angularErrorDeg = c.fovScore;
+        s.effectiveFovDeg = c.effectiveFovDeg;
+        s.peekGateDeg = c.peekGateDeg;
+        s.ray = c.ray;
+        s.hitKind = c.hitKind;
+        s.trajectorySegments = c.trajectorySegments;
+        s.contour = c.contour;
+        s.plan = c.plan;
+        s.planPreferred = c.planPreferred;
+        s.dynamicFovPresetId = c.dynamicFovPresetId;
+        s.dynamicFov = c.dynamicFov;
+        s.predictedFovEntry = c.predictedFovEntry;
+        s.fovEntryHorizonMs = c.fovEntryHorizonMs;
+        s.currentFovScore = c.currentFovScore;
+        s.projectedFovScore = c.projectedFovScore;
+        s.lockPolicy = c.lockPolicy;
+        s.motion = c.motion;
+        s.weaponSpec = c.weaponSpec;
+        return s;
+    }
 };
 
 inline PredictionOverrideMode ClampPredictionOverride(int value)

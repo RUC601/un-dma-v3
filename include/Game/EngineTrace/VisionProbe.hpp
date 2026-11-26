@@ -4,10 +4,13 @@
 #include "Game/EngineTrace/UnicornBackend.hpp"
 
 #include <atomic>
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace OW::EngineTrace {
@@ -93,8 +96,14 @@ public:
 
     const UnicornBackend::Stats& Stats() const { return stats_; }
     uint64_t Context() const { return context_.load(std::memory_order_acquire); }
+    int EngineCount() const noexcept { return static_cast<int>(engines_.size()); }
 
 private:
+    void StartWorkers();
+    void StopWorkers();
+    void WorkerLoop(size_t engineIndex);
+    void RefreshAggregatedStats();
+
     Config config_;
     UnicornBackend::Reader reader_;
     uint64_t base_ = 0;
@@ -102,6 +111,17 @@ private:
     uint64_t teb_ = 0;
     std::shared_ptr<PageStore> store_;
     std::vector<std::unique_ptr<UnicornBackend>> engines_;
+    // Persistent pool for engines_[1..N-1]; engine 0 runs on the caller's thread.
+    std::vector<std::thread> workers_;
+    std::mutex waveMutex_;
+    std::condition_variable waveStartCv_;
+    std::condition_variable waveDoneCv_;
+    bool workersStopping_ = false;
+    uint64_t waveGeneration_ = 0;
+    size_t activeWaveCount_ = 0;
+    size_t pendingWorkers_ = 0;
+    const Request* waveRequests_ = nullptr;
+    Result* waveResults_ = nullptr;
     // Read from the runtime's scene watcher while the broker thread owns Start/Stop.
     std::atomic<uint64_t> context_{0};
     std::atomic<bool> started_{false};

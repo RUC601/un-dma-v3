@@ -895,8 +895,11 @@ namespace OW {
             publishedCameraView = viewMatrix_xor;
             static uint64_t nextCameraSequence=0;
             const auto sequence = ++nextCameraSequence;
+            const uint64_t steadyCaptureUs = static_cast<uint64_t>(
+                std::chrono::duration_cast<std::chrono::microseconds>(
+                    std::chrono::steady_clock::now().time_since_epoch()).count());
             viewMatrixSampleState = {cameraViewValid, readStartedMs, expectedConnectionEpoch,
-                readStartedMs, readCompletedMs, sequence};
+                readStartedMs, readCompletedMs, sequence, steadyCaptureUs};
             RuntimeTrace::Emit(RuntimeTrace::CameraPublish, sequence, readStartedMs, readCompletedMs,
                 expectedConnectionEpoch, &renderViewProjection.m11, 16);
         }

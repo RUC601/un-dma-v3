@@ -443,7 +443,7 @@ bool TryResolveNativeHitboxCenter(const c_entity& entity, int boneId, Vector3& o
 
 std::optional<float> NativeHitWindowScore(const c_entity& entity, int boneId, uint32_t now,
     const Vector3& origin, const Vector3& direction, const Vector3& predictedDisplacement,
-    float projectileRadius, float hitboxScalePercent)
+    float projectileRadius, float hitboxScalePercent, bool requireExplicitCritical)
 {
     if (!NativeHitboxSampleUsableInternal(entity, now) || !IsFiniteVector(origin) ||
         !IsFiniteVector(direction) || !IsFiniteVector(predictedDisplacement) ||
@@ -464,6 +464,8 @@ std::optional<float> NativeHitWindowScore(const c_entity& entity, int boneId, ui
         const auto& pose = sample.poses[i];
         if (shape.boneId != boneId || !std::isfinite(shape.radius) || shape.radius <= 0.0f || !pose.Valid())
             continue;
+        if (requireExplicitCritical && shape.critical != ModelShapes::CriticalState::Critical)
+            continue;
         const Vector3 a = sample.world.TransformPoint(ModelShapes::Transform(shape.a, pose)) + relativeAnchor;
         const Vector3 b = sample.world.TransformPoint(ModelShapes::Transform(shape.b, pose)) + relativeAnchor;
         // Minimum axis scale gives an inscribed radius for non-uniform transforms.
@@ -481,7 +483,7 @@ std::optional<float> NativeHitWindowScore(const c_entity& entity, int boneId, ui
 
 std::optional<float> NativeHitWindowScore(const c_entity& entity, int boneId, uint32_t now,
     const Vector3& origin, const Vector3& direction, const NativeHitWindowInput& input,
-    const Vector3& extraDisplacement)
+    const Vector3& extraDisplacement, bool requireExplicitCritical)
 {
     if (input.projectileRadius < 0.0f || !IsFiniteVector(origin) || !IsFiniteVector(direction))
         return std::nullopt;
@@ -496,7 +498,8 @@ std::optional<float> NativeHitWindowScore(const c_entity& entity, int boneId, ui
             return std::nullopt;
         launchDirection = launchDirection / launchLength;
         return NativeHitWindowScore(entity, boneId, now, origin, launchDirection,
-            input.displacement + extraDisplacement, input.projectileRadius, input.hitboxScalePercent);
+            input.displacement + extraDisplacement, input.projectileRadius, input.hitboxScalePercent,
+            requireExplicitCritical);
     }
 
     if (!std::isfinite(input.projectileSpeed) || input.projectileSpeed <= 0.0f ||
@@ -532,6 +535,8 @@ std::optional<float> NativeHitWindowScore(const c_entity& entity, int boneId, ui
         const auto& shape = sample.shapes[i];
         const auto& pose = sample.poses[i];
         if (shape.boneId != boneId || !std::isfinite(shape.radius) || shape.radius <= 0.0f || !pose.Valid())
+            continue;
+        if (requireExplicitCritical && shape.critical != ModelShapes::CriticalState::Critical)
             continue;
         const Vector3 a = sample.world.TransformPoint(ModelShapes::Transform(shape.a, pose)) + relativeAnchor;
         const Vector3 b = sample.world.TransformPoint(ModelShapes::Transform(shape.b, pose)) + relativeAnchor;

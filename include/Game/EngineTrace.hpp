@@ -1,6 +1,10 @@
 #pragma once
 
+#include <algorithm>
+#include <cstddef>
 #include <cstdint>
+#include <span>
+#include <vector>
 
 // Engine ray service boundary for V3 (UniCore experiment).
 //
@@ -66,6 +70,15 @@ public:
     // Binds the backend to one scene. Called once per scene change; may be expensive.
     virtual bool BindScene(uint64_t sceneEpoch) = 0;
     virtual Status Trace(const Request& request, Result& result) = 0;
+    // Batch dispatch hook. Multi-engine backends (e.g. 6-engine VisionProbe) override this
+    // to execute requests concurrently in one wave; single-engine backends fall back to Trace().
+    virtual void TraceBatch(std::span<const Request> requests, std::span<Result> results) {
+        const size_t count = (std::min)(requests.size(), results.size());
+        for (size_t i = 0; i < count; ++i) {
+            results[i] = Result{};
+            results[i].status = Trace(requests[i], results[i]);
+        }
+    }
     virtual void ReleaseScene() = 0;
 };
 
@@ -96,8 +109,11 @@ public:
     // the backend to bind the new scene. Returns false when no backend could bind it.
     bool OnSceneChanged(uint64_t sceneEpoch);
 
-    // One request at a time is the intended usage. The service does not queue.
+    // Single-request synchronous trace.
     Result Trace(const Request& request);
+
+    // Concurrent multi-ray batch trace. Preserves caller order and per-request scene validation.
+    std::vector<Result> TraceBatch(std::span<const Request> requests);
 
     const Stats& GetStats() const { return stats_; }
     void ResetStats() { stats_ = Stats{}; }

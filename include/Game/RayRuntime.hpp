@@ -41,4 +41,7 @@ bool ProbeRunning() noexcept;
 // world occlusion as unavailable instead of reusing an older scene's answers.
 uint64_t SceneEpoch() noexcept;
 
+// Configured concurrent Unicorn engine count for live VisionProbe batches (default 6).
+int ProbeEngineCount() noexcept;
+
 }  // namespace OW::RayRuntime

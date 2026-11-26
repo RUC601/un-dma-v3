@@ -1064,7 +1064,10 @@ namespace AimbotDetail {
         const auto sent=OW::SendMouseMove(delta,effective_move_time_ms,options);
         const float yaw=OW::Config::OutputYawCountsPerRadian(), pitch=OW::Config::OutputPitchCountsPerRadian();
         const bool accepted=sent.dispatched && sent.status==0 && yaw>0 && pitch>0;
-        OW::CommitAimMotionCommand(accepted ? Vector3(sent.countY/pitch,-sent.countX/yaw,0) : Vector3{});
+        const Vector3 acceptedAngular = accepted ? Vector3(sent.countY/pitch,-sent.countX/yaw,0) : Vector3{};
+        OW::CommitAimMotionCommand(acceptedAngular);
+        if (accepted)
+            OW::TargetingDetail::RecordIntentProgramSent(acceptedAngular);
     }
 
     inline OW::MouseMoveQuantizationResult MoveMagneticTriggerAimDelta(
@@ -1072,7 +1075,8 @@ namespace AimbotDetail {
         const Vector3& currentAngle,
         const Vector3& outputAngle,
         const Vector3& rawTargetAngle,
-        int moveTimeMs = -1) {
+        int moveTimeMs = -1,
+        bool forceNonZero = true) {
         if (!OW::RuntimeWorkersRunning() || !OW::HasFreshViewMatrices())
             return {};
         const Vector3 delta = outputAngle - currentAngle;
@@ -1094,11 +1098,14 @@ namespace AimbotDetail {
         OW::MouseMoveQuantizationOptions quantization{};
         quantization.state = &state.magneticMoveQuantization;
         quantization.fallbackDirectionDelta = rawDelta;
-        quantization.forceNonZero = true;
+        quantization.forceNonZero = forceNonZero;
         const auto sent=OW::SendMouseMove(delta,effectiveMoveTimeMs,quantization);
         const float yaw=OW::Config::OutputYawCountsPerRadian(), pitch=OW::Config::OutputPitchCountsPerRadian();
         const bool accepted=sent.dispatched && sent.status==0 && yaw>0 && pitch>0;
-        OW::CommitAimMotionCommand(accepted ? Vector3(sent.countY/pitch,-sent.countX/yaw,0) : Vector3{});
+        const Vector3 acceptedAngular = accepted ? Vector3(sent.countY/pitch,-sent.countX/yaw,0) : Vector3{};
+        OW::CommitAimMotionCommand(acceptedAngular);
+        if (accepted)
+            OW::TargetingDetail::RecordIntentProgramSent(acceptedAngular);
         return sent;
     }
 
@@ -1706,6 +1713,14 @@ namespace AimbotDetail {
             }
             return false;
         }
+        // Finding #3 fix: enforce unified Phase 2 auto-fire gate (Engageable, reactionRemainingMs==0,
+        // and Fresh Clear under Hybrid) at final GlobalAim submission; manual/physical shots bypass this.
+        if (source == OW::OutputOwnerSource::GlobalAim) {
+            const auto lastCandidate = OW::TargetingDetail::SnapshotLastTargetCandidate();
+            if (!OW::CandidateAutoFireGateAllowed(lastCandidate, UI::Preferences::ActiveRayBackend())) {
+                return false;
+            }
+        }
         auto& state=*activeAimShotState;ObserveReleaseFireInput(state);
         if(state.releaseNeedsActivationUp) return false;
         const auto local=LocalEntity();const auto* weapon=OW::ResolveWeaponSpec(local.HeroID,OW::Config::View_aimbotAttack());
@@ -1862,12 +1877,16 @@ namespace AimbotDetail {
     }
 
     inline bool CurrentTarget(c_entity& target, bool requireVisible = false) {
-        return OW::TryGetTargetEntity(OW::Config::Targetenemyi, target, requireVisible);
+        // R3 fix: when requireVisible is false, validate hard Stage 0 entity health/freshness
+        // without re-evaluating visibility-dependent AimPlan rules that would veto valid Hybrid solutions.
+        if (!requireVisible)
+            return OW::TryGetTargetEntityStage0(OW::Config::Targetenemyi, target);
+        return OW::TryGetTargetEntity(OW::Config::Targetenemyi, target, true);
     }
 
     bool IsPrimaryTargetActionable(c_entity& target) {
         if (!CurrentTarget(target)) return false;
-        if (!OW::TargetingDetail::IsRuntimeTargetValid(target, false)) return false;
+        if (!OW::TargetingDetail::IsRuntimeTargetValidStage0(target)) return false;
         if (target.skill2act && target.HeroID == OW::eHero::HERO_GENJI) return false;
         if (target.skill1act && target.HeroID == OW::eHero::HERO_VENTURE) return false;
         if (!ProtectionFilterPasses(target)) return false;
@@ -1875,7 +1894,7 @@ namespace AimbotDetail {
     }
 
     inline bool IsPrimaryTargetSnapshotActionable(const c_entity& target) {
-        if (!OW::TargetingDetail::IsRuntimeTargetValid(target, false)) return false;
+        if (!OW::TargetingDetail::IsRuntimeTargetValidStage0(target)) return false;
         if (target.skill2act && target.HeroID == OW::eHero::HERO_GENJI) return false;
         if (target.skill1act && target.HeroID == OW::eHero::HERO_VENTURE) return false;
         if (!ProtectionFilterPasses(target)) return false;
@@ -2817,6 +2836,12 @@ namespace AimbotDetail {
             (noTarget || !candidate || !candidate->valid || !candidate->entitySnapshot.Vis))
             return false;
         if(!state.releasePending) return false;
+        // Finding #3 fix: never release a program-owned auto-charge shot during PreAim,
+        // PeekEmerge ReactionDelayGate, or Hybrid ray observation vacuum.
+        if (noTarget || !candidate ||
+            !OW::CandidateAutoFireGateAllowed(*candidate, UI::Preferences::ActiveRayBackend())) {
+            return false;
+        }
         const auto* tuning=OW::Config::ActiveSlotBehaviorTuning();
         if(!tuning || (!noTarget && GetTickCount()-state.releaseActionStarted<
             static_cast<DWORD>(tuning->releaseAimTimeoutMs))) return false;
@@ -3404,6 +3429,13 @@ namespace AimbotDetail {
                 break;
             }
             bool holdThisTick = false;
+            OW::TargetingDetail::ObserveIntentCamera(
+                OW::TargetingDetail::SnapshotFovRuntimeContext(),
+                connectionEpoch,
+                state.trackingTargetKey != 0);
+            OW::TargetingDetail::SetActiveFirePhase(
+                ResolveMagneticFirePhase(state),
+                FireCycleShotIssued(state) && state.lastFlickFireTick != 0);
             const OW::TargetCandidate candidate =
                 OW::AcquireTarget(
                     *OW::consumerFrame,
@@ -3413,7 +3445,9 @@ namespace AimbotDetail {
             OW::AimCandidateConfig selectedSettings(candidate.valid?candidate.entitySnapshot.HeroID:0);
             const c_entity target = candidate.entitySnapshot;
             const Vector3 vec = candidate.valid
-                ? TrackingSampleAgeCompensatedAimPoint(candidate, GetTickCount())
+                ? (candidate.tier == OW::VisibilityTier::PreAim
+                    ? candidate.aimPoint
+                    : TrackingSampleAgeCompensatedAimPoint(candidate, GetTickCount()))
                 : Vector3{};
             if (!candidate.valid || IsZeroVector(vec)) {
                 HoldTrackingTargetDropout(state, GetTickCount());
@@ -3429,6 +3463,45 @@ namespace AimbotDetail {
                     vec.Y,
                     vec.Z);
                 releaseHeldFire();
+            } else if (candidate.tier == OW::VisibilityTier::PreAim) {
+                // §5.4 & §8.2: PreAim two-stage wall-edge hold. Hard-forbids all firing;
+                // Positioning executes a one-shot smooth park to P_park ONLY when valid;
+                // pending EdgeFan and Parked emit zero movement.
+                releaseHeldFire();
+                const uint64_t trackingTargetKey = candidate.entityKey != 0
+                    ? candidate.entityKey
+                    : OW::TargetingDetail::StableTargetKey(target);
+                const uint64_t trackingTargetActorKey = TwoStageEntityKey(target);
+                PrepareTrackingTargetContinuity(state, trackingTargetKey, trackingTargetActorKey);
+                state.trackingTargetMissingSinceTick = 0;
+                const OW::TrackingStageDecision stageDecision = OW::EvaluateTrackingStageDecision(
+                    candidate, UI::Preferences::ActiveRayBackend());
+                if (stageDecision == OW::TrackingStageDecision::PreAimParkMove) {
+                    const float smoothInput = OW::Config::AimBehaviorSmoothInput(
+                        behavior, OW::Config::View_Tracking_smooth(), 1.0f);
+                    AimData parkAim = BuildAimData(
+                        vec, false, smoothInput, OW::Config::AimBehaviorAcceleration(behavior),
+                        -1, -1.0f, false);
+                    const float intentGain = std::clamp(candidate.intentGain, 0.0f, 1.0f);
+                    if (parkAim.valid && !IsZeroVector(parkAim.smoothed_angle) && intentGain > 0.001f) {
+                        Vector3 parkDelta = (parkAim.smoothed_angle - parkAim.local_angle) * intentGain;
+                        OW::CommitAimSmoothingOutput(parkDelta);
+                        if (parkDelta.Size() > 0.000001f) {
+                            MoveAimDelta(parkAim.local_angle, parkAim.local_angle + parkDelta);
+                            g_trackingMoves++;
+                        }
+                    } else {
+                        OW::HoldAimSmoothingState();
+                    }
+                } else {
+                    OW::HoldAimSmoothingState();
+                }
+            } else if (OW::EvaluateTrackingStageDecision(
+                           candidate, UI::Preferences::ActiveRayBackend()) ==
+                       OW::TrackingStageDecision::NoOutput) {
+                // §5.5 & §8.2: Unified PeekEmerge ReactionDelayGate / Ignored defers pull & fire.
+                releaseHeldFire();
+                OW::HoldAimSmoothingState();
             } else {
                 const uint64_t trackingTargetKey = candidate.entityKey != 0
                     ? candidate.entityKey
@@ -3448,11 +3521,15 @@ namespace AimbotDetail {
                     AdvanceHitboxMotionAssist(state, candidate, target);
                 float deadzoneDistance = 0.0f;
                 const float deadzoneDampingScale = TrackingDeadzoneDampingScale(aimTarget, &deadzoneDistance);
+                const bool contourFreshExposed =
+                    candidate.contour.evidence.exposed && candidate.contour.evidence.fresh;
+                const bool autoFireRayAllowed = OW::RayDecisionAllowsAutoFire(
+                    candidate.ray, contourFreshExposed, UI::Preferences::ActiveRayBackend());
                 if (deadzoneDampingScale <= 0.0f && !motionAssist.HasFollowDisplacement()) {
                     OW::HoldAimSmoothingState();
                     state.trackingInDeadzone = true;
                     holdThisTick = OW::RuntimeWorkersRunning() && OW::HasFreshViewMatrices() &&
-                        ShouldHoldFireWhileTracking(holdFireButton);
+                        autoFireRayAllowed && ShouldHoldFireWhileTracking(holdFireButton);
                     if (holdThisTick && !fireHeld && holdFireButton >= 0) {
                         synchronizeHeldFireState();
                         fireHeld = OW::ActionOutputSucceeded(
@@ -3487,6 +3564,8 @@ namespace AimbotDetail {
                         deadzoneDampingScale,
                         smoothInput);
                 }
+                // Defer smoothing feedback commit until after startLimiter, reversal easing,
+                // and intentGain attenuation so overshoot state never over-commits (Finding #14).
                 AimData aim = BuildAimData(
                     aimTarget,
                     false,
@@ -3494,11 +3573,11 @@ namespace AimbotDetail {
                     OW::Config::AimBehaviorAcceleration(behavior),
                     -1,
                     -1.0f,
-                    !startLimiterProfile.enabled);
+                    false);
                 const float contactDistance = aim.valid ? aim.local_pos.DistTo(aimTarget) : 0.0f;
                 const OW::SkeletonBoneMask allowedMask =
                     ResolveAllowedBoneMaskForCandidate(target, contactDistance);
-                const bool insideEffectiveHitbox = aim.valid && OW::InAllowedAimHitWindow(
+                const bool insideEffectiveHitbox = aim.valid && OW::InCandidateHitWindow(
                     candidate, aim.local_angle, aim.target_angle, aim.local_pos, aimTarget,
                     allowedMask, aimTarget - candidate.aimPoint);
                 const Vector3 inHitboxTargetAngle = insideEffectiveHitbox
@@ -3521,7 +3600,7 @@ namespace AimbotDetail {
                     ApplyAiAimNoise(aim.smoothed_angle, 500.f, true);
                 }
                 holdThisTick = OW::RuntimeWorkersRunning() && OW::HasFreshViewMatrices() &&
-                    ShouldHoldFireWhileTracking(holdFireButton);
+                    autoFireRayAllowed && ShouldHoldFireWhileTracking(holdFireButton);
                 if (holdThisTick && !fireHeld && holdFireButton >= 0) {
                     synchronizeHeldFireState();
                     fireHeld = OW::ActionOutputSucceeded(
@@ -3547,7 +3626,6 @@ namespace AimbotDetail {
                             aim.smoothed_angle,
                             startLimiterDeltaTime);
                         outputAngle = limiterResult.outputAngle;
-                        OW::CommitAimSmoothingOutput(outputAngle - aim.local_angle);
                         if (OW::Config::aimVerboseLog) {
                             Diagnostics::Aim("tracking.start_limiter requestedDegPerSec=%.3f capDegPerSec=%.3f appliedDegPerSec=%.3f limited=%d reset=%s targetKey=0x%llX session=%llu connectionEpoch=%llu dt=%.6f",
                                 limiterResult.requestedSpeedDegPerSec,
@@ -3562,8 +3640,23 @@ namespace AimbotDetail {
                         }
                     }
 
-                    const Vector3 outputDelta = outputAngle - aim.local_angle;
+                    Vector3 outputDelta = outputAngle - aim.local_angle;
+                    // Decision #1 (R6 fix): short reaction delay followed by smooth cubic ease-in
+                    // on target sudden-stop/reversal latch (avoids instant spike & abrupt step-back).
+                    const float reversalEaseScale = OW::TargetPipeline::ComputeReversalEaseScale(
+                        candidate.targetReversalActive,
+                        candidate.targetReversalElapsedMs);
+                    const float intentGain = std::clamp(candidate.intentGain, 0.0f, 1.0f);
+                    const float combinedGain = intentGain * reversalEaseScale;
+                    if (combinedGain < 0.999f) {
+                        outputDelta = outputDelta * combinedGain;
+                        outputAngle = aim.local_angle + outputDelta;
+                    }
+                    if (!insideEffectiveHitbox) {
+                        OW::CommitAimSmoothingOutput(outputDelta);
+                    }
                     const bool moved = !zeroAssistInsideHitbox &&
+                        combinedGain > 0.001f &&
                         ((!startLimiterProfile.enabled && !insideEffectiveHitbox) ||
                          outputDelta.Size() > 0.000001f);
                     if (moved) {
@@ -3700,10 +3793,10 @@ namespace AimbotDetail {
                         OW::Config::AimBehaviorSmoothInput(behavior, OW::Config::View_Tracking_smooth(), deadzoneDampingScale),
                         OW::Config::AimBehaviorAcceleration(behavior));
                     const float hitWindow = OW::Config::aimbotEffectiveHitWindow;
-                    const bool hitBeforeMove = OW::InSelectedAimHitWindow(candidate, aim.local_angle, aim.target_angle, aim.local_pos, vec);
+                    const bool hitBeforeMove = OW::InCandidateHitWindow(candidate, aim.local_angle, aim.target_angle, aim.local_pos, vec);
                     const bool hitAfterMove = !hitBeforeMove &&
                         deadzoneDampingScale > 0.0f &&
-                        OW::InSelectedAimHitWindow(candidate, aim.smoothed_angle, aim.target_angle, aim.local_pos, vec);
+                        OW::InCandidateHitWindow(candidate, aim.smoothed_angle, aim.target_angle, aim.local_pos, vec);
                     const Vector3 rawDelta = aim.target_angle - aim.local_angle;
                     Vector3 previewDelta{};
                     if (!hitBeforeMove &&
@@ -3769,6 +3862,11 @@ namespace AimbotDetail {
                 break;
             }
 
+            OW::TargetingDetail::ObserveIntentCamera(
+                OW::TargetingDetail::SnapshotFovRuntimeContext(),
+                connectionEpoch,
+                OW::TargetingDetail::SnapshotTargetLockRuntime().active);
+            OW::TargetingDetail::SetActiveFirePhase(firePhase, true);
             const auto candidate = OW::AcquireCurrentAimTarget(OW::Config::View_Prediction());
             if (CompleteReleasedAimAtCrosshair(state, false, &candidate)) break;
             const Vector3 vec = candidate.valid ? candidate.aimPoint : Vector3{};
@@ -3797,6 +3895,19 @@ namespace AimbotDetail {
                 Diagnostics::Aim("magnetic_trigger no_move reason=no_target_vector targetIndex=%d entities=%zu",
                     OW::Config::Targetenemyi,
                     OW::TargetingDetail::SnapshotEntities().size());
+                OW::RuntimeWorkerSleep(1);
+                RunAutoScaleFov();
+                if (ShouldYieldToSecondaryAim()) break;
+                continue;
+            }
+
+            // §5.4, §5.5, §8.2: Hard-forbid through-wall magnetic pull & fire during PreAim or
+            // PeekEmerge ReactionDelayGate while preserving fire-phase cooldown timing.
+            if (candidate.tier != OW::VisibilityTier::Engageable ||
+                candidate.reactionRemainingMs > 0.0f) {
+                ResetMagneticTriggerQuantization(
+                    state, candidate.tier == OW::VisibilityTier::PreAim ? "preaim_hold" : "reaction_gate");
+                OW::HoldAimSmoothingState();
                 OW::RuntimeWorkerSleep(1);
                 RunAutoScaleFov();
                 if (ShouldYieldToSecondaryAim()) break;
@@ -3847,7 +3958,10 @@ namespace AimbotDetail {
                 aimTarget,
                 false,
                 smoothInput,
-                OW::Config::AimBehaviorAcceleration(behavior));
+                OW::Config::AimBehaviorAcceleration(behavior),
+                -1,
+                -1.0f,
+                false); // R7 fix: commit smoothing feedback only after phase & intent gain attenuation.
             ApplyAiAimNoise(aim.smoothed_angle, 500.f, true);
             if (!IsZeroVector(aim.smoothed_angle)) {
                 Vector3 phasedDelta = aim.smoothed_angle - aim.local_angle;
@@ -3859,13 +3973,17 @@ namespace AimbotDetail {
             const float contactDistance = aim.valid ? aim.local_pos.DistTo(aimTarget) : 0.0f;
             const OW::SkeletonBoneMask allowedMask =
                 ResolveAllowedBoneMaskForCandidate(target, contactDistance);
-            const bool hitBeforeMove = OW::InAllowedAimHitWindow(
+            const bool hitBeforeMove = OW::InCandidateHitWindow(
                 candidate, aim.local_angle, aim.target_angle, aim.local_pos, aimTarget, allowedMask);
             ReportReleasedAimProgress(state,aim,aimTarget,hitWindow,hitBeforeMove);
             bool hitAfterMove = hitBeforeMove;
 
+            const bool magneticAutoFireRayAllowed = OW::RayDecisionAllowsAutoFire(
+                candidate.ray, contourActive, UI::Preferences::ActiveRayBackend());
+
             if (!FireCycleShotIssued(state) &&
                 GlobalAimFirePolicyAllowsGeneratedFire() &&
+                magneticAutoFireRayAllowed &&
                 DelayedShotTimedOut(state)) {
                 const c_entity local = LocalEntity();
                 ResetMagneticTriggerQuantization(state, "delayed_shot_timeout");
@@ -3878,18 +3996,20 @@ namespace AimbotDetail {
                 continue;
             }
 
+            const float magneticIntentGain = std::clamp(candidate.intentGain, 0.0f, 1.0f);
             if (hitBeforeMove) {
                 ResetMagneticTriggerQuantization(state, "inside_hit_window");
                 const bool willFireNow = !FireCycleShotIssued(state) &&
                     GlobalAimFirePolicyAllowsGeneratedFire() &&
                     firePhase.readyToFire;
-                if (!willFireNow && !firePhase.paused && motionAssist.HasFollowDisplacement()) {
+                if (!willFireNow && !firePhase.paused && motionAssist.HasFollowDisplacement() &&
+                    magneticIntentGain > 0.001f) {
                     const Vector3 inHitboxAngle =
                         OW::HitboxMotionAssist::ComputeInHitboxTargetAngle(
                             aim.local_angle, contactDistance, motionAssist);
                     Vector3 followDelta = inHitboxAngle - aim.local_angle;
-                    followDelta.X *= firePhase.pitchScale;
-                    followDelta.Y *= firePhase.yawScale;
+                    followDelta.X *= firePhase.pitchScale * magneticIntentGain;
+                    followDelta.Y *= firePhase.yawScale * magneticIntentGain;
                     if (std::isfinite(followDelta.X) && std::isfinite(followDelta.Y) &&
                         followDelta.Size() > 0.000001f) {
                         OW::HoldAimSmoothingState();
@@ -3926,10 +4046,10 @@ namespace AimbotDetail {
                     std::isfinite(rawDelta.Z) &&
                     (std::fabs(rawDelta.X) > 0.0000001f ||
                         std::fabs(rawDelta.Y) > 0.0000001f);
-                if (rawDeltaValid) {
+                if (rawDeltaValid && magneticIntentGain > 0.001f) {
                     Vector3 phaseFallbackDelta = rawDelta;
-                    phaseFallbackDelta.X *= firePhase.pitchScale;
-                    phaseFallbackDelta.Y *= firePhase.yawScale;
+                    phaseFallbackDelta.X *= firePhase.pitchScale * magneticIntentGain;
+                    phaseFallbackDelta.Y *= firePhase.yawScale * magneticIntentGain;
                     const bool phaseFallbackValid =
                         std::isfinite(phaseFallbackDelta.X) &&
                         std::isfinite(phaseFallbackDelta.Y) &&
@@ -3937,7 +4057,8 @@ namespace AimbotDetail {
                             std::fabs(phaseFallbackDelta.Y) > 0.0000001f);
                     const Vector3 phaseFallbackTarget =
                         aim.local_angle + phaseFallbackDelta;
-                    const Vector3 outputDelta = outputAngle - aim.local_angle;
+                    const Vector3 outputDelta = (outputAngle - aim.local_angle) * magneticIntentGain;
+                    outputAngle = aim.local_angle + outputDelta;
                     const bool hasSmoothedDelta =
                         std::isfinite(outputDelta.X) &&
                         std::isfinite(outputDelta.Y) &&
@@ -3949,16 +4070,24 @@ namespace AimbotDetail {
                             state,
                             aim.local_angle,
                             outputAngle,
-                            phaseFallbackTarget);
+                            phaseFallbackTarget,
+                            -1,
+                            magneticIntentGain > 0.05f);
+                    if (hasSmoothedDelta) {
+                        OW::CommitAimSmoothingOutput(outputDelta);
+                    } else {
+                        OW::HoldAimSmoothingState();
+                    }
                     if (moveResult.dispatched)
                         g_trackingMoves++;
                     if (hasSmoothedDelta) {
-                        hitAfterMove = OW::InSelectedAimHitWindow(
+                        hitAfterMove = OW::InCandidateHitWindow(
                             candidate,
                             outputAngle,
                             aim.target_angle,
                             aim.local_pos,
-                            aimTarget);
+                            aimTarget,
+                            allowedMask);
                     }
                     static DWORD lastQuantizationTickLog = 0;
                     const DWORD quantizationLogNow = GetTickCount();
@@ -4029,6 +4158,7 @@ namespace AimbotDetail {
 
             if (!FireCycleShotIssued(state) &&
                 GlobalAimFirePolicyAllowsGeneratedFire() &&
+                magneticAutoFireRayAllowed &&
                 !contourActive &&
                 OW::Config::dontshot &&
                 OW::Config::shotcount >= OW::Config::shotmanydont &&
@@ -4172,7 +4302,7 @@ namespace AimbotDetail {
                         OW::Config::AimBehaviorSmoothInput(behavior, OW::Config::View_Flick_smooth()),
                         OW::Config::AimBehaviorAcceleration(behavior));
                     const float hitWindow = OW::Config::aimbotEffectiveHitWindow;
-                    const bool wouldHit = OW::InSelectedAimHitWindow(candidate, aim.local_angle, aim.target_angle, aim.local_pos, vec);
+                    const bool wouldHit = OW::InCandidateHitWindow(candidate, aim.local_angle, aim.target_angle, aim.local_pos, vec);
                     Diagnostics::Aim("dryrun.flick local_angle_deg=(%.4f,%.4f) target_angle_deg=(%.4f,%.4f) "
                         "delta_deg=(%.4f,%.4f) hitbox=%.4f would_hit=%d target_pos=(%.1f,%.1f,%.1f)",
                         RAD2DEG(aim.local_angle.X), RAD2DEG(aim.local_angle.Y),
@@ -4226,6 +4356,13 @@ namespace AimbotDetail {
                 continue;
             }
 
+            OW::TargetingDetail::ObserveIntentCamera(
+                OW::TargetingDetail::SnapshotFovRuntimeContext(),
+                connectionEpoch,
+                OW::TargetingDetail::SnapshotTargetLockRuntime().active);
+            OW::TargetingDetail::SetActiveFirePhase(
+                ResolveMagneticFirePhase(state),
+                FireCycleShotIssued(state) && state.lastFlickFireTick != 0);
             const auto candidate = OW::AcquireCurrentAimTarget(OW::Config::View_Prediction());
             if (CompleteReleasedAimAtCrosshair(state, false, &candidate)) break;
             const Vector3 vec = candidate.valid ? candidate.aimPoint : Vector3{};
@@ -4250,6 +4387,18 @@ namespace AimbotDetail {
                     OW::Config::Targetenemyi,
                     OW::TargetingDetail::SnapshotEntities().size());
                 break;
+            }
+
+            // §5.4, §5.5, §8.2: Flick / Flick2nd / Reacquire hard-forbid flick movement and fire
+            // during PreAim or PeekEmerge ReactionDelayGate; stay ready for emergence.
+            if (candidate.tier != OW::VisibilityTier::Engageable ||
+                candidate.reactionRemainingMs > 0.0f) {
+                if (ordinaryFlick) PauseOrdinaryFlickMovement(state);
+                OW::HoldAimSmoothingState();
+                OW::RuntimeWorkerSleep(1);
+                RunAutoScaleFov();
+                if (ShouldYieldToSecondaryAim()) break;
+                continue;
             }
 
             c_entity target{};
@@ -4287,7 +4436,7 @@ namespace AimbotDetail {
                     OW::Config::AimBehaviorAcceleration(behavior),
                     twoStagePlan.methodOverride,
                     -1.0f,
-                    true,
+                    false, // R7 fix: commit smoothing feedback only after intent gain attenuation.
                     !repeatPhase.repeat,
                     twoStagePlan.methodOverride < 0); // An explicit stage uses its Slot motion, above hero overrides.
                 if (ordinaryFlick && !aim.valid) {
@@ -4297,7 +4446,7 @@ namespace AimbotDetail {
                 const float contactDistance = aim.valid ? aim.local_pos.DistTo(aimTarget) : 0.0f;
                 const OW::SkeletonBoneMask allowedMask =
                     ResolveAllowedBoneMaskForCandidate(target, contactDistance);
-                const bool hitBeforeMove = OW::InAllowedAimHitWindow(
+                const bool hitBeforeMove = OW::InCandidateHitWindow(
                     candidate, aim.local_angle, aim.target_angle, aim.local_pos, aimTarget, allowedMask);
                 const bool contactBeforeMove = hitBeforeMove;
                 const auto flickFireEvidencePreview = OW::Config::reloading
@@ -4332,8 +4481,11 @@ namespace AimbotDetail {
                 const float hitWindow = OW::Config::aimbotEffectiveHitWindow;
 
                 if (ordinaryFlick || !IsZeroVector(aim.smoothed_angle)) {
+                    const bool flickAutoFireRayAllowed = OW::RayDecisionAllowsAutoFire(
+                        candidate.ray, contourActive, UI::Preferences::ActiveRayBackend());
                     if (FlickRepeat::AllowsFirePath(ordinaryFlick, FlickRepeat::FirePath::DelayedTimeout) &&
                         GlobalAimFirePolicyAllowsGeneratedFire() &&
+                        flickAutoFireRayAllowed &&
                         DelayedShotTimedOut(state)) {
                         const c_entity local = LocalEntity();
                         Diagnostics::Aim("flick delayed_shot timeout target=%d localHero=0x%llX",
@@ -4347,18 +4499,27 @@ namespace AimbotDetail {
 
                     if (ordinaryFlick && CurrentOrdinaryFlickIdentity() != state.ordinaryFlick.identity)
                         break;
-                    if (ordinaryFlick && aim.smoothed_angle == aim.local_angle)
+                    const float flickIntentGain = std::clamp(candidate.intentGain, 0.0f, 1.0f);
+                    Vector3 flickOutputAngle = aim.smoothed_angle;
+                    if (flickIntentGain < 0.999f) {
+                        flickOutputAngle = aim.local_angle +
+                            (aim.smoothed_angle - aim.local_angle) * flickIntentGain;
+                    }
+                    if (flickIntentGain <= 0.001f ||
+                        (ordinaryFlick && flickOutputAngle == aim.local_angle)) {
                         OW::HoldAimSmoothingState();
-                    else
-                        MoveAimDelta(aim.local_angle, aim.smoothed_angle);
+                    } else {
+                        OW::CommitAimSmoothingOutput(flickOutputAngle - aim.local_angle);
+                        MoveAimDelta(aim.local_angle, flickOutputAngle);
+                    }
                     if (OW::Config::aimVerboseLog) {
                         const float deltaDegX = RAD2DEG(aim.target_angle.X - aim.local_angle.X);
                         const float deltaDegY = RAD2DEG(aim.target_angle.Y - aim.local_angle.Y);
                         Diagnostics::Aim("flick.tick delta_deg=(%.4f,%.4f) hitbox=%.4f missbox=%.4f",
                             deltaDegX, deltaDegY, hitWindow, OW::Config::missbox);
                     }
-                    const bool hitAfterMove = OW::InSelectedAimHitWindow(
-                        candidate, aim.smoothed_angle, aim.target_angle, aim.local_pos, aimTarget);
+                    const bool hitAfterMove = OW::InCandidateHitWindow(
+                        candidate, flickOutputAngle, aim.target_angle, aim.local_pos, aimTarget, allowedMask);
                     ReportReleasedAimProgress(state,aim,aimTarget,hitWindow,hitBeforeMove);
                     if (!hitBeforeMove && hitAfterMove) {
                         Diagnostics::Aim("flick.fire predicted_post_move_hit target=%d hitbox=%.6f",
@@ -4433,6 +4594,7 @@ namespace AimbotDetail {
 
                     if (FlickRepeat::AllowsFirePath(ordinaryFlick, FlickRepeat::FirePath::ForcedMiss) &&
                         GlobalAimFirePolicyAllowsGeneratedFire() &&
+                        flickAutoFireRayAllowed &&
                         OW::Config::dontshot &&
                         OW::Config::shotcount >= OW::Config::shotmanydont &&
                         OW::in_range(aim.local_angle, aim.target_angle, aim.local_pos, aimTarget, OW::Config::missbox)) {
@@ -4617,6 +4779,7 @@ namespace AimbotDetail {
         const auto scene=OW::EntitySceneGeneration();
         if(state.entityScene!=scene) {
             ReleaseKeepFiringOutput(state, "scene_generation_changed");
+            OW::TargetingDetail::ResetPhase2RuntimeState();
             const bool requireNewActivation=state.releaseActivationDown||state.releaseOwnedDown||state.releasePending;
             ResetTrackingSession(state);EndOrdinaryFlickActivation(state);
             if(!ResetAimCharge(state)) return false;
@@ -4719,6 +4882,11 @@ namespace AimbotDetail {
         }
 
         MaintainSensitivity(origin_sens);
+        OW::TargetingDetail::ObserveIntentCamera(
+            OW::TargetingDetail::SnapshotFovRuntimeContext(),
+            connectionEpoch,
+            state.trackingSessionActive && state.trackingTargetKey != 0);
+        OW::TargetingDetail::ClearActiveFirePhase();
 
         {
             ScopedIndependentAimSelection independentSelection;
@@ -4825,6 +4993,9 @@ void aimbot_thread() {
 
         while (OW::RuntimeWorkersRunning()) {
             if (!OW::ProcessConnection::IsConnected()) {
+                OW::TargetingDetail::ResetIntentEngine();
+                OW::TargetingDetail::ResetPhase2RuntimeState();
+                OW::TargetingDetail::ClearActiveFirePhase();
                 AimbotDetail::EndOrdinaryFlickActivation(state);
                 AimbotDetail::ObserveReleaseFireInput(state,true);
                 AimbotDetail::ReleaseKeepFiringOutput(state, "connection_unavailable");

@@ -54,7 +54,8 @@ inline std::optional<float> SelectedAimNativeHitScore(const TargetCandidate& can
         return std::nullopt;
     const Vector3 direction = HitWindowDirectionFromEuler(viewAngle) * distance;
     return NativeHitWindowScore(candidate.entitySnapshot, candidate.boneId,
-        GetTickCount(), camera, direction, candidate.nativeHitWindow, sampleDisplacement);
+        GetTickCount(), camera, direction, candidate.nativeHitWindow, sampleDisplacement,
+        candidate.requireExplicitCritical);
 }
 
 inline bool InSelectedAimHitWindow(const TargetCandidate& candidate,
@@ -108,6 +109,9 @@ inline bool InAllowedAimHitWindow(const TargetCandidate& candidate,
         return InSelectedAimHitWindow(candidate, viewAngle, targetAngle, camera, aimPoint);
 
     const uint32_t now = GetTickCount();
+    const bool requirePerBoneWorldClear =
+        !contourExposed &&
+        UI::Preferences::ActiveRayBackend() == static_cast<int>(RayDecisionPolicy::Hybrid);
     if (NativeHitboxSampleUsable(candidate.entitySnapshot, now) &&
         candidate.nativeHitWindow.projectileRadius >= 0.0f &&
         (candidate.aimPoint + sampleDisplacement).DistTo(aimPoint) <= 0.0001f) {
@@ -122,16 +126,29 @@ inline bool InAllowedAimHitWindow(const TargetCandidate& candidate,
             const int boneId = Plexies20260609::HitboxBoneIdForRenderSlot(slot);
             if (boneId == Plexies20260609::kUnusedRenderSkeletonBone)
                 continue;
-            if (boneId == candidate.boneId)
+            if (boneId == candidate.boneId) {
                 checkedSelectedBone = true;
+            } else if (requirePerBoneWorldClear) {
+                // Under Hybrid world ray occlusion, guidance-bone Clear cannot authorize
+                // firing at a different render slot unless THAT exact slot (left/right distinct)
+                // also has fresh WorldClear (R2 fix).
+                const uint32_t slotBit = slot < 32 ? (1u << static_cast<uint32_t>(slot)) : 0u;
+                if ((candidate.worldClearSlotMask & slotBit) == 0)
+                    continue;
+            }
+            const bool slotCriticalOnly =
+                (boneId == candidate.boneId) && candidate.requireExplicitCritical &&
+                candidate.hitAcceptance == HitAcceptance::SelectedOnly;
             const auto score = NativeHitWindowScore(candidate.entitySnapshot, boneId,
-                now, camera, direction, candidate.nativeHitWindow, sampleDisplacement);
+                now, camera, direction, candidate.nativeHitWindow, sampleDisplacement,
+                slotCriticalOnly);
             if (score && *score <= 1.0f)
                 return true;
         }
         if (!checkedSelectedBone) {
             const auto score = NativeHitWindowScore(candidate.entitySnapshot, candidate.boneId,
-                now, camera, direction, candidate.nativeHitWindow, sampleDisplacement);
+                now, camera, direction, candidate.nativeHitWindow, sampleDisplacement,
+                candidate.requireExplicitCritical && candidate.hitAcceptance == HitAcceptance::SelectedOnly);
             if (score && *score <= 1.0f)
                 return true;
         }
@@ -139,6 +156,92 @@ inline bool InAllowedAimHitWindow(const TargetCandidate& candidate,
     }
 
     return InSelectedAimHitWindow(candidate, viewAngle, targetAngle, camera, aimPoint);
+}
+
+// Unified Phase 2 program-generated auto-fire gate (§5.4, §5.5, §8.2, Decision #7):
+// enforces valid Engageable tier, expired PeekEmerge ReactionDelayGate, and Fresh Clear
+// under Hybrid ray policy (blocking PreAim, Ignored, reaction delay, and observation vacuum).
+inline bool CandidateAutoFireGateAllowed(const TargetCandidate& candidate,
+                                         int activeRayBackend) noexcept
+{
+    if (!candidate.valid ||
+        candidate.tier != VisibilityTier::Engageable ||
+        candidate.reactionRemainingMs > 0.0f) {
+        return false;
+    }
+    const bool contourExposed =
+        candidate.contour.evidence.exposed && candidate.contour.evidence.fresh;
+    return RayDecisionAllowsAutoFire(candidate.ray, contourExposed, activeRayBackend);
+}
+
+// Shared Stage 3 tracking output & fire-eligibility decision seam (§5.4, §5.5, §8.2, F9):
+// consumed directly by BehaviorController::RunTracking and exercised by offline selftests.
+enum class TrackingStageDecision : uint8_t {
+    NoOutput = 0,       // Ignored, PreAim Parked, PreAim pending EdgeFan, or ReactionDelayGate active
+    PreAimParkMove,     // PreAim Positioning with valid P_park (auto-fire strictly forbidden)
+    EngagePullOnly,     // Engageable + reaction expired, auto-fire blocked (e.g. Hybrid vacuum grace)
+    EngagePullAndFire,  // Engageable + reaction expired + auto-fire gate allowed
+};
+
+inline TrackingStageDecision EvaluateTrackingStageDecision(const TargetCandidate& candidate,
+                                                           int activeRayBackend) noexcept
+{
+    if (!candidate.valid)
+        return TrackingStageDecision::NoOutput;
+    if (candidate.tier == VisibilityTier::PreAim) {
+        return (candidate.preAimPhase == PreAimPhase::Positioning && candidate.preAimParkPointValid)
+            ? TrackingStageDecision::PreAimParkMove
+            : TrackingStageDecision::NoOutput;
+    }
+    if (candidate.tier != VisibilityTier::Engageable || candidate.reactionRemainingMs > 0.0f)
+        return TrackingStageDecision::NoOutput;
+    return CandidateAutoFireGateAllowed(candidate, activeRayBackend)
+        ? TrackingStageDecision::EngagePullAndFire
+        : TrackingStageDecision::EngagePullOnly;
+}
+
+// Decoupled HitAcceptance consumer for TargetCandidate (§7.2, §8.2).
+// Enforces VisibilityTier::Engageable (hard-forbids PreAim/Ignored fire), expired ReactionDelayGate,
+// and dispatches SelectedOnly vs AnyValidHitbox using candidate.acceptanceMask.
+inline bool InCandidateHitWindow(const TargetCandidate& candidate,
+    const Vector3& viewAngle, const Vector3& targetAngle, const Vector3& camera,
+    const Vector3& aimPoint, SkeletonBoneMask fallbackAllowedMask = 0,
+    const Vector3& sampleDisplacement = {})
+{
+    if (!CandidateAutoFireGateAllowed(candidate, UI::Preferences::ActiveRayBackend()))
+        return false;
+    if (candidate.hitAcceptance == HitAcceptance::SelectedOnly) {
+        if (NativeHitboxSampleUsable(candidate.entitySnapshot, GetTickCount())) {
+            const bool contourExposed = candidate.contour.evidence.exposed && candidate.contour.evidence.fresh;
+            if (!RayDecisionAllowsSelection(candidate.ray, contourExposed,
+                                            UI::Preferences::ActiveRayBackend()))
+                return false;
+            const auto score = SelectedAimNativeHitScore(
+                candidate, viewAngle, camera, aimPoint, sampleDisplacement);
+            return score && *score <= 1.0f;
+        }
+        return InSelectedAimHitWindow(candidate, viewAngle, targetAngle, camera, aimPoint);
+    }
+
+    const SkeletonBoneMask mask = candidate.acceptanceMask != 0
+        ? candidate.acceptanceMask
+        : fallbackAllowedMask;
+    return InAllowedAimHitWindow(
+        candidate, viewAngle, targetAngle, camera, aimPoint, mask, sampleDisplacement);
+}
+
+// Authoritative Stage 3 HitAcceptance consumer for TargetSolution (§8.1, §8.2).
+inline bool InSolutionHitWindow(const TargetSolution& solution,
+    const Vector3& viewAngle, const Vector3& targetAngle, const Vector3& camera,
+    const Vector3& aimPoint, const Vector3& sampleDisplacement = {})
+{
+    if (!solution.valid || solution.tier != VisibilityTier::Engageable ||
+        solution.reactionRemainingMs > 0.0f)
+        return false;
+    const TargetCandidate candidate = solution.ToCandidate();
+    return InCandidateHitWindow(
+        candidate, viewAngle, targetAngle, camera, aimPoint,
+        solution.acceptanceMask, sampleDisplacement);
 }
 
 } // namespace OW

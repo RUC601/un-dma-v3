@@ -273,6 +273,7 @@ struct ViewMatrixSampleState {
     uint64_t readStartedMs = 0;
     uint64_t readCompletedMs = 0;
     uint64_t publishSequence = 0;
+    uint64_t steadyCaptureUs = 0;
 };
 
 inline bool IsViewMatrixSampleFresh(const ViewMatrixSampleState& sample,

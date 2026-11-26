@@ -23,6 +23,7 @@
 #include "Game/AimBehaviorMode.hpp"
 #include "Game/GameData.hpp"
 #include "Utils/InputLabels.hpp"
+#include "Game/TargetSolutionTypes.hpp"
 #include "Game/TriggerBoneSelection.hpp"
 #include "output/DeviceSettings.hpp"
 #include "output/DeviceRegistry.hpp"
@@ -292,6 +293,8 @@ namespace OW { namespace Config {
     // retarget.
     inline int aimBoneSelectionMode = 2;
     inline int aimPreferredBone = kAimBoneChest;
+    inline int aimPriority = static_cast<int>(AimPriority::HeadOnly);
+    inline int aimHitAcceptance = static_cast<int>(HitAcceptance::SelectedOnly);
     inline SkeletonBoneMask aimbotBoneMask2 = kDefaultAimBoneMask;
     inline bool switch_team  = false;
     inline bool switch_team2 = false;
@@ -502,6 +505,8 @@ namespace OW { namespace Config {
         int predictionAlgorithm = static_cast<int>(PredictionAlgorithm::BallisticIntercept);
         int boneSelectionMode = 2;
         int preferredBone = kAimBoneChest;
+        int aimPriority = static_cast<int>(AimPriority::HeadOnly);
+        int hitAcceptance = static_cast<int>(HitAcceptance::SelectedOnly);
     };
     inline thread_local SlotTargetRules slotTargetRules{};
     inline thread_local bool targetAimPlanEnabled = false;
@@ -1518,6 +1523,8 @@ namespace OW { namespace Config {
         SkeletonBoneMask aimBoneMask = kDefaultAimBoneMask;
         int boneSelectionMode = 2;
         int preferredBone = kAimBoneChest;
+        int aimPriority = static_cast<int>(AimPriority::HeadOnly);
+        int hitAcceptance = static_cast<int>(HitAcceptance::SelectedOnly);
         float hitbox = kDefaultHitboxScalePercent; // percentage of resolved bone+projectile window
         int aimMode = 0;         // 0=Tracking, 1=Flick
         int aimBehavior = kAimBehaviorTracking; // 0=Tracking, 1=Flick, 2=Flick2nd, 3=Reacquire, 4=MagneticTrigger

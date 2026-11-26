@@ -71,15 +71,102 @@ bool VisionProbe::Start(uint64_t sceneEpoch) {
     }
     // Every engine reads the same synthetic setup, so the context is identical across them.
     context_.store(engines_.empty() ? 0 : engines_.front()->Context(), std::memory_order_release);
+    StartWorkers();
     started_.store(true, std::memory_order_release);
     return true;
 }
 
 void VisionProbe::Stop() {
     started_.store(false, std::memory_order_release);
+    StopWorkers();
     engines_.clear();
     store_.reset();
     context_.store(0, std::memory_order_release);
+}
+
+void VisionProbe::StartWorkers() {
+    StopWorkers();
+    if (engines_.size() <= 1) return;
+    {
+        std::lock_guard<std::mutex> lock(waveMutex_);
+        workersStopping_ = false;
+        waveGeneration_ = 0;
+        activeWaveCount_ = 0;
+        pendingWorkers_ = 0;
+        waveRequests_ = nullptr;
+        waveResults_ = nullptr;
+    }
+    workers_.reserve(engines_.size() - 1);
+    for (size_t i = 1; i < engines_.size(); ++i) {
+        workers_.emplace_back([this, i]() { WorkerLoop(i); });
+    }
+}
+
+void VisionProbe::StopWorkers() {
+    {
+        std::lock_guard<std::mutex> lock(waveMutex_);
+        workersStopping_ = true;
+    }
+    waveStartCv_.notify_all();
+    for (auto& worker : workers_) {
+        if (worker.joinable()) worker.join();
+    }
+    workers_.clear();
+    {
+        std::lock_guard<std::mutex> lock(waveMutex_);
+        workersStopping_ = false;
+        activeWaveCount_ = 0;
+        pendingWorkers_ = 0;
+        waveRequests_ = nullptr;
+        waveResults_ = nullptr;
+    }
+}
+
+void VisionProbe::WorkerLoop(size_t engineIndex) {
+    uint64_t seenGeneration = 0;
+    for (;;) {
+        const Request* req = nullptr;
+        Result* res = nullptr;
+        {
+            std::unique_lock<std::mutex> lock(waveMutex_);
+            waveStartCv_.wait(lock, [&]() {
+                return workersStopping_ || waveGeneration_ != seenGeneration;
+            });
+            if (workersStopping_) return;
+            seenGeneration = waveGeneration_;
+            if (engineIndex < activeWaveCount_) {
+                req = waveRequests_ + engineIndex;
+                res = waveResults_ + engineIndex;
+            }
+        }
+        if (req && res) {
+            engines_[engineIndex]->Trace(*req, *res);
+            std::lock_guard<std::mutex> lock(waveMutex_);
+            if (pendingWorkers_ > 0 && --pendingWorkers_ == 0) {
+                waveDoneCv_.notify_one();
+            }
+        }
+    }
+}
+
+void VisionProbe::RefreshAggregatedStats() {
+    UnicornBackend::Stats total{};
+    for (const auto& engine : engines_) {
+        const auto& s = engine->GetStats();
+        total.traces += s.traces;
+        total.faults += s.faults;
+        total.mappedPages += s.mappedPages;
+        total.pageFetches += s.pageFetches;
+        total.cacheHits += s.cacheHits;
+        total.pageReadFailures += s.pageReadFailures;
+        total.pageUnavailableTraces += s.pageUnavailableTraces;
+        total.pageReadRetries += s.pageReadRetries;
+        total.instructions += s.instructions;
+        if (s.lastFailedPage != 0) total.lastFailedPage = s.lastFailedPage;
+        if (s.maxUs > total.maxUs) total.maxUs = s.maxUs;
+        if (s.lastUs > total.lastUs) total.lastUs = s.lastUs;
+    }
+    stats_ = total;
 }
 
 bool VisionProbe::Healthy() const {
@@ -109,22 +196,35 @@ std::vector<Result> VisionProbe::Probe(const std::vector<Request>& requests) {
         return results;
     }
 
-    // One request per engine per wave; waves run until the batch is covered.
+    // One request per engine per wave; engine 0 runs on the caller thread while persistent
+    // worker threads execute engines_[1..waveCount-1] concurrently.
     size_t index = 0;
     while (index < requests.size()) {
         const size_t waveCount = (std::min)(engines_.size(), requests.size() - index);
-        std::vector<std::thread> workers;
-        workers.reserve(waveCount);
-        for (size_t i = 0; i < waveCount; ++i) {
-            UnicornBackend* engine = engines_[i].get();
-            const Request* request = &requests[index + i];
-            Result* result = &results[index + i];
-            workers.emplace_back([engine, request, result]() { engine->Trace(*request, *result); });
+        if (waveCount == 1) {
+            engines_[0]->Trace(requests[index], results[index]);
+        } else {
+            {
+                std::lock_guard<std::mutex> lock(waveMutex_);
+                waveRequests_ = &requests[index];
+                waveResults_ = &results[index];
+                activeWaveCount_ = waveCount;
+                pendingWorkers_ = waveCount - 1;
+                ++waveGeneration_;
+            }
+            waveStartCv_.notify_all();
+            engines_[0]->Trace(requests[index], results[index]);
+            {
+                std::unique_lock<std::mutex> lock(waveMutex_);
+                waveDoneCv_.wait(lock, [&]() { return pendingWorkers_ == 0; });
+                activeWaveCount_ = 0;
+                waveRequests_ = nullptr;
+                waveResults_ = nullptr;
+            }
         }
-        for (auto& worker : workers) worker.join();
         index += waveCount;
     }
-    stats_ = engines_.front()->GetStats();
+    RefreshAggregatedStats();
     return results;
 }
 
@@ -132,7 +232,7 @@ Result VisionProbe::ProbeOne(const Request& request) {
     if (!started_.load(std::memory_order_acquire) || engines_.empty()) return Result{};
     Result result;
     engines_.front()->Trace(request, result);
-    stats_ = engines_.front()->GetStats();
+    RefreshAggregatedStats();
     return result;
 }
 

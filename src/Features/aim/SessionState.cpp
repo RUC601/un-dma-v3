@@ -42,6 +42,7 @@ namespace AimbotDetail {
         state.trackingInDeadzone = false;
         state.hitboxMotionAssist.Reset();
         OW::ResetAimStartLimiter(state.trackingStartLimiter);
+        OW::TargetingDetail::ResetTargetLockRuntime();
     }
 
     void PauseOrdinaryFlickMovement(RuntimeState& state) {

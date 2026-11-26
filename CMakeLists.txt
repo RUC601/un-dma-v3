@@ -60,10 +60,13 @@ set(GAME_HEADERS
     include/Game/HeroPerkRuntime.hpp
     include/Game/HeroPerks.hpp
     include/Game/HeroSkills.hpp
+    include/Game/IntentEngine.hpp
     include/output/InputOrchestrator.hpp
     include/Game/LeadPrediction.hpp
     include/Game/Offsets.hpp
     include/Game/EngineTrace.hpp
+    include/Game/PreAimState.hpp
+    include/Game/TrajectoryRayPlanner.hpp
     include/Game/V3Raycast.hpp
     include/Game/RayDecision.hpp
     include/Game/RayQueryBroker.hpp
@@ -76,6 +79,8 @@ set(GAME_HEADERS
     include/Game/SDK.hpp
     include/Game/Structs.hpp
     include/Game/Target.hpp
+    include/Game/TargetPipeline.hpp
+    include/Game/TargetSolutionTypes.hpp
     include/Game/TriggerBoneSelection.hpp
     include/Game/WeaponCadence.hpp
     include/Game/WeaponSpec.hpp
@@ -358,6 +363,17 @@ if(MSVC)
 endif()
 add_test(NAME V3RaycastSelfTest COMMAND V3RaycastSelfTest)
 
+# V3 Phase 1 target pipeline regression: IntentEngine, Utility scoring,
+# AimFirePhase anchoring, AimPriority x HitAcceptance, and legacy config migration.
+add_executable(V3TargetPipelineSelfTest
+    tools/v3_target_pipeline_selftest.cpp)
+target_include_directories(V3TargetPipelineSelfTest PRIVATE include src vendor/leechcore vendor/imgui vendor/rapidjson)
+target_compile_definitions(V3TargetPipelineSelfTest PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS _SILENCE_CXX17_ITERATOR_BASE_CLASS_DEPRECATION_WARNING)
+if(MSVC)
+    target_compile_options(V3TargetPipelineSelfTest PRIVATE /W3 /wd4244 /wd4267 /wd4305 /wd4200)
+endif()
+add_test(NAME V3TargetPipelineSelfTest COMMAND V3TargetPipelineSelfTest)
+
 # ============================================================================
 # Optional: UniCore trace bench (experimental, not part of the product binary)
 # ============================================================================
@@ -393,6 +409,7 @@ if(UNLEASHED_TRACE_BENCH)
         "${CMAKE_SOURCE_DIR}/vendor/leechcore/leechcore.lib"
         "${UNICORN_DIR}/lib/unicorn.lib"
         psapi.lib)
+    add_test(NAME TraceBenchSelfTest COMMAND TraceBench --selftest)
 
     add_custom_command(TARGET TraceBench POST_BUILD
         COMMAND ${CMAKE_COMMAND} -E copy_if_different

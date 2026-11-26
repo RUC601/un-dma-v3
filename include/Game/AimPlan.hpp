@@ -216,6 +216,27 @@ inline bool EligiblePreGeometry(const Selection& p,const Effective& e,uint64_t h
     }
     return p.mode != 2 || PredicateMatches(p, hero, hp, maxHp, visible);
 }
+// Stage 0 hard filter: never eliminates entities on entity-level Vis (B1/Stage 0 iron rule).
+// Visibility-dependent rules are deferred to Stage 2 where VisibilityPolicy (Lite/Vision/Ray) applies.
+inline bool EligiblePreGeometryStage0(const Selection& p,const Effective& e,uint64_t hero,float hp,float maxHp) {
+    if (!HealthPasses(hp,e.overrideLimits?e.limits.minHealth:p.minHealth,e.overrideLimits?e.limits.maxHealth:p.maxHealth))
+        return false;
+    if (!p.onlyRules.empty()) {
+        const RuleObservation obs{hero, hp, maxHp, true};
+        for (const auto& r : p.onlyRules) {
+            if (IsSpatialRule(r) || r.measure == static_cast<int>(RuleMeasure::Visible))
+                continue;
+            if (!RuleMatches(r, obs))
+                return false;
+        }
+        return true;
+    }
+    if (p.mode != 2)
+        return true;
+    if (p.predicate == static_cast<int>(RuleMeasure::Visible))
+        return true;
+    return PredicateMatches(p, hero, hp, maxHp, true);
+}
 inline bool Eligible(const Selection& p,const Effective& e,const RuleObservation& obs) {
     if (!HealthPasses(obs.hp,e.overrideLimits?e.limits.minHealth:p.minHealth,e.overrideLimits?e.limits.maxHealth:p.maxHealth))
         return false;
