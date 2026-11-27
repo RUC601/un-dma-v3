@@ -374,6 +374,20 @@ if(MSVC)
 endif()
 add_test(NAME V3TargetPipelineSelfTest COMMAND V3TargetPipelineSelfTest)
 
+# V3 UI preferences persistence & theme color sanitization regression:
+# temp-dir Load/Save round-trip, v1/v2/v3 migration, malformed JSON preservation,
+# customThemes deduplication/clamping, concurrent visibility mode reads, and luminance cap.
+add_executable(V3UiPreferencesSelfTest
+    tools/v3_ui_preferences_selftest.cpp
+    src/config/UiPreferences.cpp
+    src/config/FileTransaction.cpp)
+target_include_directories(V3UiPreferencesSelfTest PRIVATE include src vendor/imgui vendor/rapidjson)
+target_compile_definitions(V3UiPreferencesSelfTest PRIVATE NOMINMAX _CRT_SECURE_NO_WARNINGS _SILENCE_CXX17_ITERATOR_BASE_CLASS_DEPRECATION_WARNING)
+if(MSVC)
+    target_compile_options(V3UiPreferencesSelfTest PRIVATE /W3 /wd4244 /wd4267 /wd4305 /wd4200)
+endif()
+add_test(NAME V3UiPreferencesSelfTest COMMAND V3UiPreferencesSelfTest)
+
 # ============================================================================
 # Optional: UniCore trace bench (experimental, not part of the product binary)
 # ============================================================================

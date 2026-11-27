@@ -22,35 +22,33 @@ namespace OW {
 bool RefreshAutoGameMouseSensitivity(bool force) {
     static DWORD lastRefreshTick = 0;
 
-    if (!OW::Config::autoReadGameMouseSensitivity) {
-        OW::Config::detectedGameMouseSensitivity = 0.0f;
-        OW::Config::gameMouseSensitivityAutoDetected = false;
+    const auto prev = OW::Config::ReadOutputConversionSnapshot();
+    if (!prev.autoReadGameMouseSensitivity) {
+        OW::Config::SetAutoDetectedGameMouseSensitivity(0.0f, false);
         return false;
     }
 
     const DWORD now = GetTickCount();
     if (!force && lastRefreshTick != 0 && now - lastRefreshTick < 1000)
-        return OW::Config::gameMouseSensitivityAutoDetected;
+        return prev.gameMouseSensitivityAutoDetected;
     lastRefreshTick = now;
 
     float sensitivity = 0.0f;
     uint64_t sourceObject = 0;
     if (!OW::TryReadGameMouseSensitivity(sensitivity, &sourceObject)) {
-        if (OW::Config::gameMouseSensitivityAutoDetected) {
+        if (prev.gameMouseSensitivityAutoDetected) {
             Diagnostics::Aim("game_sens.auto_read lost previous=%.6f manual=%.6f",
-                OW::Config::detectedGameMouseSensitivity,
-                OW::Config::gameMouseSensitivity);
+                prev.detectedGameSensitivity,
+                prev.manualGameSensitivity);
         }
-        OW::Config::detectedGameMouseSensitivity = 0.0f;
-        OW::Config::gameMouseSensitivityAutoDetected = false;
+        OW::Config::SetAutoDetectedGameMouseSensitivity(0.0f, false);
         return false;
     }
 
     const bool changed =
-        !OW::Config::gameMouseSensitivityAutoDetected ||
-        std::fabs(OW::Config::detectedGameMouseSensitivity - sensitivity) > 0.001f;
-    OW::Config::detectedGameMouseSensitivity = sensitivity;
-    OW::Config::gameMouseSensitivityAutoDetected = true;
+        !prev.gameMouseSensitivityAutoDetected ||
+        std::fabs(prev.detectedGameSensitivity - sensitivity) > 0.001f;
+    OW::Config::SetAutoDetectedGameMouseSensitivity(sensitivity, true);
     if (changed) {
         Diagnostics::Aim("game_sens.auto_read value=%.6f object=0x%llX source=globaladmin_singleton_0x6",
             sensitivity,
@@ -263,10 +261,15 @@ namespace AimbotDetail {
         return true;
     }
 
+    inline bool IsGlobalVisionModeActive() noexcept {
+        return UI::Preferences::ActiveVisibilityMode() ==
+               static_cast<int>(UI::Preferences::VisibilityMode::Vision);
+    }
+
     inline bool AimPresetHasSelectableEntityInDistanceRange(const OW::Config::HeroPreset& preset) {
         const auto frame=OW::consumerFrame?OW::consumerFrame:OW::SnapshotFrame();
         const auto& entities=frame->entities;
-        OW::TargetingDetail::ContourEvaluation contour(*frame,preset.contourEnabled);
+        OW::TargetingDetail::ContourEvaluation contour(*frame, IsGlobalVisionModeActive());
         if (entities.empty())
             return false;
 
@@ -355,7 +358,7 @@ namespace AimbotDetail {
     inline bool AimPresetHasEntityInDistanceRange(const OW::Config::HeroPreset& preset) {
         const auto frame=OW::consumerFrame?OW::consumerFrame:OW::SnapshotFrame();
         const auto& entities=frame->entities;
-        OW::TargetingDetail::ContourEvaluation contour(*frame,preset.contourEnabled);
+        OW::TargetingDetail::ContourEvaluation contour(*frame, IsGlobalVisionModeActive());
         if (entities.empty())
             return false;
 
@@ -1121,13 +1124,8 @@ namespace AimbotDetail {
         "overwatch.trigger.generated_fire";
 
     inline const char* ContourUnsupportedReason() {
-        if(!OW::Config::View_aimbotContourEnabled()) return nullptr;
-        const int behavior = OW::Config::View_aimBehavior();
-        if(behavior!=OW::Config::kAimBehaviorFlick &&
-           behavior!=OW::Config::kAimBehaviorMagneticTrigger)
-            return "flick_or_magnetic_trigger_required";
-        // Leak-shot recognition supplies the target identity and aim direction.
-        // Projectile heroes use the same Flick behavior after acquisition.
+        // Global Vision mode applies uniformly across all Aim behaviors (Tracking, Flick,
+        // Flick2nd, Reacquire, MagneticTrigger) and Trigger.
         return nullptr;
     }
     inline bool ContourModeSupported() { return ContourUnsupportedReason()==nullptr; }
@@ -1160,10 +1158,10 @@ namespace AimbotDetail {
     }
 
     inline bool ContourSubmissionAllowed() {
-        if(!OW::Config::View_aimbotContourEnabled()) return true;
+        if(!IsGlobalVisionModeActive()) return true;
         if(!activeAimShotState) return false;
         const auto candidate=OW::TargetingDetail::SnapshotLastTargetCandidate();
-        // Contour/leak-shot data supplies candidate identity and aim direction. Once
+        // Contour/Vision data supplies candidate identity and aim direction. Once
         // AcquireTarget has published that candidate, firing follows the same
         // state machine as a native-visible target. Contact confirmation is
         // diagnostic evidence, not a second fire policy.
@@ -1177,21 +1175,19 @@ namespace AimbotDetail {
     }
 
     struct ScopedIndependentAimSelection {
-        bool contour=OW::Config::View_aimbotContourEnabled();
+        bool preserve = IsGlobalVisionModeActive();
         OW::TargetCandidate selected{};
         OW::TargetingDetail::TargetLockRuntime lock{};
         int index=-1;
         float health=0;
         ScopedIndependentAimSelection() {
-            if(!contour) return;
+            if(!preserve) return;
             selected=OW::TargetingDetail::SnapshotLastTargetCandidate();
             lock=OW::TargetingDetail::SnapshotTargetLockRuntime();
             index=OW::Config::Targetenemyi;health=OW::Config::health;
-            OW::Config::View_aimbotContourEnabled()=false;
         }
         ~ScopedIndependentAimSelection() {
-            if(!contour) return;
-            OW::Config::View_aimbotContourEnabled()=true;
+            if(!preserve) return;
             if(selected.valid && !OW::TargetingDetail::IsRuntimeTargetValid(selected.entitySnapshot,false)) {
                 selected={};lock={};index=-1;
             }
@@ -2832,14 +2828,18 @@ namespace AimbotDetail {
 
     inline bool CompleteReleasedAimAtCrosshair(RuntimeState& state, bool noTarget,
                                                const OW::TargetCandidate* candidate = nullptr) {
-        if (OW::Config::View_aimbotContourEnabled() &&
-            (noTarget || !candidate || !candidate->valid || !candidate->entitySnapshot.Vis))
-            return false;
         if(!state.releasePending) return false;
         // Finding #3 fix: never release a program-owned auto-charge shot during PreAim,
         // PeekEmerge ReactionDelayGate, or Hybrid ray observation vacuum.
-        if (noTarget || !candidate ||
+        if (noTarget || !candidate || !candidate->valid ||
             !OW::CandidateAutoFireGateAllowed(*candidate, UI::Preferences::ActiveRayBackend())) {
+            return false;
+        }
+        // In global Vision mode, Vis=false targets remain eligible for release when
+        // fresh contour exposure evidence is active (aligned with ContourSubmissionAllowed).
+        if (IsGlobalVisionModeActive() &&
+            !candidate->entitySnapshot.Vis &&
+            (!candidate->contour.evidence.exposed || !candidate->contour.evidence.fresh)) {
             return false;
         }
         const auto* tuning=OW::Config::ActiveSlotBehaviorTuning();
@@ -3871,7 +3871,7 @@ namespace AimbotDetail {
             if (CompleteReleasedAimAtCrosshair(state, false, &candidate)) break;
             const Vector3 vec = candidate.valid ? candidate.aimPoint : Vector3{};
             OW::AimCandidateConfig selectedSettings4(OW::Config::selectedAimHero);
-            const bool contourEnabled = OW::Config::View_aimbotContourEnabled();
+            const bool contourEnabled = IsGlobalVisionModeActive();
             const auto& contourCandidate = candidate;
             const bool contourActive = contourEnabled && contourCandidate.valid &&
                 !contourCandidate.entitySnapshot.Vis;
@@ -4367,7 +4367,7 @@ namespace AimbotDetail {
             if (CompleteReleasedAimAtCrosshair(state, false, &candidate)) break;
             const Vector3 vec = candidate.valid ? candidate.aimPoint : Vector3{};
             OW::AimCandidateConfig selectedSettings6(OW::Config::selectedAimHero);
-            const bool contourEnabled=OW::Config::View_aimbotContourEnabled();
+            const bool contourEnabled=IsGlobalVisionModeActive();
             const auto& contourCandidate = candidate;
             const bool contourActive = contourEnabled && contourCandidate.valid &&
                 !contourCandidate.entitySnapshot.Vis;
@@ -4929,11 +4929,12 @@ namespace AimbotDetail {
         ScopedHeroPresetOverride heroPresetOverride(state);
         activeAimShotState=&state;
         ObserveFireCycle(state);
-        if(state.contourWasEnabled!=OW::Config::View_aimbotContourEnabled()) {
+        const bool visionModeActive = IsGlobalVisionModeActive();
+        if(state.contourWasEnabled!=visionModeActive) {
             state.contourContact.Reset();OW::TargetingDetail::ResetContourSelection();
-            state.contourWasEnabled=OW::Config::View_aimbotContourEnabled();
+            state.contourWasEnabled=visionModeActive;
         }
-        if(OW::Config::View_aimbotContourEnabled() && !ContourModeSupported()) {
+        if(visionModeActive && !ContourModeSupported()) {
             static DWORD lastUnsupportedReport=0;
             const DWORD now=GetTickCount();
             if(IsAimActivationKeyDown() && (!lastUnsupportedReport || now-lastUnsupportedReport>=1000)) {

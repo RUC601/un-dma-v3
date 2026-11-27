@@ -189,11 +189,12 @@ namespace OW {
     // =========================================================================
 
     inline float ResolveCalibrationReferenceGameSensitivity(float referenceOverride = 0.0f) {
-        if (std::isfinite(referenceOverride) && referenceOverride > 0.0f)
-            return referenceOverride;
-        if (std::isfinite(Config::gameMouseSensitivity) && Config::gameMouseSensitivity > 0.0f)
-            return Config::gameMouseSensitivity;
-        return Config::referenceGameSensitivity;
+        const auto snapshot = Config::ReadOutputConversionSnapshot();
+        return ResolveCalibrationReferenceSensitivity(
+            referenceOverride,
+            snapshot.effectiveGameSensitivity,
+            snapshot.manualGameSensitivity,
+            snapshot.referenceGameSensitivity);
     }
 
     struct CalibrationOutputCleanup {
@@ -282,10 +283,7 @@ namespace OW {
         if (measurement)
             *measurement = {yaw, calibrateBothAxes ? pitch : yaw, referenceSensitivity};
         else {
-            Config::calibratedCountsPerRadian = yaw;
-            Config::calibratedPitchCountsPerRadian = calibrateBothAxes && std::fabs(pitch - yaw) / yaw > 0.05f
-                ? pitch : 0.0f;
-            Config::referenceGameSensitivity = referenceSensitivity;
+            Config::CommitCalibratedCountsPerRadian(yaw, pitch, referenceSensitivity, calibrateBothAxes);
         }
         std::printf("[CALIBRATE] Result: yaw=%.1f pitch=%.1f counts/rad refGameSens=%.3f\n",
             yaw, calibrateBothAxes ? pitch : yaw, referenceSensitivity);
@@ -344,10 +342,7 @@ namespace OW {
             return 0.0f;
         }
         // No intermediate sample changed persistent settings; publish the paired mean once.
-        Config::calibratedCountsPerRadian = result.yaw;
-        Config::calibratedPitchCountsPerRadian = std::fabs(result.pitch - result.yaw) / result.yaw > 0.05f
-            ? result.pitch : 0.0f;
-        Config::referenceGameSensitivity = result.referenceSensitivity;
+        Config::CommitCalibratedCountsPerRadian(result.yaw, result.pitch, result.referenceSensitivity, true);
         std::printf("[CALIBRATE] Averaged %d valid paired samples: yaw=%.1f pitch=%.1f counts/rad refGameSens=%.3f\n",
             validSamples, result.yaw, result.pitch, result.referenceSensitivity);
         return result.yaw;
@@ -729,9 +724,11 @@ namespace OW {
         inline thread_local Contour::Observation lastContourObservation;
         inline bool SelectionVisible(const c_entity& entity) {
             // Preserve the native UN visibility result. Contour is only a
-            // fallback for candidates rejected by the native visibility test.
+            // fallback in global Vision mode for candidates rejected by native Vis.
             if (entity.Vis) return true;
-            if(!Config::View_aimbotContourEnabled()) return entity.Vis;
+            if (UI::Preferences::ActiveVisibilityMode() !=
+                static_cast<int>(UI::Preferences::VisibilityMode::Vision))
+                return entity.Vis;
             const auto identity=ContourIdentity(entity);
             for(const auto& entry:contourVisibility) if(entry.first==identity) return entry.second;
             return false;
@@ -2098,7 +2095,10 @@ namespace OW {
         const TargetPipeline::AcquisitionContext* contextOverride = nullptr) {
         TargetSolution best{};
         Config::ScopedConfigRead configRead;
-        TargetingDetail::ContourEvaluation contour(frame,Config::View_aimbotContourEnabled());
+        const int activeVisibilityMode = UI::Preferences::ActiveVisibilityMode();
+        const bool globalVisionMode =
+            activeVisibilityMode == static_cast<int>(UI::Preferences::VisibilityMode::Vision);
+        TargetingDetail::ContourEvaluation contour(frame, globalVisionMode);
         TargetSolution lockedSolution{};
         const float commonFov=TrackingContinuityPolicy::EffectiveFovDeg(AimRankingFovScale(),trackingContinuityGraceMs!=0);
         float commonDistance=Config::View_aimbotMaxDist();
@@ -2161,8 +2161,8 @@ namespace OW {
             ? Config::slotTargetRules.barrierPolicy : Config::aimBarrierPolicy);
         const RoleUtilityMode slotRoleUtilityMode = ClampRoleUtilityMode(Config::slotTargetRules.active
             ? Config::slotTargetRules.roleUtilityMode : Config::aimRoleUtilityMode);
-        const VisibilityPolicy slotVisibilityPolicy = ResolveVisibilityPolicy(
-            activeRayBackend, contour.enabled, slotBarrierPolicy, barrierRayMask);
+        const VisibilityPolicy slotVisibilityPolicy = ResolveVisibilityPolicyFromMode(
+            activeVisibilityMode, slotBarrierPolicy, barrierRayMask);
         const int activeTeamMode = Config::View_aimbotTeam();
         const float activeAllyHealthMaxPercent = Config::slotTargetRules.active
             ? Config::slotTargetRules.allyHealthMaxPercent : 100.0f;
@@ -3955,12 +3955,16 @@ namespace OW {
         const ProjectileRuntimeSpec projectileSpec =
             TargetingDetail::ResolveProjectileRuntimeSpec(weaponSpec, localEntity, secondary);
         const float hitboxScale = secondary ? Config::hitbox2 : Config::View_hitbox();
+        const int activeVisibilityMode = UI::Preferences::ActiveVisibilityMode();
+        const bool globalVisionMode =
+            activeVisibilityMode == static_cast<int>(UI::Preferences::VisibilityMode::Vision);
+        TargetingDetail::ContourEvaluation contour(frame, globalVisionMode);
         const int activeRayBackend = UI::Preferences::ActiveRayBackend();
         const uint64_t barrierRayMask = RayRuntime::BarrierRayMask();
         const BarrierPolicy slotBarrierPolicy = ClampBarrierPolicy(Config::slotTargetRules.active
             ? Config::slotTargetRules.barrierPolicy : Config::aimBarrierPolicy);
-        const VisibilityPolicy slotVisibilityPolicy = ResolveVisibilityPolicy(
-            activeRayBackend, false, slotBarrierPolicy, barrierRayMask);
+        const VisibilityPolicy slotVisibilityPolicy = ResolveVisibilityPolicyFromMode(
+            activeVisibilityMode, slotBarrierPolicy, barrierRayMask);
         const bool hybridLiveWorldGate =
             activeRayBackend == static_cast<int>(RayDecisionPolicy::Hybrid) &&
             RayRuntime::HasAttachedService() &&
@@ -3978,7 +3982,16 @@ namespace OW {
                 if (!TargetingDetail::IsRuntimeTargetValidStage0(entity) ||
                     !TargetingDetail::TargetTeamMatches(entity, Config::View_aimbotTeam(), localEntity))
                     continue;
-                if (ignoreInvisible && !hybridLiveWorldGate && !entity.Vis) {
+                const bool contourFallback = contour.enabled && !entity.Vis;
+                if (contourFallback) {
+                    if (!contour.Visible(entityIndex)) {
+                        const uint64_t occKey = TargetingDetail::StableTargetKey(entity);
+                        std::lock_guard<std::mutex> preAimLock(TargetingDetail::RuntimePreAimMutex());
+                        TargetingDetail::RuntimeReactionDelayGateStorage()
+                            .ObserveOccludedOrPreAim(occKey, entity.actor_generation, now64, false);
+                        continue;
+                    }
+                } else if (ignoreInvisible && !hybridLiveWorldGate && !entity.Vis) {
                     const uint64_t occKey = TargetingDetail::StableTargetKey(entity);
                     std::lock_guard<std::mutex> preAimLock(TargetingDetail::RuntimePreAimMutex());
                     TargetingDetail::RuntimeReactionDelayGateStorage()
@@ -4016,6 +4029,15 @@ namespace OW {
 
                     int boneId = Plexies20260609::kUnusedRenderSkeletonBone;
                     Vector3 rawAimPoint{};
+                    Contour::Observation slotContour{};
+                    if (contourFallback) {
+                        const std::uint16_t slotBit = renderSlot < 16
+                            ? static_cast<std::uint16_t>(1u << renderSlot)
+                            : 0u;
+                        slotContour = contour.Resolve(entityIndex, slotBit);
+                        if (!slotContour.evidence.exposed || !slotContour.evidence.fresh)
+                            continue;
+                    }
                     if (!TargetingDetail::TryResolveSkeletonBonePoint(
                             entity,
                             renderSlot,
@@ -4129,7 +4151,7 @@ namespace OW {
                             triggerHitKind = barrierEval.hitKind;
                         }
                     }
-                    if (!RayDecisionAllowsAutoFire(candidateRay, false, activeRayBackend)) {
+                    if (!RayDecisionAllowsAutoFire(candidateRay, contourFallback, activeRayBackend)) {
                         ++rayRejectedCandidates;
                         if (candidateRay.world == RayDecisionStatus::Occluded ||
                             (hybridLiveWorldGate && !entity.Vis && !candidateRay.BarrierOccluded())) {
@@ -4148,9 +4170,11 @@ namespace OW {
                             candidateRay.ageMs, candidateRay.latencyUs);
                         continue;
                     }
-                    const bool stage2Vis = hybridLiveWorldGate
-                        ? candidateRay.WorldClear()
-                        : TargetingDetail::SelectionVisible(entity);
+                    const bool stage2Vis = contourFallback
+                        ? (slotContour.evidence.exposed && slotContour.evidence.fresh)
+                        : (hybridLiveWorldGate
+                            ? candidateRay.WorldClear()
+                            : TargetingDetail::SelectionVisible(entity));
                     if (!candidateConfig.Passes(entity, distance, angularScoreDeg, stage2Vis))
                         continue;
 
@@ -4202,6 +4226,7 @@ namespace OW {
                     entityBest.visibilityPolicy = slotVisibilityPolicy;
                     entityBest.barrierPolicy = slotBarrierPolicy;
                     entityBest.hitKind = triggerHitKind;
+                    entityBest.contour = slotContour;
                 }
 
                 const uint64_t trigStableKey = TargetingDetail::StableTargetKey(entity);
@@ -4236,6 +4261,11 @@ namespace OW {
             Config::aimbotEffectiveHitWindow = best.valid ? best.effectiveHitWindow : 0.0f;
 
         TargetingDetail::StoreLastTargetCandidate(best);
+        if (contour.enabled && best.valid && best.contour.evidence.fresh && best.contour.evidence.exposed &&
+            (best.contour.evidence.identity != TargetingDetail::lastContourObservation.evidence.identity ||
+             best.contour.evidence.sequence > TargetingDetail::lastContourObservation.evidence.sequence)) {
+            TargetingDetail::lastContourObservation = best.contour;
+        }
         const bool hasTriggerWorldVerdict = best.ray.world == RayDecisionStatus::Clear ||
                                             best.ray.world == RayDecisionStatus::Occluded;
         const bool triggerVisRayDiverge = best.valid && hasTriggerWorldVerdict &&

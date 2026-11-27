@@ -4,6 +4,7 @@
 #include "Renderer/FrameSchedule.hpp"
 #include "Features/UI.hpp"
 #include "ui/vision/ContourPanel.hpp"
+#include "ui/Theme.hpp"
 #include "config/UiPreferences.hpp"
 #include "Game/HeroSettings.hpp"
 #include <fstream>
@@ -18,11 +19,13 @@
 
 #include <algorithm>
 #include <dcomp.h>
+#include <dwmapi.h>
 #include <dxgi1_5.h>
 #include <windowsx.h>
 
 #pragma comment(lib, "d3d11.lib")
 #pragma comment(lib, "dcomp.lib")
+#pragma comment(lib, "dwmapi.lib")
 #pragma comment(lib, "dxgi.lib")
 
 #ifndef WS_EX_NOREDIRECTIONBITMAP
@@ -46,6 +49,61 @@ constexpr ULONGLONG kCanvasBoundsRefreshMs = 2000;
 constexpr ULONGLONG kMenuRenderIntervalMs = 16;
 
 ImGuiContext* g_menuContext = nullptr;
+bool g_menuUsingDwmRoundedCorners = false;
+ImU32 g_lastMenuDwmBorderColor = 0;
+
+COLORREF ImU32ToColorRef(ImU32 col) noexcept {
+    const unsigned r = (col >> IM_COL32_R_SHIFT) & 0xFFu;
+    const unsigned g = (col >> IM_COL32_G_SHIFT) & 0xFFu;
+    const unsigned b = (col >> IM_COL32_B_SHIFT) & 0xFFu;
+    return RGB(r, g, b);
+}
+
+void ApplyMenuFallbackRoundRegion(HWND hWnd) {
+    if (!hWnd || g_menuUsingDwmRoundedCorners)
+        return;
+    if (IsZoomed(hWnd)) {
+        SetWindowRgn(hWnd, nullptr, TRUE);
+        return;
+    }
+    RECT rc{};
+    if (!GetWindowRect(hWnd, &rc))
+        return;
+    const int w = rc.right - rc.left;
+    const int h = rc.bottom - rc.top;
+    if (w <= 0 || h <= 0)
+        return;
+    const float dpi = GetDpiForWindow(hWnd) / 96.0f;
+    const int radius = (std::max)(8, static_cast<int>(std::lround(12.0f * dpi)));
+    HRGN rgn = CreateRoundRectRgn(0, 0, w + 1, h + 1, radius * 2, radius * 2);
+    if (rgn && !SetWindowRgn(hWnd, rgn, TRUE))
+        DeleteObject(rgn);
+}
+
+void SyncMenuWindowBorderColor(HWND hWnd, ImU32 strokeColor) {
+    if (!hWnd || !g_menuUsingDwmRoundedCorners || strokeColor == g_lastMenuDwmBorderColor)
+        return;
+    constexpr DWORD kDwmwaBorderColor = 34;
+    const COLORREF border = ImU32ToColorRef(strokeColor);
+    if (SUCCEEDED(DwmSetWindowAttribute(hWnd, kDwmwaBorderColor, &border, sizeof(border))))
+        g_lastMenuDwmBorderColor = strokeColor;
+}
+
+void ApplyMenuWindowCorners(HWND hWnd) {
+    if (!hWnd)
+        return;
+    constexpr DWORD kDwmwaWindowCornerPreference = 33;
+    constexpr DWORD kDwmwcpRound = 2;
+    const DWORD pref = kDwmwcpRound;
+    const HRESULT hr = DwmSetWindowAttribute(hWnd, kDwmwaWindowCornerPreference, &pref, sizeof(pref));
+    g_menuUsingDwmRoundedCorners = SUCCEEDED(hr);
+    g_lastMenuDwmBorderColor = 0;
+    if (g_menuUsingDwmRoundedCorners) {
+        SyncMenuWindowBorderColor(hWnd, UI::Theme::kColStroke);
+    } else {
+        ApplyMenuFallbackRoundRegion(hWnd);
+    }
+}
 
 struct FrameWaitTimer {
     HANDLE handle = CreateWaitableTimerExW(nullptr, nullptr,
@@ -461,6 +519,7 @@ LRESULT WINAPI MenuWndProc(HWND hWnd, UINT msg, WPARAM wParam, LPARAM lParam) {
             }
             break;
         case WM_SIZE:
+            ApplyMenuFallbackRoundRegion(hWnd);
             if ((wParam == SIZE_RESTORED || wParam == SIZE_MAXIMIZED) &&
                 IsWindowVisibleAndRestored(hWnd))
                 g_Overlay.RestoreFromTaskbar();
@@ -749,6 +808,8 @@ bool Overlay::CreateWindows(const wchar_t* overlayTitle, HINSTANCE instance) {
     );
     if (!m_menuHWnd)
         return false;
+
+    ApplyMenuWindowCorners(m_menuHWnd);
 
     RECT clientRect = {};
     if (GetClientRect(m_menuHWnd, &clientRect)) {
@@ -1584,6 +1645,7 @@ void Overlay::RenderMenu() {
     ImGui::NewFrame();
 
     UI::Render();
+    SyncMenuWindowBorderColor(m_menuHWnd, UI::Theme::kColStroke);
 
     ImGui::Render();
     // 本帧 UI 按钮可能刚收起整层。

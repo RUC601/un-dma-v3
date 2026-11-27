@@ -947,7 +947,48 @@ int main(int argc, char** argv) {
             const bool ok = UI::Preferences::MigrateRayBackend(c.version, c.saved, out);
             if (ok != c.accepted || (ok && out != c.expected)) return Fail("rayBackend preference migration");
         }
-        if (UI::Preferences::kCurrentVersion <= UI::Preferences::kLegacyVersion) return Fail("preference version not bumped");
+        if (UI::Preferences::kCurrentVersion < 3) return Fail("preference version not bumped to v3");
+
+        // v3 visibilityMode migration: 0=Lite, 1=Vision, 2=Ray; legacy v1/v2 rayBackend maps 0->Lite, 1->Ray.
+        struct VisCase {
+            int version;
+            bool hasVis;
+            unsigned savedVis;
+            bool hasRay;
+            unsigned savedRay;
+            bool accepted;
+            int expected;
+        };
+        const VisCase visCases[] = {
+            {1, false, 0, true, 0, true, 0},  // v1 Native -> Lite
+            {1, false, 0, true, 1, true, 0},  // v1 Embree -> Lite
+            {1, false, 0, true, 2, true, 2},  // v1 UniCore -> Ray
+            {1, false, 0, true, 3, false, -1},
+            {2, false, 0, true, 0, true, 0},  // v2 Native-only -> Lite
+            {2, false, 0, true, 1, true, 2},  // v2 Hybrid -> Ray
+            {3, true, 0, true, 1, true, 0},   // v3 explicit Lite wins over stale rayBackend
+            {3, true, 1, true, 0, true, 1},   // v3 explicit Vision
+            {3, true, 2, true, 1, true, 2},   // v3 explicit Ray
+            {3, true, 3, true, 0, false, -1}, // v3 out of range
+            {3, false, 0, false, 0, true, 0}, // defaults to Lite
+        };
+        for (const auto& vc : visCases) {
+            int outMode = -1;
+            const bool ok = UI::Preferences::MigrateVisibilityMode(
+                vc.version, vc.hasVis, vc.savedVis, vc.hasRay, vc.savedRay, outMode);
+            if (ok != vc.accepted || (ok && outMode != vc.expected))
+                return Fail("v3 visibilityMode preference migration");
+        }
+
+        // ResolveVisibilityPolicyFromMode strict mutual exclusion.
+        constexpr uint64_t kMask = 0x0690000000000055ull;
+        if (OW::ResolveVisibilityPolicyFromMode(0, OW::BarrierPolicy::WaitBarrierDrop, kMask) != OW::VisibilityPolicy::Lite ||
+            OW::ResolveVisibilityPolicyFromMode(1, OW::BarrierPolicy::WaitBarrierDrop, kMask) != OW::VisibilityPolicy::Vision ||
+            OW::ResolveVisibilityPolicyFromMode(2, OW::BarrierPolicy::IgnoreBarrier, kMask) != OW::VisibilityPolicy::RayWorld ||
+            OW::ResolveVisibilityPolicyFromMode(2, OW::BarrierPolicy::WaitBarrierDrop, 0) != OW::VisibilityPolicy::RayWorld ||
+            OW::ResolveVisibilityPolicyFromMode(2, OW::BarrierPolicy::WaitBarrierDrop, kMask) != OW::VisibilityPolicy::RayWorldAndBarrier) {
+            return Fail("ResolveVisibilityPolicyFromMode mutual exclusion mismatch");
+        }
     }
 
     // Phase 3: Three-region profile contract (CN 155284N / World 155284 / Nexon 155284KB),

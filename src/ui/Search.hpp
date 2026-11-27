@@ -3,6 +3,7 @@
 #include <imgui_internal.h>
 #include <string>
 #include "ui/Text.hpp"
+#include "ui/Theme.hpp"
 namespace UI::Search {
 struct Entry {const char* label;int page;};
 inline constexpr Entry entries[]{
@@ -132,6 +133,6 @@ inline bool Pending(){return !requested.empty()&&targetPage==currentPage;}
 inline void Anchor(const char* label){
  const bool match=Pending()&&(requested==label||std::string(Text::Label(requested.c_str(),true))==label);
  if(match){ImGui::SetScrollFromPosY(ImGui::GetCursorPosY(),.25f);highlighted=label;highlightUntil=ImGui::GetTime()+2;requested.clear();}
- if(ImGui::GetTime()<highlightUntil&&highlighted==label){const auto p=ImGui::GetCursorScreenPos();ImGui::GetWindowDrawList()->AddRectFilled(p,ImVec2(p.x+ImGui::GetContentRegionAvail().x,p.y+ImGui::GetFrameHeight()),IM_COL32(228,17,67,30),4);}
+ if(ImGui::GetTime()<highlightUntil&&highlighted==label){const auto p=ImGui::GetCursorScreenPos();ImGui::GetWindowDrawList()->AddRectFilled(p,ImVec2(p.x+ImGui::GetContentRegionAvail().x,p.y+ImGui::GetFrameHeight()),Theme::kColAccentGlow,4);}
 }
 }

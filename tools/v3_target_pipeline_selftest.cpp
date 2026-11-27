@@ -22,8 +22,14 @@
 Memory::~Memory() {}
 
 namespace UI::Preferences {
-int g_testRayBackend = 0; // 0 = NativeOnly, 1 = Hybrid
-int ActiveRayBackend() noexcept { return g_testRayBackend; }
+int g_testVisibilityMode = 0; // 0 = Lite, 1 = Vision, 2 = Ray
+int g_testRayBackend = 0;     // Legacy direct override used by existing Phase 1-3 cases
+int ActiveVisibilityMode() noexcept {
+    return g_testRayBackend == 1 ? 2 : g_testVisibilityMode;
+}
+int ActiveRayBackend() noexcept {
+    return ActiveVisibilityMode() == 2 ? 1 : 0;
+}
 }
 
 namespace OW {
@@ -1708,6 +1714,44 @@ bool TestPhase3VisibilityBarrierAndRolePlugins()
             OW::TargetPipeline::ResolveCandidateRayMaxAgeMs(0.0f) != 100u) {
             return false;
         }
+    }
+
+    // 6. Explicit 3-mode VisibilityPolicy strict mutual exclusion & Trigger Vision parity:
+    //    Lite (0) -> Lite; Vision (1) -> Vision (rayBackend stays 0); Ray (2) -> RayWorld / RayWorldAndBarrier.
+    {
+        constexpr uint64_t kMask = 0x0690000000000055ull;
+        if (OW::ResolveVisibilityPolicyFromMode(0, OW::BarrierPolicy::WaitBarrierDrop, kMask) != OW::VisibilityPolicy::Lite)
+            return false;
+        if (OW::ResolveVisibilityPolicyFromMode(1, OW::BarrierPolicy::WaitBarrierDrop, kMask) != OW::VisibilityPolicy::Vision)
+            return false;
+        if (OW::ResolveVisibilityPolicyFromMode(2, OW::BarrierPolicy::IgnoreBarrier, kMask) != OW::VisibilityPolicy::RayWorld)
+            return false;
+        if (OW::ResolveVisibilityPolicyFromMode(2, OW::BarrierPolicy::WaitBarrierDrop, 0) != OW::VisibilityPolicy::RayWorld)
+            return false;
+        if (OW::ResolveVisibilityPolicyFromMode(2, OW::BarrierPolicy::WaitBarrierDrop, kMask) != OW::VisibilityPolicy::RayWorldAndBarrier)
+            return false;
+
+        // Verify global Vision mode projects ActiveRayBackend() == 0 so Ray gates never collide with Vision,
+        // and a Vis=false candidate with fresh exposed contour passes CandidateAutoFireGateAllowed (release-at-crosshair).
+        UI::Preferences::g_testRayBackend = 0;
+        UI::Preferences::g_testVisibilityMode = 1;
+        if (UI::Preferences::ActiveVisibilityMode() != 1 || UI::Preferences::ActiveRayBackend() != 0)
+            return false;
+        {
+            OW::TargetCandidate visionCand{};
+            visionCand.valid = true;
+            visionCand.tier = OW::VisibilityTier::Engageable;
+            visionCand.entitySnapshot.Vis = false;
+            visionCand.contour.evidence.exposed = true;
+            visionCand.contour.evidence.fresh = true;
+            visionCand.ray.world = OW::RayDecisionStatus::Unknown;
+            if (!OW::CandidateAutoFireGateAllowed(visionCand, UI::Preferences::ActiveRayBackend()))
+                return false;
+        }
+        UI::Preferences::g_testVisibilityMode = 2;
+        if (UI::Preferences::ActiveVisibilityMode() != 2 || UI::Preferences::ActiveRayBackend() != 1)
+            return false;
+        UI::Preferences::g_testVisibilityMode = 0;
     }
 
     return true;

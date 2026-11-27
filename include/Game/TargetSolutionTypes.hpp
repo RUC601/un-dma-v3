@@ -104,20 +104,34 @@ inline constexpr RoleUtilityMode ClampRoleUtilityMode(int value) noexcept
     return static_cast<RoleUtilityMode>(std::clamp(value, 0, kRoleUtilityModeCount - 1));
 }
 
-// Consolidates runtime ray policy, contour vision fallback, per-slot BarrierPolicy, and
-// profile barrier-mask availability into the single authoritative VisibilityPolicy (§2, §6.3).
-// rayDecisionPolicy: 0=NativeOnly, 1=Hybrid.
+// Consolidates the explicit 3-state global visibility mode (0=Lite, 1=Vision, 2=Ray),
+// per-slot BarrierPolicy, and profile barrier-mask availability into the single
+// authoritative VisibilityPolicy (§2, §6.3). The three modes are strictly mutually exclusive:
+//   0 (Lite):   Entity Vis + local native Hitbox only (no contour, no ray)
+//   1 (Vision): Entity Vis + global Contour exposure fallback (Aim + Trigger, no ray)
+//   2 (Ray):    UniCore 6-engine async ray (+ Slot 3 barrier when WaitBarrierDrop & mask != 0)
+inline constexpr VisibilityPolicy ResolveVisibilityPolicyFromMode(int visibilityMode,
+                                                                  BarrierPolicy barrierPolicy,
+                                                                  uint64_t barrierMask) noexcept
+{
+    if (visibilityMode == 2) {
+        if (barrierPolicy == BarrierPolicy::WaitBarrierDrop && barrierMask != 0)
+            return VisibilityPolicy::RayWorldAndBarrier;
+        return VisibilityPolicy::RayWorld;
+    }
+    if (visibilityMode == 1)
+        return VisibilityPolicy::Vision;
+    return VisibilityPolicy::Lite;
+}
+
+// Legacy 2-state rayDecisionPolicy (0=NativeOnly, 1=Hybrid) + contourEnabled projection.
 inline constexpr VisibilityPolicy ResolveVisibilityPolicy(int rayDecisionPolicy,
                                                           bool contourEnabled,
                                                           BarrierPolicy barrierPolicy,
                                                           uint64_t barrierMask) noexcept
 {
-    if (rayDecisionPolicy == 1) {
-        if (barrierPolicy == BarrierPolicy::WaitBarrierDrop && barrierMask != 0)
-            return VisibilityPolicy::RayWorldAndBarrier;
-        return VisibilityPolicy::RayWorld;
-    }
-    return contourEnabled ? VisibilityPolicy::Vision : VisibilityPolicy::Lite;
+    const int mode = (rayDecisionPolicy == 1) ? 2 : (contourEnabled ? 1 : 0);
+    return ResolveVisibilityPolicyFromMode(mode, barrierPolicy, barrierMask);
 }
 
 inline constexpr const char* AimPriorityName(AimPriority priority) noexcept

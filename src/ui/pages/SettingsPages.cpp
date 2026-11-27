@@ -110,40 +110,41 @@ void UI::MiscPage() {
 // =====================================================================
 void DrawMiscGeneralPage() {
     const bool zh = OW::Config::uiLanguage == 1;
-    UIGroupBox(zh ? "射线查询" : "Ray queries");
-    SettingRow(zh ? "碰撞检测" : "Collision backend");
+    UIGroupBox(zh ? "可见性与射线" : "Visibility and rays");
+    SettingRow(zh ? "全局可见性模式" : "Visibility mode");
     PushControlWidth();
-    const char* backends[] = {"Native-only", "Hybrid"};
-    if (UISelect("##rayBackend", &UI::Preferences::values.rayBackend, backends, 2, false)) {
-        UI::Preferences::SetActiveRayBackend(UI::Preferences::values.rayBackend);
+    const char* visModesZh[] = { "实体 (Lite)", "轮廓 (Vision)", "射线 (Ray)" };
+    const char* visModesEn[] = { "Entity (Lite)", "Contour (Vision)", "Ray (UniCore)" };
+    int visMode = UI::Preferences::ActiveVisibilityMode();
+    if (UISelect("##visibilityMode", &visMode, zh ? visModesZh : visModesEn, 3, false)) {
+        UI::Preferences::SetActiveVisibilityMode(visMode);
         SetPersistenceStatus(UI::Preferences::Save(), T(UiText::SavedAllChanges));
     }
     ImGui::PopItemWidth();
-    // Hybrid requires BOTH an attached UniCore service and an established ray scene.
-    // Without them RayDecisionAllowsSelection() rejects every non-contour target, which the
-    // user only experiences as "random missed selections"; the only signal used to be a
-    // Diagnostics::Warn every 5s. Surface the exact cause where the choice is made.
+    // Ray mode requires BOTH an attached UniCore service and an established ray scene.
+    // Surface the exact cause right where the mode is configured.
     {
+        const int activeVisMode = UI::Preferences::ActiveVisibilityMode();
+        const int activeRayBackend = UI::Preferences::ActiveRayBackend();
         const bool serviceBound = OW::RayRuntime::HasAttachedService();
         const uint64_t sceneEpoch = OW::RayRuntime::SceneEpoch();
-        if (OW::RayPolicyNeedsServiceNotice(UI::Preferences::values.rayBackend, serviceBound, sceneEpoch)) {
+        if (OW::RayPolicyNeedsServiceNotice(activeRayBackend, serviceBound, sceneEpoch)) {
             ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.72f, 0.30f, 1.0f));
             ImGui::TextWrapped("%s", !serviceBound
-                ? (zh ? "Hybrid 已选，但没有活动的 UniCore 射线服务：世界遮挡不可用，非轮廓目标会被严格拒绝，表现为漏选。"
-                      : "Hybrid is selected but no UniCore ray service is attached: world occlusion is unavailable and non-contour targets are rejected, so selections are missed.")
-                : (zh ? "Hybrid 已选，射线场景尚未建立（未进入对局或正在切换地图）：世界遮挡不可用，非轮廓目标会被严格拒绝。"
-                      : "Hybrid is selected but the ray scene is not established yet (not in a match, or switching maps): world occlusion is unavailable and non-contour targets are rejected."));
+                ? (zh ? "已选射线模式，但没有活动的 UniCore 射线服务：世界遮挡不可用，目标会被严格拒绝，表现为漏选。"
+                      : "Ray mode is selected but no UniCore ray service is attached: world occlusion is unavailable and targets are rejected.")
+                : (zh ? "已选射线模式，射线场景尚未建立（未进入对局或正在切换地图）：世界遮挡暂不可用。"
+                      : "Ray mode is selected but the ray scene is not established yet (not in a match, or switching maps): world occlusion is temporarily unavailable."));
             ImGui::PopStyleColor();
         }
         const uint64_t worldMask = OW::RayRuntime::WorldRayMask();
         const uint64_t barrierMask = OW::RayRuntime::BarrierRayMask();
-        const OW::VisibilityPolicy effectivePolicy = OW::ResolveVisibilityPolicy(
-            UI::Preferences::values.rayBackend,
-            OW::Config::View_aimbotContourEnabled(),
+        const OW::VisibilityPolicy effectivePolicy = OW::ResolveVisibilityPolicyFromMode(
+            activeVisMode,
             OW::ClampBarrierPolicy(OW::Config::aimBarrierPolicy),
             barrierMask);
-        ImGui::TextDisabled(zh ? "全局默认可见性策略: %s（各英雄槽位可单独覆盖屏障策略）| 世界掩码: 0x%llX | 屏障掩码: %s"
-                               : "Default visibility policy (global; slots may override barrier): %s | World mask: 0x%llX | Barrier mask: %s",
+        ImGui::TextDisabled(zh ? "当前有效策略: %s（也可在左下角名片快速切换）| 世界掩码: 0x%llX | 屏障掩码: %s"
+                               : "Effective policy: %s (also switchable in the bottom-left account menu) | World mask: 0x%llX | Barrier mask: %s",
                             OW::VisibilityPolicyName(effectivePolicy),
                             static_cast<unsigned long long>(worldMask),
                             barrierMask != 0
@@ -260,22 +261,87 @@ void DrawMiscGeneralPage() {
         }
         ImGui::PopItemWidth();
 
-        auto& preferences=UI::Preferences::values;
-        bool preferenceChanged=false;
-        static const char* skins[]={"UN Crimson","Graphite","ED Violet"};
-        SettingRow(OW::Config::uiLanguage==1?"界面风格":"Menu style");PushControlWidth();
-        if(UISelect("##menuSkin",&preferences.skin,skins,3)) {preferences.customAccent=false;preferenceChanged=true;}
+        auto& preferences = UI::Preferences::values;
+        bool preferenceChanged = false;
+        std::vector<const UI::Preferences::ThemePreset*> allThemes;
+        std::vector<const char*> themeNames;
+        int activeThemeIndex = -1;
+        for (const auto& p : UI::Preferences::BuiltinThemePresets()) {
+            if (p.id == preferences.activeThemeId) activeThemeIndex = static_cast<int>(allThemes.size());
+            allThemes.push_back(&p);
+            themeNames.push_back(p.name.c_str());
+        }
+        for (const auto& p : preferences.customThemes) {
+            if (p.id == preferences.activeThemeId) activeThemeIndex = static_cast<int>(allThemes.size());
+            allThemes.push_back(&p);
+            themeNames.push_back(p.name.c_str());
+        }
+        const char* customLabel = zh ? "自定义" : "Custom";
+        if (activeThemeIndex < 0) {
+            activeThemeIndex = static_cast<int>(themeNames.size());
+            themeNames.push_back(customLabel);
+        }
+        SettingRow(zh ? "界面预设" : "Theme preset");
+        PushControlWidth();
+        if (UISelect("##menuSkin", &activeThemeIndex, themeNames.data(), static_cast<int>(themeNames.size()), false)) {
+            if (activeThemeIndex >= 0 && activeThemeIndex < static_cast<int>(allThemes.size())) {
+                UI::Preferences::ApplyThemePreset(allThemes[static_cast<size_t>(activeThemeIndex)]->id);
+                preferenceChanged = true;
+            }
+        }
         ImGui::PopItemWidth();
-        if(!preferences.customAccent)preferences.accent=ImGui::ColorConvertU32ToFloat4(UI::Theme::kColAccent);
-        if(UIColorEdit(OW::Config::uiLanguage==1?"强调色":"Accent color",&preferences.accent)) {preferences.customAccent=true;preferenceChanged=true;}
-        SettingRow(OW::Config::uiLanguage==1?"减少动画":"Reduce motion");
-        preferenceChanged|=UICheckbox("##reduceMotion",&preferences.reducedMotion);
-        SettingRow(OW::Config::uiLanguage==1?"登录毛玻璃":"Login glass");
-        preferenceChanged|=UICheckbox("##loginGlass",&preferences.loginGlass);
-        SettingRow(OW::Config::uiLanguage==1?"控制台分层":"Console layers");
-        preferenceChanged|=UICheckbox("##consoleLayers",&preferences.consoleLayers);
-        if(preferenceChanged)UI::Preferences::Save();
-        if(!UI::Preferences::Error().empty()) ImGui::TextWrapped("%s",UI::Preferences::Error().c_str());
+
+        if (UIColorEdit(zh ? "菜单暗底色" : "Base dark color", &preferences.baseDark)) {
+            preferences.baseDark.w = 1.0f;
+            preferences.activeThemeId.clear();
+            preferences.customAccent = true;
+            preferenceChanged = true;
+        }
+        if (UIColorEdit(zh ? "强调色" : "Accent color", &preferences.accent)) {
+            preferences.accent.w = 1.0f;
+            preferences.activeThemeId.clear();
+            preferences.customAccent = true;
+            preferenceChanged = true;
+        }
+        {
+            static char newThemeBuf[48] = "";
+            const bool full = preferences.customThemes.size() >= UI::Preferences::kMaxCustomThemePresets;
+            const char* saveBtnText = zh ? "存为预设" : "Save preset";
+            const float btnW = (std::max)(82.0f, ImGui::CalcTextSize(saveBtnText).x + 20.0f);
+            SettingRow(zh ? "新建外观预设" : "New theme preset");
+            ImGui::BeginDisabled(full);
+            const float inputW = MaxFloat(90.0f, ImGui::GetContentRegionAvail().x - btnW - ImGui::GetStyle().ItemSpacing.x - kControlRightPadding);
+            ImGui::PushItemWidth(inputW);
+            const bool enterSave = ImGui::InputText("##newThemePresetName", newThemeBuf, sizeof(newThemeBuf), ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::PopItemWidth();
+            ImGui::SameLine();
+            if ((enterSave || ImGui::Button(saveBtnText, ImVec2(btnW, ControlHeight()))) && !full) {
+                if (!UI::Preferences::AddCustomThemePreset(newThemeBuf, preferences.baseDark, preferences.accent).empty()) {
+                    newThemeBuf[0] = '\0';
+                    preferenceChanged = true;
+                }
+            }
+            ImGui::EndDisabled();
+            const auto* activeCustom = UI::Preferences::FindThemePreset(preferences.activeThemeId);
+            if (activeCustom && !activeCustom->builtin) {
+                SettingRow(zh ? "删除当前预设" : "Delete active preset");
+                if (ImGui::Button(zh ? "删除此自定义预设" : "Delete custom preset", ImVec2(0, ControlHeight()))) {
+                    UI::Preferences::DeleteCustomThemePreset(activeCustom->id);
+                    preferenceChanged = true;
+                }
+            }
+        }
+        SettingRow(zh ? "减少动画" : "Reduce motion");
+        preferenceChanged |= UICheckbox("##reduceMotion", &preferences.reducedMotion);
+        SettingRow(zh ? "登录毛玻璃" : "Login glass");
+        preferenceChanged |= UICheckbox("##loginGlass", &preferences.loginGlass);
+        SettingRow(zh ? "控制台分层" : "Console layers");
+        preferenceChanged |= UICheckbox("##consoleLayers", &preferences.consoleLayers);
+        if (preferenceChanged) {
+            UI::Theme::Apply();
+            UI::Preferences::Save();
+        }
+        if (!UI::Preferences::Error().empty()) ImGui::TextWrapped("%s", UI::Preferences::Error().c_str());
 
     }
     CloseGroupBox();

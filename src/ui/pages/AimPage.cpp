@@ -142,36 +142,42 @@ void UI::AimbotPage() {
         }
         ImGui::PopItemWidth();
 
-        const bool leakShotSupported = activePreset.aimBehavior == OW::Config::kAimBehaviorFlick ||
-            activePreset.aimBehavior == OW::Config::kAimBehaviorMagneticTrigger;
-        SettingRow(L("Leak shot"));
-        ImGui::BeginDisabled(!leakShotSupported && !activePreset.contourEnabled);
-        presetChanged |= UICheckbox("##aimContour", &activePreset.contourEnabled);
-        ImGui::EndDisabled();
-        if (ImGui::IsItemHovered(ImGuiHoveredFlags_AllowWhenDisabled))
-            ImGui::SetTooltip("%s", OW::Config::uiLanguage == 1
-                ? (leakShotSupported ? "对原生不可见的目标，用新鲜采集画面确认露出部位。" : "漏打适用于 Flick 和磁性扳机。")
-                : (leakShotSupported ? "Uses fresh capture frames to confirm exposed parts of hidden targets." : "Available with Flick and Magnetic Trigger."));
-        if (activePreset.contourEnabled) {
-            V2::Vision::Settings captureSettings;
-            const auto captureFrame = V2::Vision::GetService().Snapshot(captureSettings);
-            const auto captureStatus = V2::Vision::GetService().Status();
+        {
             const bool zh = OW::Config::uiLanguage == 1;
-            const char* captureMessage = nullptr;
-            if (!captureSettings.enabled || captureStatus.state == V2::Vision::ServiceState::Stopped)
-                captureMessage = zh ? "漏打采集已停止" : "Leak shot capture stopped";
-            else if (captureStatus.state == V2::Vision::ServiceState::Faulted)
-                captureMessage = zh ? "漏打采集失败" : "Leak shot capture failed";
-            else if (captureStatus.state == V2::Vision::ServiceState::Starting)
-                captureMessage = zh ? "漏打采集连接中" : "Leak shot capture starting";
-            else if (!captureFrame)
-                captureMessage = zh ? "漏打等待新画面" : "Leak shot waiting for a fresh frame";
-            if (captureMessage) {
-                SettingRow(zh ? "采集状态" : "Capture status");
-                ImGui::AlignTextToFramePadding();
-                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.64f, 0.25f, 1.0f));
-                ImGui::TextWrapped("%s", captureMessage);
-                ImGui::PopStyleColor();
+            const int visMode = UI::Preferences::ActiveVisibilityMode();
+            const char* modeDesc =
+                visMode == static_cast<int>(UI::Preferences::VisibilityMode::Ray)
+                    ? (zh ? "射线 (Ray) · UniCore 6 引擎" : "Ray (UniCore 6-engine)")
+                : visMode == static_cast<int>(UI::Preferences::VisibilityMode::Vision)
+                    ? (zh ? "轮廓 (Vision) · 全局作用于 Aim & Trigger" : "Vision (Contour) · global for Aim & Trigger")
+                    : (zh ? "实体 (Lite) · 仅实体级可见性" : "Lite · entity Vis only");
+            SettingRow(zh ? "可见性来源" : "Visibility source");
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("%s", modeDesc);
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", zh ? "可在左下角名片菜单或设置中统一切换（实体 / 轮廓 / 射线）。"
+                                           : "Switch globally (Lite / Vision / Ray) from the bottom-left account menu or Settings.");
+
+            if (visMode == static_cast<int>(UI::Preferences::VisibilityMode::Vision)) {
+                V2::Vision::Settings captureSettings;
+                const auto captureFrame = V2::Vision::GetService().Snapshot(captureSettings);
+                const auto captureStatus = V2::Vision::GetService().Status();
+                const char* captureMessage = nullptr;
+                if (!captureSettings.enabled || captureStatus.state == V2::Vision::ServiceState::Stopped)
+                    captureMessage = zh ? "轮廓采集已停止：请从左下角名片或采集页启动。" : "Contour capture stopped: start it from the account menu or Capture page.";
+                else if (captureStatus.state == V2::Vision::ServiceState::Faulted)
+                    captureMessage = zh ? "轮廓采集失败：请检查采集卡设备。" : "Contour capture failed: check the capture device.";
+                else if (captureStatus.state == V2::Vision::ServiceState::Starting)
+                    captureMessage = zh ? "轮廓采集连接中…" : "Contour capture starting...";
+                else if (!captureFrame)
+                    captureMessage = zh ? "轮廓采集等待新鲜画面…" : "Contour capture waiting for a fresh frame...";
+                if (captureMessage) {
+                    SettingRow(zh ? "采集状态" : "Capture status");
+                    ImGui::AlignTextToFramePadding();
+                    ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.64f, 0.25f, 1.0f));
+                    ImGui::TextWrapped("%s", captureMessage);
+                    ImGui::PopStyleColor();
+                }
             }
         }
     }, "Activation & Action", [&]() {
@@ -266,16 +272,17 @@ void UI::AimbotPage() {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", L("Controls whether firing requires the selected guidance bone or accepts any allowed hitbox."));
 
-        SettingRow(L("Barrier policy"));
-        const char* barrierPolicies[] = { L("Ignore barrier"), L("Wait barrier drop") };
-        activePreset.barrierPolicy = static_cast<int>(OW::ClampBarrierPolicy(activePreset.barrierPolicy));
-        PushControlWidth();
-        presetChanged |= UISelect("##aimBarrierPolicy", &activePreset.barrierPolicy,
-                                  barrierPolicies, IM_ARRAYSIZE(barrierPolicies));
-        ImGui::PopItemWidth();
-        if (ImGui::IsItemHovered())
-            ImGui::SetTooltip("%s", L("Wait barrier drop holds PreAim on dynamic shields (Slot 3) and fires once the barrier drops."));
-        {
+        if (UI::Preferences::ActiveVisibilityMode() ==
+            static_cast<int>(UI::Preferences::VisibilityMode::Ray)) {
+            SettingRow(L("Barrier policy"));
+            const char* barrierPolicies[] = { L("Ignore barrier"), L("Wait barrier drop") };
+            activePreset.barrierPolicy = static_cast<int>(OW::ClampBarrierPolicy(activePreset.barrierPolicy));
+            PushControlWidth();
+            presetChanged |= UISelect("##aimBarrierPolicy", &activePreset.barrierPolicy,
+                                      barrierPolicies, IM_ARRAYSIZE(barrierPolicies));
+            ImGui::PopItemWidth();
+            if (ImGui::IsItemHovered())
+                ImGui::SetTooltip("%s", L("Wait barrier drop holds PreAim on dynamic shields (Slot 3) and fires once the barrier drops."));
             const uint64_t barrierMask = OW::RayRuntime::BarrierRayMask();
             const int activeRayBackend = UI::Preferences::ActiveRayBackend();
             if (OW::RayPolicyNeedsBarrierNotice(activeRayBackend,
@@ -284,11 +291,8 @@ void UI::AimbotPage() {
                 const bool zh = OW::Config::uiLanguage == 1;
                 ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.72f, 0.30f, 1.0f));
                 ImGui::TextWrapped("%s",
-                    activeRayBackend != static_cast<int>(OW::RayDecisionPolicy::Hybrid)
-                        ? (zh ? "Wait barrier drop 需要 Misc -> 射线查询 启用 Hybrid；当前按 Lite/Vision 运行。"
-                              : "Wait barrier drop requires Hybrid ray policy in Misc -> Ray queries; running in Lite/Vision.")
-                        : (zh ? "当前构建尚无实机验证的动态屏障掩码（rayBarrierMask=0），Slot 3 将让渡给次候选并仅执行世界层射线。"
-                              : "Active build has no live-verified barrier mask yet (rayBarrierMask=0); Slot 3 yields and world-only ray checks remain active."));
+                    zh ? "当前构建尚无实机验证的动态屏障掩码（rayBarrierMask=0），Slot 3 将让渡给次候选并仅执行世界层射线。"
+                       : "Active build has no live-verified barrier mask yet (rayBarrierMask=0); Slot 3 yields and world-only ray checks remain active.");
                 ImGui::PopStyleColor();
             }
         }

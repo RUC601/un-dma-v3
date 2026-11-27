@@ -8,6 +8,9 @@
 #include "ui/Text.hpp"
 #include "ui/Theme.hpp"
 #include "ui/ColorPicker.hpp"
+#include "ui/vision/ContourPanel.hpp"
+#include "vision/ContourService.hpp"
+#include "runtime/LauncherBridge.hpp"
 #include "config/UiPreferences.hpp"
 #include "ui/EditorSupport.hpp"
 using UI::Text::UiText;
@@ -2743,65 +2746,771 @@ const HeroOption& DrawPredictionHeroPicker() {
 }
 
 struct HeroContextToolbarLayout {
-    std::string current;
-    std::string follow;
+    std::string heroName;
+    std::string followLabel;
     ID3D11ShaderResourceView* avatar = nullptr;
-    float avatarWidth = 0;
-    float currentWidth = 0;
-    float followWidth = 0;
+    float pillWidth = 0;
     bool detected = false;
 };
 
 static HeroContextToolbarLayout MeasureHeroContextToolbar(float height) {
     HeroContextToolbarLayout layout;
+    const float scale = (std::max)(1.0f, ImGui::GetFontSize() / 15.0f);
     const uint64_t heroId = DetectedLocalHeroId();
     const std::string detectedName = HeroDisplayNameForId(heroId);
-    layout.current = std::string(L("Current")) + ": " + L(detectedName.c_str());
+    layout.heroName = L(detectedName.c_str());
     const HeroOption* hero = FindHeroOptionById(heroId);
     layout.avatar = hero ? HeroAvatarForOption(*hero) : nullptr;
-    layout.avatarWidth = layout.avatar ? height - 12.0f + 8.0f : 0.0f;
-    layout.currentWidth = layout.avatarWidth + ImGui::CalcTextSize(layout.current.c_str()).x;
     layout.detected = heroId != 0;
-    const bool following = UI::state.followDetectedHero;
-    const bool chinese = OW::Config::uiLanguage == OW::Config::kUiLanguageChineseSimplified;
-    layout.follow = L("Follow current hero");
-    layout.follow += chinese ? (following ? "  /  开" : "  /  关") : (following ? "  /  On" : "  /  Off");
-    layout.followWidth = ImGui::CalcTextSize(layout.follow.c_str()).x + 32.0f;
+    const bool zh = OW::Config::uiLanguage == OW::Config::kUiLanguageChineseSimplified;
+    layout.followLabel = zh ? "跟随" : "Follow";
+
+    const float padL = 7.0f * scale;
+    const float padR = 10.0f * scale;
+    const float avatarBox = height - 10.0f * scale;
+    const float switchW = 28.0f * scale;
+    const float nameW = ImGui::CalcTextSize(layout.heroName.c_str()).x;
+    const float followW = ImGui::CalcTextSize(layout.followLabel.c_str()).x;
+    layout.pillWidth = padL + avatarBox + 8.0f * scale + nameW + 10.0f * scale + 1.0f +
+                       10.0f * scale + followW + 8.0f * scale + switchW + padR;
     return layout;
 }
 
-static void DrawHeroContextToolbar(float height, bool stacked) {
+static void DrawHeroContextToolbar(float height, bool /*stacked*/) {
     const auto layout = MeasureHeroContextToolbar(height);
+    const float scale = (std::max)(1.0f, ImGui::GetFontSize() / 15.0f);
     const bool following = UI::state.followDetectedHero;
+    const bool zh = OW::Config::uiLanguage == OW::Config::kUiLanguageChineseSimplified;
+
     const ImVec2 pos = ImGui::GetCursorScreenPos();
-    ImGui::Dummy(ImVec2(layout.currentWidth, height));
-    auto* draw = ImGui::GetWindowDrawList();
-    if (layout.avatar) {
-        const float avatarSize = height - 12.0f;
-        const ImVec2 imageMin(pos.x, pos.y + 6.0f);
-        const ImVec2 imageMax(pos.x + avatarSize, pos.y + 6.0f + avatarSize);
-        draw->AddImageRounded(reinterpret_cast<ImTextureID>(layout.avatar), imageMin, imageMax,
-            ImVec2(0, 0), ImVec2(1, 1), IM_COL32_WHITE, 4.0f);
-        draw->AddRect(imageMin, imageMax, IM_COL32(255, 255, 255, 25), 4.0f);
-    }
-    draw->AddText(ImVec2(pos.x + layout.avatarWidth, pos.y + (height - ImGui::GetTextLineHeight()) * .5f),
-        layout.detected ? kColTextMuted : kColTextDim, layout.current.c_str());
-    if (!stacked) ImGui::SameLine();
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameBorderSize, 1.0f);
-    ImGui::PushStyleVar(ImGuiStyleVar_FrameRounding, 6.0f);
-    ImGui::PushStyleColor(ImGuiCol_Border, ImVec4(.72f,.17f,.29f,1));
-    ImGui::PushStyleColor(ImGuiCol_Button, following ? ImVec4(.38f,.08f,.14f,1) : ImVec4(.18f,.09f,.12f,1));
-    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, ImVec4(.49f,.11f,.20f,1));
-    ImGui::PushStyleColor(ImGuiCol_ButtonActive, ImVec4(.58f,.12f,.23f,1));
-    if (ImGui::Button((layout.follow + "###FollowCurrentHero").c_str(), ImVec2(layout.followWidth, height))) {
+    const ImVec2 size(layout.pillWidth, height);
+    const bool pressed = ImGui::InvisibleButton("###FollowCurrentHero", size);
+    const bool hovered = ImGui::IsItemHovered();
+    if (pressed) {
         UI::state.followDetectedHero = !following;
         if (UI::state.followDetectedHero) {
             s_lastSyncedDetectedHeroId = 0;
             SyncSelectedTypeWithDetectedHero();
         }
     }
-    ImGui::PopStyleColor(4);
-    ImGui::PopStyleVar(2);
+    ImGui::SetItemTooltip("%s: %s\n%s",
+        L("Current"), layout.heroName.c_str(),
+        zh ? "点击切换是否自动跟随当前对局英雄" : "Click to toggle auto-following the active in-game hero");
+
+    auto* draw = ImGui::GetWindowDrawList();
+    const ImVec2 end(pos.x + size.x, pos.y + size.y);
+    const float rounding = 8.0f * scale;
+    const ImVec4 acc = ImGui::ColorConvertU32ToFloat4(kColAccent);
+    const ImU32 bgCol = following
+        ? ImGui::ColorConvertFloat4ToU32(ImVec4(acc.x, acc.y, acc.z, hovered ? 0.17f : 0.11f))
+        : (hovered ? kColControlHover : kColControl);
+    const ImU32 borderCol = following
+        ? ImGui::ColorConvertFloat4ToU32(ImVec4(acc.x, acc.y, acc.z, hovered ? 0.72f : 0.52f))
+        : kColStroke;
+    draw->AddRectFilled(pos, end, bgCol, rounding);
+    draw->AddRect(pos, end, borderCol, rounding, 0, 1.0f);
+
+    float x = pos.x + 7.0f * scale;
+    const float avatarBox = height - 10.0f * scale;
+    const ImVec2 avMin(x, pos.y + (height - avatarBox) * 0.5f);
+    const ImVec2 avMax(avMin.x + avatarBox, avMin.y + avatarBox);
+    if (layout.avatar) {
+        draw->AddImageRounded(reinterpret_cast<ImTextureID>(layout.avatar), avMin, avMax,
+            ImVec2(0, 0), ImVec2(1, 1), IM_COL32_WHITE, 5.0f * scale);
+        draw->AddRect(avMin, avMax, IM_COL32(255, 255, 255, 34), 5.0f * scale);
+    } else {
+        draw->AddRectFilled(avMin, avMax, kColPanel, 5.0f * scale);
+        draw->AddRect(avMin, avMax, kColStroke, 5.0f * scale);
+        const char* badge = layout.detected ? "•" : "?";
+        const ImVec2 bsz = ImGui::CalcTextSize(badge);
+        draw->AddText(ImVec2(avMin.x + (avatarBox - bsz.x) * 0.5f, avMin.y + (avatarBox - bsz.y) * 0.5f),
+                      kColTextDim, badge);
+    }
+    x += avatarBox + 8.0f * scale;
+
+    const ImVec2 nameSize = ImGui::CalcTextSize(layout.heroName.c_str());
+    draw->AddText(ImVec2(x, pos.y + (height - nameSize.y) * 0.5f),
+                  layout.detected ? kColText : kColTextDim, layout.heroName.c_str());
+    x += nameSize.x + 10.0f * scale;
+
+    draw->AddLine(ImVec2(x, pos.y + 8.0f * scale), ImVec2(x, end.y - 8.0f * scale), kColStroke, 1.0f);
+    x += 11.0f * scale;
+
+    const ImVec2 flSize = ImGui::CalcTextSize(layout.followLabel.c_str());
+    draw->AddText(ImVec2(x, pos.y + (height - flSize.y) * 0.5f),
+                  following ? kColTextMuted : kColTextDim, layout.followLabel.c_str());
+    x += flSize.x + 8.0f * scale;
+
+    const float switchW = 28.0f * scale;
+    const float switchH = 16.0f * scale;
+    const ImVec2 swMin(x, pos.y + (height - switchH) * 0.5f);
+    const ImVec2 swMax(swMin.x + switchW, swMin.y + switchH);
+    const ImU32 trackCol = following ? kColAccent : IM_COL32(62, 66, 76, 220);
+    draw->AddRectFilled(swMin, swMax, trackCol, switchH * 0.5f);
+    draw->AddRect(swMin, swMax, IM_COL32(255, 255, 255, following ? 55 : 28), switchH * 0.5f);
+    const float knobR = (switchH - 4.0f * scale) * 0.5f;
+    const float knobX = following ? (swMax.x - 2.0f * scale - knobR) : (swMin.x + 2.0f * scale + knobR);
+    draw->AddCircleFilled(ImVec2(knobX, swMin.y + switchH * 0.5f), knobR, IM_COL32_WHITE, 20);
+}
+
+struct VisibilityStatusSummary {
+    const char* shortLabel = "";
+    std::string detail;
+    ImU32 dotColor = IM_COL32(108, 214, 150, 255);
+    bool captureActive = false;
+};
+
+static VisibilityStatusSummary BuildVisibilityStatusSummary(bool zh) {
+    VisibilityStatusSummary out{};
+    const int mode = UI::Preferences::ActiveVisibilityMode();
+    if (mode == static_cast<int>(UI::Preferences::VisibilityMode::Lite)) {
+        out.shortLabel = zh ? "实体" : "Lite";
+        out.detail = zh ? "仅实体 Vis · 零额外开销" : "Entity Vis only · zero overhead";
+        out.dotColor = IM_COL32(108, 214, 150, 255);
+        return out;
+    }
+    if (mode == static_cast<int>(UI::Preferences::VisibilityMode::Vision)) {
+        out.shortLabel = zh ? "轮廓" : "Vision";
+        V2::Vision::Settings capSettings;
+        const auto capFrame = V2::Vision::GetService().Snapshot(capSettings);
+        const auto capStatus = V2::Vision::GetService().Status();
+        out.captureActive = capStatus.state == V2::Vision::ServiceState::Running ||
+                            capStatus.state == V2::Vision::ServiceState::Starting;
+        if (!capSettings.enabled || capStatus.state == V2::Vision::ServiceState::Stopped) {
+            out.detail = zh ? "采集已停止 · 未收到画面" : "Capture stopped · no frames";
+            out.dotColor = IM_COL32(246, 179, 71, 255);
+        } else if (capStatus.state == V2::Vision::ServiceState::Faulted) {
+            out.detail = zh ? "采集失败 · 请检查设备" : "Capture faulted · check device";
+            out.dotColor = IM_COL32(242, 92, 110, 255);
+        } else if (capStatus.state == V2::Vision::ServiceState::Starting || !capFrame) {
+            out.detail = zh ? "采集连接中 · 等待画面" : "Capture starting · waiting";
+            out.dotColor = IM_COL32(246, 179, 71, 255);
+        } else {
+            char buf[96]{};
+            std::snprintf(buf, sizeof(buf), zh ? "采集中 %.0f fps · Aim & Trigger" : "Capture %.0f fps · Aim & Trigger", capStatus.fps);
+            out.detail = buf;
+            out.dotColor = IM_COL32(108, 214, 150, 255);
+        }
+        return out;
+    }
+    out.shortLabel = zh ? "射线" : "Ray";
+    const bool serviceBound = OW::RayRuntime::HasAttachedService();
+    const uint64_t sceneEpoch = OW::RayRuntime::SceneEpoch();
+    if (!serviceBound) {
+        out.detail = zh ? "UniCore 服务未附着" : "UniCore service not attached";
+        out.dotColor = IM_COL32(242, 92, 110, 255);
+    } else if (sceneEpoch == 0) {
+        out.detail = zh ? "等待进局建立射线场景" : "Waiting for match ray scene";
+        out.dotColor = IM_COL32(246, 179, 71, 255);
+    } else {
+        out.detail = zh ? "6 引擎就绪 · 场景已绑定" : "6-engine ready · scene bound";
+        out.dotColor = IM_COL32(108, 214, 150, 255);
+    }
+    return out;
+}
+
+static void DrawNeverloseAccountPopup(
+    const UI::Workspace::Model& model,
+    const std::function<void(int)>& navigateToPage,
+    ImVec2 popupPos,
+    ImVec2 popupSize,
+    float scale,
+    bool zh)
+{
+    auto* draw = ImGui::GetWindowDrawList();
+    const float availW = ImGui::GetContentRegionAvail().x;
+    const float rowH = (std::max)(30.0f * scale, ImGui::GetFontSize() + 14.0f * scale);
+    const auto& username = V2::Launcher::username;
+    const char* name = username.empty() ? "—" : username.c_str();
+    const ImU32 connColor = model.connected ? IM_COL32(108, 214, 150, 255) : IM_COL32(242, 92, 110, 255);
+
+    // ---- Header: compact avatar + username + Till: Lifetime + read-only region/version ----
+    {
+        const ImVec2 hp = ImGui::GetCursorScreenPos();
+        const float av = 38.0f * scale;
+        const ImVec2 avCenter(hp.x + 2.0f * scale + av * 0.5f, hp.y + av * 0.5f + 2.0f * scale);
+        draw->AddCircleFilled(avCenter, av * 0.5f, kColControl, 28);
+        draw->AddCircle(avCenter, av * 0.5f, kColStroke, 28, 1.0f);
+        draw->AddCircleFilled(ImVec2(avCenter.x, avCenter.y - 4.5f * scale), 5.0f * scale, kColTextDim, 20);
+        draw->PathLineTo(ImVec2(avCenter.x - 9.0f * scale, avCenter.y + 8.5f * scale));
+        draw->PathBezierCubicCurveTo(ImVec2(avCenter.x - 8.2f * scale, avCenter.y + 0.5f * scale),
+            ImVec2(avCenter.x + 8.2f * scale, avCenter.y + 0.5f * scale),
+            ImVec2(avCenter.x + 9.0f * scale, avCenter.y + 8.5f * scale));
+        draw->PathBezierCubicCurveTo(ImVec2(avCenter.x + 4.5f * scale, avCenter.y + 11.2f * scale),
+            ImVec2(avCenter.x - 4.5f * scale, avCenter.y + 11.2f * scale),
+            ImVec2(avCenter.x - 9.0f * scale, avCenter.y + 8.5f * scale));
+        draw->PathFillConvex(kColTextDim);
+
+        const float textX = hp.x + av + 11.0f * scale;
+        const float smallFs = ImGui::GetFontSize() * 0.82f;
+        const char* copyTxt = zh ? "复制" : "Copy";
+        const float copyW = ImGui::CalcTextSize(copyTxt).x + 12.0f * scale;
+        const float copyH = ImGui::GetFontSize() + 4.0f * scale;
+        const float nameMaxX = hp.x + availW - copyW - 4.0f * scale;
+
+        draw->PushClipRect(ImVec2(textX, hp.y), ImVec2((std::max)(textX, nameMaxX), hp.y + 52.0f * scale), true);
+        draw->AddText(ImVec2(textX, hp.y), kColText, name);
+        draw->PopClipRect();
+
+        ImGui::SetCursorScreenPos(ImVec2(hp.x + availW - copyW, hp.y - 1.0f * scale));
+        ImGui::BeginDisabled(username.empty());
+        ImGui::PushStyleVar(ImGuiStyleVar_FramePadding, ImVec2(4.0f * scale, 1.0f * scale));
+        ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(0, 0, 0, 0));
+        ImGui::PushStyleColor(ImGuiCol_ButtonHovered, kColControlHover);
+        ImGui::PushStyleColor(ImGuiCol_ButtonActive, kColControlHot);
+        if (ImGui::Button(copyTxt, ImVec2(copyW, copyH))) {
+            ImGui::SetClipboardText(username.c_str());
+            SetPersistenceStatus(true, zh ? "已复制用户 ID" : "Copied user ID");
+        }
+        ImGui::PopStyleColor(3);
+        ImGui::PopStyleVar();
+        ImGui::EndDisabled();
+
+        const float subY1 = hp.y + ImGui::GetFontSize() + 1.5f * scale;
+        draw->AddText(ImGui::GetFont(), smallFs, ImVec2(textX, subY1), kColTextDim, "Till: Lifetime");
+
+        std::string connLine;
+        if (model.connected && !model.region.empty()) {
+            connLine = model.region;
+            if (!model.buildVersion.empty())
+                connLine += " · " + model.buildVersion;
+            if (model.pid > 0)
+                connLine += " · PID " + std::to_string(model.pid);
+        } else if (model.connected) {
+            connLine = zh ? "已连接" : "Connected";
+            if (model.pid > 0)
+                connLine += " · PID " + std::to_string(model.pid);
+        } else {
+            connLine = zh ? "未连接" : "Disconnected";
+        }
+        const float subY2 = subY1 + smallFs + 2.0f * scale;
+        draw->AddCircleFilled(ImVec2(textX + 3.2f * scale, subY2 + smallFs * 0.52f), 3.0f * scale, connColor, 16);
+        draw->PushClipRect(ImVec2(textX + 9.0f * scale, subY2 - 2.0f), ImVec2(hp.x + availW, subY2 + smallFs + 4.0f), true);
+        draw->AddText(ImGui::GetFont(), smallFs, ImVec2(textX + 9.5f * scale, subY2), connColor, connLine.c_str());
+        draw->PopClipRect();
+
+        ImGui::SetCursorScreenPos(ImVec2(hp.x, (std::max)(hp.y + av + 6.0f * scale, subY2 + smallFs + 6.0f * scale)));
+        if (model.connected) {
+            ImGui::SetCursorScreenPos(ImVec2(hp.x, hp.y));
+            ImGui::Dummy(ImVec2(availW - copyW - 4.0f * scale, (std::max)(av + 4.0f * scale, subY2 + smallFs - hp.y + 4.0f * scale)));
+            ImGui::SetItemTooltip("%s", connLine.c_str());
+        } else {
+            ImGui::Dummy(ImVec2(0, 0));
+        }
+    }
+
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    auto placeSubPopup = [&](float rowScreenY, float subWidth, float estHeight) {
+        const auto* vp = ImGui::GetMainViewport();
+        const float margin = 8.0f * scale;
+        const float vpLeft = vp->WorkPos.x + margin;
+        const float vpRight = vp->WorkPos.x + vp->WorkSize.x - margin;
+        const float vpTop = vp->WorkPos.y + margin;
+        const float vpBottom = vp->WorkPos.y + vp->WorkSize.y - margin;
+        const float maxAvailH = (std::max)(80.0f * scale, vpBottom - vpTop);
+        float sx = popupPos.x + popupSize.x + margin;
+        if (sx + subWidth > vpRight)
+            sx = (std::max)(vpLeft, popupPos.x - subWidth - margin);
+        const bool alignBottom = (rowScreenY + estHeight + 16.0f * scale > vpBottom);
+        const ImVec2 pos = alignBottom
+            ? ImVec2(sx, vpBottom)
+            : ImVec2(sx, (std::max)(vpTop, rowScreenY));
+        const ImVec2 pivot = alignBottom ? ImVec2(0.0f, 1.0f) : ImVec2(0.0f, 0.0f);
+        ImGui::SetNextWindowPos(pos, ImGuiCond_Always, pivot);
+        ImGui::SetNextWindowSizeConstraints(ImVec2(subWidth, 0.0f), ImVec2(subWidth, maxAvailH));
+        ImGui::SetNextWindowSize(ImVec2(subWidth, 0.0f), ImGuiCond_Always);
+    };
+
+    auto drawMenuRow = [&](const char* id, const char* label, const char* valueText,
+                           bool hasDot, ImU32 dotCol, bool hasChevron, bool activeSub,
+                           bool danger, const std::function<void(ImDrawList*, ImVec2, ImU32)>& drawGlyph,
+                           float* outRowY = nullptr,
+                           const std::function<void(ImDrawList*, float rightEdge, float centerY)>& drawExtraRight = {}) -> bool {
+        const ImVec2 rp = ImGui::GetCursorScreenPos();
+        if (outRowY) *outRowY = rp.y;
+        const bool clicked = ImGui::InvisibleButton(id, ImVec2(availW, rowH));
+        const bool hovered = ImGui::IsItemHovered();
+        const ImVec2 rend(rp.x + availW, rp.y + rowH);
+        if (hovered || activeSub) {
+            const ImU32 hoverBg = danger ? IM_COL32(242, 92, 110, 38) : kColControlHover;
+            draw->AddRectFilled(rp, rend, hoverBg, 6.0f * scale);
+        }
+        const ImU32 fgCol = danger
+            ? (hovered ? IM_COL32(255, 146, 158, 255) : kColTextMuted)
+            : ((hovered || activeSub) ? kColText : kColTextMuted);
+        const ImU32 iconCol = danger
+            ? (hovered ? IM_COL32(255, 146, 158, 255) : kColTextDim)
+            : ((hovered || activeSub) ? kColAccent : kColTextDim);
+        const float cy = rp.y + rowH * 0.5f;
+        if (drawGlyph) drawGlyph(draw, ImVec2(rp.x + 12.0f * scale, cy), iconCol);
+        const float textX = rp.x + 28.0f * scale;
+        float rightCursor = rend.x - 8.0f * scale;
+        if (hasChevron) {
+            const float cx = rightCursor - 3.0f * scale;
+            draw->AddLine(ImVec2(cx - 2.2f * scale, cy - 3.5f * scale), ImVec2(cx + 1.2f * scale, cy), kColTextDim, 1.3f * scale);
+            draw->AddLine(ImVec2(cx + 1.2f * scale, cy), ImVec2(cx - 2.2f * scale, cy + 3.5f * scale), kColTextDim, 1.3f * scale);
+            rightCursor = cx - 8.0f * scale;
+        }
+        if (drawExtraRight) {
+            drawExtraRight(draw, rightCursor, cy);
+            rightCursor -= 18.0f * scale;
+        }
+        if (valueText && *valueText) {
+            const float smallFs = ImGui::GetFontSize() * 0.86f;
+            const float maxValW = (std::max)(40.0f * scale, availW * 0.42f);
+            const ImVec2 vsz = ImGui::GetFont()->CalcTextSizeA(smallFs, FLT_MAX, 0.f, valueText);
+            const float vw = (std::min)(vsz.x, maxValW);
+            const float vx = rightCursor - vw;
+            draw->PushClipRect(ImVec2(vx, rp.y), ImVec2(rightCursor, rend.y), true);
+            draw->AddText(ImGui::GetFont(), smallFs, ImVec2(vx, cy - smallFs * 0.5f), kColTextDim, valueText);
+            draw->PopClipRect();
+            rightCursor = vx - 5.0f * scale;
+            if (hasDot) {
+                draw->AddCircleFilled(ImVec2(rightCursor - 2.5f * scale, cy), 3.0f * scale, dotCol, 16);
+                rightCursor -= 9.0f * scale;
+            }
+        }
+        draw->PushClipRect(ImVec2(textX, rp.y), ImVec2((std::max)(textX, rightCursor - 4.0f * scale), rend.y), true);
+        draw->AddText(ImVec2(textX, cy - ImGui::GetFontSize() * 0.5f), fgCol, label);
+        draw->PopClipRect();
+        return clicked;
+    };
+
+    auto openSubStyle = [&]() {
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowPadding, ImVec2(9.0f * scale, 9.0f * scale));
+        ImGui::PushStyleVar(ImGuiStyleVar_WindowRounding, 10.0f * scale);
+        ImGui::PushStyleVar(ImGuiStyleVar_PopupBorderSize, 1.0f);
+        ImGui::PushStyleColor(ImGuiCol_PopupBg, kColPanel);
+        ImGui::PushStyleColor(ImGuiCol_Border, kColStroke);
+    };
+    auto closeSubStyle = [&]() {
+        ImGui::PopStyleColor(2);
+        ImGui::PopStyleVar(3);
+    };
+
+    // 1. Visibility mode (Lite / Vision / Ray)
+    {
+        const auto vis = BuildVisibilityStatusSummary(zh);
+        float rowY = 0.0f;
+        const bool subOpen = ImGui::IsPopupOpen("##SubVisMode", ImGuiPopupFlags_None);
+        if (drawMenuRow("##rowVisMode", zh ? "可见性模式" : "Visibility", vis.shortLabel,
+                        true, vis.dotColor, true, subOpen, false,
+                        [scale](ImDrawList* d, ImVec2 c, ImU32 col) {
+                            d->AddCircle(c, 5.2f * scale, col, 20, 1.3f);
+                            d->AddCircleFilled(c, 2.0f * scale, col, 12);
+                        }, &rowY)) {
+            ImGui::OpenPopup("##SubVisMode");
+        }
+        const float subW = 224.0f * scale;
+        const bool isVision = UI::Preferences::ActiveVisibilityMode() == static_cast<int>(UI::Preferences::VisibilityMode::Vision);
+        placeSubPopup(rowY, subW, (isVision ? 270.0f : 200.0f) * scale);
+        openSubStyle();
+        if (ImGui::BeginPopup("##SubVisMode", ImGuiWindowFlags_NoMove)) {
+            ImGui::TextDisabled("%s", zh ? "全局可见性来源" : "Global visibility source");
+            ImGui::Spacing();
+            const int curMode = UI::Preferences::ActiveVisibilityMode();
+            const char* labels[] = {
+                zh ? "实体 (Lite)" : "Entity (Lite)",
+                zh ? "轮廓 (Vision)" : "Contour (Vision)",
+                zh ? "射线 (Ray)" : "Ray (UniCore)"
+            };
+            const char* hints[] = {
+                zh ? "仅读实体" : "Vis only",
+                zh ? "全局 Aim+Trigger" : "Aim + Trigger",
+                zh ? "6 引擎射线" : "6-engine ray"
+            };
+            for (int m = 0; m < 3; ++m) {
+                ImGui::PushID(m);
+                const bool sel = (curMode == m);
+                if (sel) ImGui::PushStyleColor(ImGuiCol_Header, kColAccentDark);
+                if (ImGui::Selectable(labels[m], sel, ImGuiSelectableFlags_DontClosePopups, ImVec2(0, 26.0f * scale))) {
+                    UI::Preferences::SetActiveVisibilityMode(m);
+                    SetPersistenceStatus(UI::Preferences::Save(), T(UiText::SavedAllChanges));
+                }
+                if (sel) ImGui::PopStyleColor();
+                const ImVec2 itemMax = ImGui::GetItemRectMax();
+                const ImVec2 itemMin = ImGui::GetItemRectMin();
+                const float hfs = ImGui::GetFontSize() * 0.80f;
+                const float hw = ImGui::GetFont()->CalcTextSizeA(hfs, FLT_MAX, 0.f, hints[m]).x;
+                ImGui::GetWindowDrawList()->AddText(ImGui::GetFont(), hfs,
+                    ImVec2(itemMax.x - hw - 4.0f * scale, (itemMin.y + itemMax.y - hfs) * 0.5f),
+                    kColTextDim, hints[m]);
+                ImGui::PopID();
+            }
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+            const auto latest = BuildVisibilityStatusSummary(zh);
+            const ImVec2 sp = ImGui::GetCursorScreenPos();
+            ImGui::GetWindowDrawList()->AddCircleFilled(
+                ImVec2(sp.x + 4.0f * scale, sp.y + ImGui::GetFontSize() * 0.5f), 3.2f * scale, latest.dotColor, 16);
+            ImGui::SetCursorPosX(ImGui::GetCursorPosX() + 13.0f * scale);
+            ImGui::TextWrapped("%s", latest.detail.c_str());
+            if (UI::Preferences::ActiveVisibilityMode() == static_cast<int>(UI::Preferences::VisibilityMode::Vision)) {
+                ImGui::Spacing();
+                if (!latest.captureActive) {
+                    if (ImGui::Selectable(zh ? "启动采集卡" : "Start capture", false, ImGuiSelectableFlags_DontClosePopups)) {
+                        auto cfg = V2::Vision::GetService().GetSettings();
+                        cfg.enabled = true;
+                        V2::Vision::GetService().Configure(cfg);
+                        if (!V2::Vision::GetService().Start())
+                            SetPersistenceStatus(false, "");
+                        else
+                            SetPersistenceStatus(true, zh ? "采集卡已启动" : "Capture started");
+                    }
+                    if (ImGui::Selectable(zh ? "打开采集与轮廓设置..." : "Open capture settings...")) {
+                        if (navigateToPage) navigateToPage(13);
+                        ImGui::CloseCurrentPopup();
+                    }
+                } else if (ImGui::Selectable(zh ? "停止采集卡" : "Stop capture", false, ImGuiSelectableFlags_DontClosePopups)) {
+                    V2::Vision::GetService().Stop();
+                    auto cfg = V2::Vision::GetService().GetSettings();
+                    cfg.enabled = false;
+                    V2::Vision::GetService().Configure(cfg);
+                    UI::Vision::ReleasePreviewResources();
+                    SetPersistenceStatus(true, zh ? "已停止采集卡" : "Capture stopped");
+                }
+            }
+            ImGui::EndPopup();
+        }
+        closeSubStyle();
+    }
+
+    // 2. Active Config Profile
+    {
+        float rowY = 0.0f;
+        const bool subOpen = ImGui::IsPopupOpen("##SubProfile", ImGuiPopupFlags_None);
+        if (drawMenuRow("##rowProfile", zh ? "配置文件" : "Profile", OW::Config::configFileName.c_str(),
+                        false, 0, true, subOpen, false,
+                        [scale](ImDrawList* d, ImVec2 c, ImU32 col) {
+                            for (int i = -1; i <= 1; ++i)
+                                d->AddLine(ImVec2(c.x - 5.0f * scale, c.y + i * 3.5f * scale),
+                                           ImVec2(c.x + 5.0f * scale, c.y + i * 3.5f * scale), col, 1.3f);
+                        }, &rowY)) {
+            ImGui::OpenPopup("##SubProfile");
+        }
+        const float subW = 216.0f * scale;
+        placeSubPopup(rowY, subW, 220.0f * scale);
+        openSubStyle();
+        if (ImGui::BeginPopup("##SubProfile", ImGuiWindowFlags_NoMove)) {
+            ImGui::TextDisabled("%s", zh ? "切换配置档" : "Switch profile");
+            ImGui::Spacing();
+            const std::vector<std::string> profiles = EnumerateConfigProfiles();
+            static char profileBuf[kConfigProfileNameBufferSize] = "";
+            for (const std::string& p : profiles) {
+                const bool sel = (p == OW::Config::configFileName);
+                if (sel) ImGui::PushStyleColor(ImGuiCol_Header, kColAccentDark);
+                if (ImGui::Selectable(p.c_str(), sel, 0, ImVec2(0, 25.0f * scale))) {
+                    if (SelectConfigProfile(p.c_str(), profileBuf))
+                        SetPersistenceStatus(PersistLastConfigProfile(), T(UiText::SavedAllChanges));
+                    else
+                        SetPersistenceStatus(false, "");
+                }
+                if (sel) ImGui::PopStyleColor();
+            }
+            ImGui::EndPopup();
+        }
+        closeSubStyle();
+    }
+
+    // 3. Language
+    {
+        float rowY = 0.0f;
+        const bool subOpen = ImGui::IsPopupOpen("##SubLang", ImGuiPopupFlags_None);
+        if (drawMenuRow("##rowLang", zh ? "语言" : "Language", zh ? "中文" : "English",
+                        false, 0, true, subOpen, false,
+                        [scale](ImDrawList* d, ImVec2 c, ImU32 col) {
+                            d->AddCircle(c, 5.5f * scale, col, 18, 1.25f);
+                            d->AddLine(ImVec2(c.x - 5.2f * scale, c.y), ImVec2(c.x + 5.2f * scale, c.y), col, 1.1f);
+                            d->AddEllipse(c, ImVec2(2.6f * scale, 5.5f * scale), col, 0.f, 16, 1.1f);
+                        }, &rowY)) {
+            ImGui::OpenPopup("##SubLang");
+        }
+        const float subW = 176.0f * scale;
+        placeSubPopup(rowY, subW, 112.0f * scale);
+        openSubStyle();
+        if (ImGui::BeginPopup("##SubLang", ImGuiWindowFlags_NoMove)) {
+            ImGui::TextDisabled("%s", zh ? "界面语言" : "Language");
+            ImGui::Spacing();
+            const int curLang = OW::Config::ClampUiLanguage(OW::Config::uiLanguage);
+            const char* langs[] = { "English", "简体中文" };
+            for (int l = 0; l < 2; ++l) {
+                const bool sel = (curLang == l);
+                if (sel) ImGui::PushStyleColor(ImGuiCol_Header, kColAccentDark);
+                if (ImGui::Selectable(langs[l], sel, 0, ImVec2(0, 25.0f * scale))) {
+                    OW::Config::uiLanguage = l;
+                    UI::Preferences::values.language = l;
+                    UI::Preferences::Save();
+                }
+                if (sel) ImGui::PopStyleColor();
+            }
+            ImGui::EndPopup();
+        }
+        closeSubStyle();
+    }
+
+    // 4. Dual-color Appearance & Custom Theme Presets
+    {
+        float rowY = 0.0f;
+        const bool subOpen = ImGui::IsPopupOpen("##SubTheme", ImGuiPopupFlags_None);
+        const auto* activePreset = UI::Preferences::FindThemePreset(UI::Preferences::values.activeThemeId);
+        const char* themeLabel = activePreset ? activePreset->name.c_str() : (zh ? "自定义" : "Custom");
+        const ImU32 baseCol = ImGui::ColorConvertFloat4ToU32(UI::Theme::SanitizeBaseDarkColor(UI::Preferences::values.baseDark));
+        const ImU32 accCol = ImGui::ColorConvertFloat4ToU32(UI::Preferences::values.accent);
+        if (drawMenuRow("##rowTheme", zh ? "外观风格" : "Style", themeLabel,
+                        false, 0, true, subOpen, false,
+                        [scale](ImDrawList* d, ImVec2 c, ImU32 col) {
+                            d->AddCircle(c, 5.4f * scale, col, 20, 1.3f);
+                            d->AddCircleFilled(ImVec2(c.x - 1.8f * scale, c.y - 1.4f * scale), 1.3f * scale, col);
+                            d->AddCircleFilled(ImVec2(c.x + 1.8f * scale, c.y - 1.4f * scale), 1.3f * scale, col);
+                            d->AddCircleFilled(ImVec2(c.x, c.y + 2.0f * scale), 1.3f * scale, col);
+                        },
+                        &rowY,
+                        [scale, baseCol, accCol](ImDrawList* d, float rightEdge, float cy) {
+                            const float r = 5.0f * scale;
+                            d->AddCircleFilled(ImVec2(rightEdge - r - 6.0f * scale, cy), r, baseCol, 18);
+                            d->AddCircle(ImVec2(rightEdge - r - 6.0f * scale, cy), r, IM_COL32(255, 255, 255, 70), 18, 1.0f);
+                            d->AddCircleFilled(ImVec2(rightEdge - r, cy), r, accCol, 18);
+                            d->AddCircle(ImVec2(rightEdge - r, cy), r, IM_COL32(255, 255, 255, 90), 18, 1.0f);
+                        })) {
+            ImGui::OpenPopup("##SubTheme");
+        }
+        const float subW = 262.0f * scale;
+        const float themeEstH = (240.0f + static_cast<float>(3 + UI::Preferences::values.customThemes.size()) * 29.0f) * scale;
+        placeSubPopup(rowY - 80.0f * scale, subW, themeEstH);
+        openSubStyle();
+        if (ImGui::BeginPopup("##SubTheme", ImGuiWindowFlags_NoMove)) {
+            auto& prefs = UI::Preferences::values;
+            ImGui::TextDisabled("%s", zh ? "外观预设" : "Theme presets");
+            ImGui::Spacing();
+
+            std::string pendingDeleteId;
+            auto drawPresetEntry = [&](const UI::Preferences::ThemePreset& preset) {
+                ImGui::PushID(preset.id.c_str());
+                const bool sel = (prefs.activeThemeId == preset.id);
+                const float delW = preset.builtin ? 0.0f : (22.0f * scale);
+                const float itemW = ImGui::GetContentRegionAvail().x - delW - (preset.builtin ? 0.0f : 4.0f * scale);
+                const ImVec2 p = ImGui::GetCursorScreenPos();
+                if (sel) ImGui::PushStyleColor(ImGuiCol_Header, kColAccentDark);
+                if (ImGui::Selectable("##presetRow", sel, ImGuiSelectableFlags_DontClosePopups, ImVec2(itemW, 25.0f * scale))) {
+                    UI::Preferences::ApplyThemePreset(preset.id);
+                    UI::Theme::Apply();
+                    UI::Preferences::Save();
+                }
+                if (sel) ImGui::PopStyleColor();
+                auto* dl = ImGui::GetWindowDrawList();
+                const float cy = p.y + 12.5f * scale;
+                const ImU32 pb = ImGui::ColorConvertFloat4ToU32(UI::Theme::SanitizeBaseDarkColor(preset.baseDark));
+                const ImU32 pa = ImGui::ColorConvertFloat4ToU32(preset.accent);
+                dl->AddCircleFilled(ImVec2(p.x + 8.0f * scale, cy), 4.5f * scale, pb, 16);
+                dl->AddCircle(ImVec2(p.x + 8.0f * scale, cy), 4.5f * scale, IM_COL32(255, 255, 255, 70), 16, 1.0f);
+                dl->AddCircleFilled(ImVec2(p.x + 14.0f * scale, cy), 4.5f * scale, pa, 16);
+                dl->AddCircle(ImVec2(p.x + 14.0f * scale, cy), 4.5f * scale, IM_COL32(255, 255, 255, 90), 16, 1.0f);
+                dl->PushClipRect(ImVec2(p.x + 24.0f * scale, p.y), ImVec2(p.x + itemW - 4.0f * scale, p.y + 25.0f * scale), true);
+                dl->AddText(ImVec2(p.x + 24.0f * scale, cy - ImGui::GetFontSize() * 0.5f), sel ? kColText : kColTextMuted, preset.name.c_str());
+                dl->PopClipRect();
+                if (!preset.builtin) {
+                    ImGui::SameLine(0, 4.0f * scale);
+                    ImGui::PushStyleColor(ImGuiCol_Button, IM_COL32(0, 0, 0, 0));
+                    ImGui::PushStyleColor(ImGuiCol_ButtonHovered, IM_COL32(242, 92, 110, 50));
+                    if (ImGui::Button("x##delTheme", ImVec2(delW, 25.0f * scale)))
+                        pendingDeleteId = preset.id;
+                    ImGui::PopStyleColor(2);
+                }
+                ImGui::PopID();
+            };
+
+            for (const auto& p : UI::Preferences::BuiltinThemePresets())
+                drawPresetEntry(p);
+            for (const auto& p : prefs.customThemes)
+                drawPresetEntry(p);
+            if (!pendingDeleteId.empty() && UI::Preferences::DeleteCustomThemePreset(pendingDeleteId)) {
+                UI::Preferences::Save();
+                SetPersistenceStatus(true, zh ? "已删除自定义外观预设" : "Deleted custom theme preset");
+            }
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            // Dual-color pickers: dark base + accent
+            bool colorsEdited = false;
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("%s", zh ? "暗底色" : "Base dark");
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x - UI::kColorSwatchWidth);
+            if (UI::ColorPicker("##popupBaseDark", prefs.baseDark)) {
+                prefs.baseDark.w = 1.0f;
+                prefs.activeThemeId.clear();
+                prefs.customAccent = true;
+                colorsEdited = true;
+            }
+
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("%s", zh ? "强调色" : "Accent");
+            ImGui::SameLine(ImGui::GetContentRegionAvail().x - UI::kColorSwatchWidth);
+            if (UI::ColorPicker("##popupAccent", prefs.accent)) {
+                prefs.accent.w = 1.0f;
+                prefs.activeThemeId.clear();
+                prefs.customAccent = true;
+                colorsEdited = true;
+            }
+
+            // Quick accent dots
+            constexpr ImVec4 kQuickAccents[] = {
+                {228.f/255.f, 17.f/255.f, 67.f/255.f, 1.f},
+                {59.f/255.f, 130.f/255.f, 246.f/255.f, 1.f},
+                {46.f/255.f, 229.f/255.f, 168.f/255.f, 1.f},
+                {171.f/255.f, 147.f/255.f, 255.f/255.f, 1.f},
+                {245.f/255.f, 158.f/255.f, 11.f/255.f, 1.f},
+                {236.f/255.f, 72.f/255.f, 153.f/255.f, 1.f},
+            };
+            ImGui::AlignTextToFramePadding();
+            ImGui::TextDisabled("%s", zh ? "快选" : "Quick");
+            for (int q = 0; q < IM_ARRAYSIZE(kQuickAccents); ++q) {
+                ImGui::SameLine(q == 0 ? 54.0f * scale : 0.0f, 6.0f * scale);
+                ImGui::PushID(q);
+                const ImVec2 qp = ImGui::GetCursorScreenPos();
+                const float qd = 16.0f * scale;
+                if (ImGui::InvisibleButton("##qAcc", ImVec2(qd, qd))) {
+                    prefs.accent = kQuickAccents[q];
+                    prefs.activeThemeId.clear();
+                    prefs.customAccent = true;
+                    colorsEdited = true;
+                }
+                auto* dl = ImGui::GetWindowDrawList();
+                dl->AddCircleFilled(ImVec2(qp.x + qd * 0.5f, qp.y + qd * 0.5f), qd * 0.48f,
+                    ImGui::ColorConvertFloat4ToU32(kQuickAccents[q]), 18);
+                dl->AddCircle(ImVec2(qp.x + qd * 0.5f, qp.y + qd * 0.5f), qd * 0.48f,
+                    ImGui::IsItemHovered() ? IM_COL32_WHITE : IM_COL32(255, 255, 255, 65), 18, 1.0f);
+                ImGui::PopID();
+            }
+
+            if (colorsEdited) {
+                UI::Theme::Apply();
+                UI::Preferences::Save();
+            }
+
+            ImGui::Spacing();
+            ImGui::Separator();
+            ImGui::Spacing();
+
+            static char newThemeName[48] = "";
+            const bool full = prefs.customThemes.size() >= UI::Preferences::kMaxCustomThemePresets;
+            const char* savePresetTxt = zh ? "存预设" : "Save";
+            const float btnW = ImGui::CalcTextSize(savePresetTxt).x + 18.0f * scale;
+            ImGui::BeginDisabled(full);
+            ImGui::SetNextItemWidth((std::max)(80.0f * scale, ImGui::GetContentRegionAvail().x - btnW - 6.0f * scale));
+            const bool submitted = ImGui::InputTextWithHint("##newThemeName",
+                zh ? "新预设名称…" : "New preset name...", newThemeName, sizeof(newThemeName),
+                ImGuiInputTextFlags_EnterReturnsTrue);
+            ImGui::SameLine(0, 6.0f * scale);
+            if ((submitted || ImGui::Button(savePresetTxt, ImVec2(btnW, 0))) && !full) {
+                const std::string createdId = UI::Preferences::AddCustomThemePreset(
+                    newThemeName, prefs.baseDark, prefs.accent);
+                if (!createdId.empty()) {
+                    newThemeName[0] = '\0';
+                    UI::Theme::Apply();
+                    SetPersistenceStatus(UI::Preferences::Save(), zh ? "已保存自定义外观预设" : "Saved custom theme preset");
+                }
+            }
+            ImGui::EndDisabled();
+            ImGui::EndPopup();
+        }
+        closeSubStyle();
+    }
+
+    // 5. Overlay Canvas Background Mode
+    {
+        float rowY = 0.0f;
+        const bool subOpen = ImGui::IsPopupOpen("##SubCanvasBg", ImGuiPopupFlags_None);
+        const char* bgShort = OW::Config::overlayTransparentBackground
+            ? (zh ? "透明" : "Transp.")
+            : (zh ? "纯黑" : "Opaque");
+        if (drawMenuRow("##rowCanvasBg", zh ? "画布背景" : "Canvas", bgShort,
+                        false, 0, true, subOpen, false,
+                        [scale](ImDrawList* d, ImVec2 c, ImU32 col) {
+                            d->AddRect(ImVec2(c.x - 5.5f * scale, c.y - 4.2f * scale),
+                                       ImVec2(c.x + 5.5f * scale, c.y + 4.2f * scale), col, 1.5f, 0, 1.3f);
+                        }, &rowY)) {
+            ImGui::OpenPopup("##SubCanvasBg");
+        }
+        const float subW = 196.0f * scale;
+        placeSubPopup(rowY, subW, 112.0f * scale);
+        openSubStyle();
+        if (ImGui::BeginPopup("##SubCanvasBg", ImGuiWindowFlags_NoMove)) {
+            ImGui::TextDisabled("%s", zh ? "画布背景模式" : "Canvas background");
+            ImGui::Spacing();
+            const char* modes[] = { zh ? "纯黑融合器" : "Opaque black", zh ? "透明背景" : "Transparent" };
+            const int cur = OW::Config::overlayTransparentBackground ? 1 : 0;
+            for (int m = 0; m < 2; ++m) {
+                const bool sel = (cur == m);
+                if (sel) ImGui::PushStyleColor(ImGuiCol_Header, kColAccentDark);
+                if (ImGui::Selectable(modes[m], sel, 0, ImVec2(0, 25.0f * scale))) {
+                    const bool transparentBg = (m == 1);
+                    if (!g_Overlay.SetCanvasTransparentBackground(transparentBg))
+                        OW::Config::overlayTransparentBackground = g_Overlay.IsCanvasTransparentBackground();
+                    else
+                        OW::Config::overlayTransparentBackground = transparentBg;
+                }
+                if (sel) ImGui::PopStyleColor();
+            }
+            ImGui::EndPopup();
+        }
+        closeSubStyle();
+    }
+
+    ImGui::Spacing();
+    ImGui::Separator();
+    ImGui::Spacing();
+
+    // Bottom quiet action rows (no DryRun, no region picker)
+    const bool recoveryBusy = OW::ProcessConnection::IsRecoveryBusy();
+    ImGui::BeginDisabled(recoveryBusy);
+    if (drawMenuRow("##actRefresh", zh ? "刷新缓存" : "Refresh caches", nullptr, false, 0, false, false, false,
+                    [scale](ImDrawList* d, ImVec2 c, ImU32 col) {
+                        d->PathArcTo(c, 4.8f * scale, 0.4f, 5.4f, 16);
+                        d->PathStroke(col, 0, 1.3f);
+                    })) {
+        StopFirePatternRecorder();
+        OW::ProcessConnection::RequestCacheRefresh();
+        ImGui::CloseCurrentPopup();
+    }
+    if (drawMenuRow("##actReconnect", zh ? "重连进程" : "Reconnect", nullptr, false, 0, false, false, false,
+                    [scale](ImDrawList* d, ImVec2 c, ImU32 col) {
+                        const ImVec2 pts[] = {
+                            {c.x + 1.0f * scale, c.y - 5.5f * scale},
+                            {c.x - 3.5f * scale, c.y + 0.5f * scale},
+                            {c.x + 0.2f * scale, c.y + 0.5f * scale},
+                            {c.x - 1.2f * scale, c.y + 5.5f * scale},
+                            {c.x + 3.5f * scale, c.y - 0.8f * scale},
+                            {c.x - 0.2f * scale, c.y - 0.8f * scale},
+                        };
+                        d->AddPolyline(pts, 6, col, ImDrawFlags_Closed, 1.2f);
+                    })) {
+        OW::ProcessConnection::RequestReconnect();
+        ImGui::CloseCurrentPopup();
+    }
+    ImGui::EndDisabled();
+
+    if (drawMenuRow("##actMinimize", zh ? "最小化画布" : "Minimize overlay", nullptr, false, 0, false, false, false,
+                    [scale](ImDrawList* d, ImVec2 c, ImU32 col) {
+                        d->AddLine(ImVec2(c.x - 4.8f * scale, c.y + 2.0f * scale),
+                                   ImVec2(c.x + 4.8f * scale, c.y + 2.0f * scale), col, 1.5f);
+                    })) {
+        g_Overlay.MinimizeToTaskbar();
+        ImGui::CloseCurrentPopup();
+    }
+    if (drawMenuRow("##actExit", zh ? "退出 UNLEASHED" : "Exit UNLEASHED", nullptr, false, 0, false, false, true,
+                    [scale](ImDrawList* d, ImVec2 c, ImU32 col) {
+                        d->PathArcTo(c, 4.8f * scale, -IM_PI * 0.25f, IM_PI * 1.25f, 16);
+                        d->PathStroke(col, 0, 1.3f);
+                        d->AddLine(ImVec2(c.x, c.y - 5.8f * scale), ImVec2(c.x, c.y - 0.8f * scale), col, 1.4f);
+                    })) {
+        g_Overlay.RequestExit();
+        ImGui::CloseCurrentPopup();
+    }
 }
 
 static void DrawEditingContext() {
@@ -2893,15 +3602,23 @@ void UI::Render() {
     model.connected = OW::ProcessConnection::IsConnected();
     const auto layout = V2::Profiles::Snapshot();
     const auto* matched = V2::Profiles::MatchedProfile(layout.detection);
-    if (model.connected && matched) model.region = matched->region;
+    if (model.connected && matched) {
+        model.region = matched->region;
+        model.buildVersion = matched->build;
+    }
+    if (model.connected)
+        model.pid = OW::ProcessConnection::ConnectedPid();
+    const auto visSummary = BuildVisibilityStatusSummary(chinese);
+    model.visibilityShort = visSummary.shortLabel;
+    model.visibilityDotColor = visSummary.dotColor;
     model.brandIcon = reinterpret_cast<ImTextureID>(s_logoTexture);
-    const auto toolbar = MeasureHeroContextToolbar((std::max)(30.0f, ImGui::GetFrameHeight()));
-    model.headerWidth = toolbar.currentWidth + ImGui::GetStyle().ItemSpacing.x + toolbar.followWidth;
-    model.headerColumnWidth = (std::max)(toolbar.currentWidth, toolbar.followWidth);
-    Workspace::Render(model, [] {
-        SetPersistenceStatus(OW::Config::SaveAllConfig(OW::Config::ConfigPath()), T(UiText::SavedAllChanges));
-    }, [&](int selected) {
-        page=selected==6?5:selected==9?8:selected;
+    const float toolbarH = (std::max)(32.0f * (std::max)(1.0f, ImGui::GetFontSize() / 15.0f), ImGui::GetFrameHeight());
+    const auto toolbar = MeasureHeroContextToolbar(toolbarH);
+    model.headerWidth = toolbar.pillWidth;
+    model.headerColumnWidth = toolbar.pillWidth;
+    auto routePage = [&](int targetPage) {
+        page = targetPage == 6 ? 5 : targetPage == 9 ? 8 : targetPage;
+        model.selected = page;
         if (page<4) { state.activeTab=TAB_AIMING; state.aimingSubTab=page; }
         else if (page==4) state.activeTab=TAB_ALERT;
         else if (page==5) state.activeTab=TAB_VISUALS;
@@ -2909,6 +3626,11 @@ void UI::Render() {
         else if (page==17) state.activeTab=TAB_PREDICTION;
         else if (page<8) { state.activeTab=TAB_THEME; state.themeSubTab=page-6; }
         else { state.activeTab=TAB_MISC; const int mapping[]={2,3,4,5,6,7,0,1}; state.miscSubTab=mapping[page-8]; }
+    };
+    Workspace::Render(model, [] {
+        SetPersistenceStatus(OW::Config::SaveAllConfig(OW::Config::ConfigPath()), T(UiText::SavedAllChanges));
+    }, [&](int selected) {
+        routePage(selected);
         DrawEditingContext();
         switch(page) {
         case 0: AimbotPage(); break; case 1: TriggerPage(); break;
@@ -2922,6 +3644,8 @@ void UI::Render() {
         case 16: DrawHeroKeyPage(); break; case 17: DrawPredictionDataPage(); break;
         }
         CloseGroupBox();
-    }, DrawHeroContextToolbar);
+    }, DrawHeroContextToolbar, [&](ImVec2 popupPos, ImVec2 popupSize, float scale, bool zh) {
+        DrawNeverloseAccountPopup(model, routePage, popupPos, popupSize, scale, zh);
+    });
     page=model.selected;
 }
