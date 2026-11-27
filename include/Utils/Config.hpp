@@ -1006,6 +1006,15 @@ namespace OW { namespace Config {
         return aimBehaviorMoveSplitEnabled[static_cast<size_t>(normalized)];
     }
 
+    inline bool AimBehaviorStopAssistInsideHitbox(int behavior)
+    {
+        if (const auto* tuning=ActiveSlotBehaviorTuning(); tuning && ClampAimBehaviorIndex(behavior)==ClampAimBehaviorIndex(View_aimBehavior())) return tuning->stopAssistInsideHitbox;
+        const int normalized = ClampAimBehaviorIndex(behavior);
+        if (const AimBehaviorPreset* preset = ActiveAimBehaviorPreset(normalized))
+            return preset->stopAssistInsideHitbox;
+        return true;
+    }
+
     inline int AimBehaviorMoveSplitMaxPixels(int behavior)
     {
         if (const auto* tuning=ActiveSlotBehaviorTuning(); tuning && ClampAimBehaviorIndex(behavior)==ClampAimBehaviorIndex(View_aimBehavior())) return tuning->moveSplitMaxPixels;

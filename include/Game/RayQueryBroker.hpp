@@ -49,6 +49,12 @@ public:
     void Attach(Service* service);
     void Detach();
     bool HasService() const noexcept;
+    uint32_t ConsecutiveErrorWaves() const noexcept {
+        return consecutiveErrorWaves_.load(std::memory_order_acquire);
+    }
+    uint32_t LastWaveLatencyUs() const noexcept {
+        return lastWaveLatencyUs_.load(std::memory_order_acquire);
+    }
     void SetScene(uint64_t sceneEpoch);
     void Submit(Query query);
     void SubmitBatch(std::span<const Query> queries);
@@ -81,6 +87,8 @@ private:
     bool stopping_ = false;
     bool inFlight_ = false;
     std::atomic<bool> hasService_{false};
+    std::atomic<uint32_t> consecutiveErrorWaves_{0};
+    std::atomic<uint32_t> lastWaveLatencyUs_{0};
     Service* service_ = nullptr;
     uint64_t serviceGeneration_ = 0;
     uint64_t desiredSceneEpoch_ = 0;

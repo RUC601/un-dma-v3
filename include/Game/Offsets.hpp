@@ -133,17 +133,18 @@ namespace OW {
             // has no verified Unicorn entry and the live probe stays disabled.
             uint64_t rayEntryRva = 0;
             // Layer mask written to setup + 0x58.
-            //   rayMask: player/world mask (0x0690000000000017; statically present across
-            //            CN/World/Nexon 155284 and live-observed on World 155284).
-            //   rayWorldMask: static world-occlusion mask (0x0690000000000002; statically
-            //            present across CN/World/Nexon 155284 and live-observed on thread
-            //            stacks in all three regions).
+            //   rayMask: default world/LOS trace mask (0x0690000000000017; statically present
+            //            across CN/World/Nexon 155284 and live-verified on CN & World 155284).
+            //   rayWorldMask: static world-occlusion mask (0x0690000000000017; live-verified
+            //            2026-11-27 on CN 155284N to return fraction=1.0 on visible actors and
+            //            wall hits flags=0x24 on occluded actors. 0x0690000000000002 collides
+            //            with actor hitboxes and must NOT be used for world occlusion).
             //   rayBarrierMask: dynamic barrier-layer mask for Slot 3 WaitBarrierDrop queries.
             //            0 means "unsupported / not yet live-verified for this build". Legacy
             //            149004 values (0x15 / 0x51) have 0 occurrences in 155284 dumps and
             //            must never be copied forward.
             uint64_t rayMask = 0x0690000000000017ull;
-            uint64_t rayWorldMask = 0x0690000000000002ull;
+            uint64_t rayWorldMask = 0x0690000000000017ull;
             uint64_t rayBarrierMask = 0;
             // setup + 0x1A0 ray callback. CN visibility/aim captures use base + 0xFDCBF0;
             // the ground/movement variant base + 0xFF33F0 clears the collision bit at
@@ -462,7 +463,7 @@ namespace OW {
             .rayContextVtableRva = 0x35933C0,
             .rayEntryRva = 0x10222E0,
             .rayMask = 0x0690000000000017ull,
-            .rayWorldMask = 0x0690000000000002ull,
+            .rayWorldMask = 0x0690000000000017ull,
             // Dynamic barrier mask is not yet live-verified on CN 155284N (0 = unsupported).
             .rayBarrierMask = 0,
             .rayAuxCallbackRva = 0xFDCBF0,
@@ -514,7 +515,7 @@ namespace OW {
             .rayContextVtableRva = 0x2FB25F0,
             .rayEntryRva = 0xD0E030,
             .rayMask = 0x0690000000000017ull,
-            .rayWorldMask = 0x0690000000000002ull,
+            .rayWorldMask = 0x0690000000000017ull,
             // Dynamic barrier mask is not yet live-verified on World 155284 (0 = unsupported).
             .rayBarrierMask = 0,
             // World +0x1A0 callback not established; keep 0 rather than borrowing CN's.
@@ -557,7 +558,7 @@ namespace OW {
             // 0x...17 (17 sites in .text) and 0x...02 (1 site + 4 live stack hits) are
             // independently verified in 155284KB; dynamic barrier mask stays 0 (unsupported).
             profile.rayMask = 0x0690000000000017ull;
-            profile.rayWorldMask = 0x0690000000000002ull;
+            profile.rayWorldMask = 0x0690000000000017ull;
             profile.rayBarrierMask = 0;
             // Nexon is built from a CN copy; never let it inherit CN's +0x1A0 callback
             // RVA (0xFDCBF0 is CN's address and has not been verified in this image).

@@ -1005,9 +1005,9 @@ int main(int argc, char** argv) {
             return Fail("Nexon profile must not inherit CN ray/ClientGame RVAs");
         if (nexon.rayAuxCallbackRva != 0 || world.rayAuxCallbackRva != 0)
             return Fail("World/Nexon must keep unverified rayAuxCallbackRva=0");
-        if (cn.rayWorldMask != 0x0690000000000002ull ||
-            world.rayWorldMask != 0x0690000000000002ull ||
-            nexon.rayWorldMask != 0x0690000000000002ull)
+        if (cn.rayWorldMask != 0x0690000000000017ull ||
+            world.rayWorldMask != 0x0690000000000017ull ||
+            nexon.rayWorldMask != 0x0690000000000017ull)
             return Fail("three-region rayWorldMask mismatch");
         if (cn.rayBarrierMask != 0 || world.rayBarrierMask != 0 || nexon.rayBarrierMask != 0)
             return Fail("unverified rayBarrierMask must stay 0 (no fabricated legacy 149004 masks)");

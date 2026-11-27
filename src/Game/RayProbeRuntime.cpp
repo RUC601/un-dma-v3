@@ -198,9 +198,13 @@ bool AttachProbe() {
     const int engines = ResolveConfiguredProbeEngines();
     runtime.configuredEngines.store(engines, std::memory_order_release);
     config.engines = engines;
-    config.instructionLimit = 4'000'000;
+    // Normal Overwatch world raycasts finish in ~2k-20k instructions (~1-3 ms). Cap at 250k
+    // so a degenerate ray or stale cached heap page aborts in ~15-25 ms instead of stalling
+    // all 6 engines for ~5 seconds and turning every Aim/Trigger ray Stale.
+    config.instructionLimit = 250'000;
     config.timeoutUs = 0;  // instructionLimit is the only bound; no 15 ms timer floor
     config.refreshTouchedPages = false;  // static world pages stay cached for the scene
+    config.skipCodeHook = true;  // native instructionLimit + unmapped-fetch hook remain active
     config.resolveContext = [](uint64_t& resolved) { return TryGetRayContext(resolved); };
 
     auto probe = std::make_unique<EngineTrace::VisionProbe>(
@@ -219,12 +223,14 @@ bool AttachProbe() {
     runtime.attachedProfile = offset::ActiveProfile();
     runtime.publishedContext.store(context, std::memory_order_release);
     Diagnostics::Info(
-        "[RAY-PROBE] attached pid=%d base=0x%llX image=0x%X profile=%s entry_rva=0x%llX mask=0x%llX context=0x%llX chain_raw220=0x%llX chain_sub60=0x%llX chain_1e8=0x%llX setup_1f8=scratch setup_1a0=0",
+        "[RAY-PROBE] attached pid=%d base=0x%llX image=0x%X profile=%s entry_rva=0x%llX mask=0x%llX world_mask=0x%llX skip_code_hook=%d context=0x%llX chain_raw220=0x%llX chain_sub60=0x%llX chain_1e8=0x%llX setup_1f8=scratch setup_1a0=0",
         static_cast<int>(ProcessConnection::ConnectedPid()),
         static_cast<unsigned long long>(SDK->dwGameBase),
         static_cast<unsigned int>(offsets.imageSize), offsets.name,
         static_cast<unsigned long long>(offsets.rayEntryRva),
         static_cast<unsigned long long>(offsets.rayMask),
+        static_cast<unsigned long long>(RayRuntime::WorldRayMask()),
+        config.skipCodeHook ? 1 : 0,
         static_cast<unsigned long long>(context),
         static_cast<unsigned long long>(chain.raw220),
         static_cast<unsigned long long>(chain.sub60),
@@ -269,14 +275,29 @@ void WatchThread() {
                 } else {
                     uint64_t resolved = 0;
                     const bool resolvedOk = TryGetRayContext(resolved);
-                    if (!resolvedOk || !healthy || resolved != boundContext) {
-                        // The level instance changed or died. Drop the engines, their world
-                        // pages and the old setup seed; the next tick re-resolves the context
-                        // and captures a fresh seed for the new scene.
+                    const uint32_t errWaves = Broker().ConsecutiveErrorWaves();
+                    const uint32_t lastWaveUs = Broker().LastWaveLatencyUs();
+                    const bool probeDegraded = errWaves >= 8;
+                    if (lastWaveUs >= 150'000) {
+                        static uint64_t lastSlowLogMs = 0;
+                        const uint64_t nowMs = NowMs();
+                        if (lastSlowLogMs == 0 || nowMs - lastSlowLogMs >= 2000) {
+                            lastSlowLogMs = nowMs;
+                            Diagnostics::Warn(
+                                "[RAY-PROBE] slow wave detected lastWaveMs=%.1f errWaves=%u",
+                                static_cast<double>(lastWaveUs) / 1000.0, errWaves);
+                        }
+                    }
+                    if (!resolvedOk || !healthy || resolved != boundContext || probeDegraded) {
+                        // The level instance changed, died, or cached dynamic heap pages went
+                        // stale causing repeated trace errors. Drop the engines and page cache
+                        // so the next tick re-resolves fresh memory cleanly.
                         Diagnostics::Info(
-                            "[RAY-PROBE] scene change detected (%s); releasing engines and page cache",
+                            "[RAY-PROBE] scene change detected (%s, errWaves=%u, lastWaveMs=%.1f); releasing engines and page cache",
                             !resolvedOk ? "context_unresolved"
-                                        : (!healthy ? "context_dead" : "context_changed"));
+                                        : (!healthy ? "context_dead"
+                                                    : (probeDegraded ? "stale_page_errors" : "context_changed")),
+                            errWaves, static_cast<double>(lastWaveUs) / 1000.0);
                         DetachProbe();
                     }
                 }

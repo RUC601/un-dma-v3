@@ -41,6 +41,20 @@ inline bool BehaviorTuningEditor(OW::Config::AimBehaviorTuning& t,int behavior,
             changed=true;
         }
         ImGui::PopItemWidth();
+        if ((behavior == 1 || behavior == 2 || behavior == 4) &&
+            OW::ClampFirePolicy(t.firePolicy) == OW::FirePolicyType::TrackingWithHold) {
+            ImGui::TextColored(ImVec4(0.96f, 0.72f, 0.24f, 1.0f), "%s",
+                OW::Config::uiLanguage == 1
+                    ? "提示：按住跟枪策略用于 Tracking，Flick 模式建议选 Single Shot 或 Keep Firing"
+                    : "Note: Tracking With Hold is intended for Tracking; Flick works best with Single Shot or Keep Firing.");
+        }
+    }
+    SettingRow(OW::Config::uiLanguage == 1 ? "命中框内停止助力" : "Stop Assist Inside Hitbox");
+    changed |= UICheckbox("##stopAssistInsideHitbox", &t.stopAssistInsideHitbox);
+    if (ImGui::IsItemHovered()) {
+        ImGui::SetTooltip("%s", OW::Config::uiLanguage == 1
+            ? "开启：准星进入允许命中框边缘即停止拉枪（仅保留微幅跟随）。\n关闭：进入命中框后继续平滑拉向所选骨骼中心（适合抛物线/大体积弹道，如毛妹右键、西格玛左键/E）。"
+            : "ON: Stop pulling once crosshair enters an allowed hitbox edge (light motion follow only).\nOFF: Continue pulling smoothly toward the guidance bone center inside the hitbox (recommended for slow/arcing/large projectiles).");
     }
     if(behavior==1||behavior==2||behavior==4) {
         SettingRow("Release to fire");changed|=UICheckbox("##releaseToFire",&t.releaseToFire);

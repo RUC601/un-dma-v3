@@ -34,6 +34,7 @@ inline Value TuningJson(const AimBehaviorTuning& t,Allocator& a) {
     Put(v,"flick2ndInnerMethod",t.flick2ndInnerMethod,a);
     Put(v,"baseSpeed",t.baseSpeed,a);
     Put(v,"moveSplitEnabled",t.moveSplitEnabled,a);
+    Put(v,"stopAssistInsideHitbox",t.stopAssistInsideHitbox,a);
     Put(v,"moveSplitMaxPixels",t.moveSplitMaxPixels,a);
     Put(v,"moveSplitDelayUs",t.moveSplitDelayUs,a);
     Put(v,"releaseToFire",t.releaseToFire,a);
@@ -127,6 +128,7 @@ inline AimBehaviorTuning ReadTuning(const Value& v,
     Read(v,"flick2ndInnerMethod",t.flick2ndInnerMethod);
     Read(v,"baseSpeed",t.baseSpeed);
     Read(v,"moveSplitEnabled",t.moveSplitEnabled);
+    Read(v,"stopAssistInsideHitbox",t.stopAssistInsideHitbox);
     Read(v,"moveSplitMaxPixels",t.moveSplitMaxPixels);
     Read(v,"moveSplitDelayUs",t.moveSplitDelayUs);
     Read(v,"releaseToFire",t.releaseToFire);

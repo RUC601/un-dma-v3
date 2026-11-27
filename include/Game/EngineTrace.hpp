@@ -37,13 +37,16 @@ struct Vec3 {
     float z = 0.0f;
 };
 
-inline constexpr uint64_t kDefaultWorldMask = 0x0690000000000002ull;
+inline constexpr uint64_t kDefaultWorldMask = 0x0690000000000017ull;
 
 struct Request {
     Vec3 start{};
     Vec3 end{};
-    // Engine layer mask. Field evidence across CN 155284N / World 155284 / Nexon 155284KB:
-    // 0x0690000000000002 is used by world traces, 0x0690000000000017 by player-filtered traces.
+    // Engine layer mask. Live CN 155284N verification (2026-11-27):
+    // 0x0690000000000017 traces static world/terrain occlusion only (visible enemies return
+    // fraction=1.0, walled enemies return wall hit with flags=0x24). 0x0690000000000002 hits
+    // actor hitboxes (hitbox=0xFFFF0004/0xFFFF0028, fraction<1.0 on visible targets) and must
+    // NOT be used for static world occlusion.
     uint64_t mask = kDefaultWorldMask;
     // Caller's scene generation. A mismatch means the answer would describe another scene.
     uint64_t sceneEpoch = 0;

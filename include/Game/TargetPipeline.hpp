@@ -183,6 +183,20 @@ inline GuidanceBoneLadder BuildGuidanceBoneLadder(AimPriority priority,
         // Always keep Chest -> Pelvis available for BodyCenter even if legacy mask was Head-only.
         ladder.PushUnique(kSkeletonBoneChest);
         ladder.PushUnique(kSkeletonBonePelvis);
+        // When Ray leak-shot fallback is enabled, walk outward deterministically from body center
+        // so occluded-torso targets still engage cleanly without nearest-bone hesitation.
+        if (allowLimbExecuteFallback) {
+            constexpr std::array<SkeletonBoneMask, 8> kCenterOutwardFallback{{
+                kSkeletonBoneNeck, kSkeletonBoneHead,
+                kSkeletonBoneShoulders, kSkeletonBoneKnees,
+                kSkeletonBoneElbows, kSkeletonBoneShanks,
+                kSkeletonBoneHands, kSkeletonBoneFeet
+            }};
+            for (SkeletonBoneMask group : kCenterOutwardFallback) {
+                if ((gatedMask & group) != 0)
+                    ladder.PushUnique(group);
+            }
+        }
         return ladder;
     }
     case AimPriority::NearestHitbox: {

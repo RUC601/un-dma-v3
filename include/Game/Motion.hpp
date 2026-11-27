@@ -247,7 +247,15 @@ inline EntityMotionEstimate EstimateEntityMotionCore(const EntityLike& entity)
     }
 
     // Tier 1: World position delta within the 4-10 ms gate is the primary velocity source.
-    if (estimate.hasWorldDeltaVelocity) {
+    // Screen out 200 Hz DMA quantization against ~60 Hz game position steps: when reported
+    // velocity is valid and moving, reject fake-zero frames and >2x tick-bunching spikes so
+    // Tier 2 jump-screened reported velocity prevents violent slow-projectile lead jitter.
+    const bool worldDeltaQuantizedVsReported =
+        estimate.hasReportedVelocity &&
+        ((estimate.worldDeltaSpeed <= 0.05f && estimate.reportedSpeed >= 0.50f) ||
+         (estimate.reportedSpeed >= 0.50f &&
+          estimate.worldDeltaSpeed > estimate.reportedSpeed * 2.0f + 1.5f));
+    if (estimate.hasWorldDeltaVelocity && !worldDeltaQuantizedVsReported) {
         estimate.effectiveVelocity = estimate.worldDeltaVelocity;
         estimate.effectiveSpeed = estimate.worldDeltaSpeed;
         estimate.velocitySource = VelocitySource::WorldDeltaFallback;

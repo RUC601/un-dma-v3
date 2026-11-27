@@ -70,6 +70,8 @@ void RayQueryBroker::Attach(Service* service) {
         ++serviceGeneration_;
         service_ = service;
         hasService_.store(service != nullptr, std::memory_order_release);
+        consecutiveErrorWaves_.store(0, std::memory_order_release);
+        lastWaveLatencyUs_.store(0, std::memory_order_release);
         boundSceneEpoch_ = 0;
         sceneDirty_ = (service_ != nullptr && desiredSceneEpoch_ != 0);
         pendingQueue_.clear();
@@ -83,6 +85,8 @@ void RayQueryBroker::Detach() {
     ++serviceGeneration_;
     service_ = nullptr;
     hasService_.store(false, std::memory_order_release);
+    consecutiveErrorWaves_.store(0, std::memory_order_release);
+    lastWaveLatencyUs_.store(0, std::memory_order_release);
     boundSceneEpoch_ = 0;
     sceneDirty_ = false;
     pendingQueue_.clear();
@@ -302,6 +306,8 @@ void RayQueryBroker::Run() {
 
         std::vector<CacheEntry> completedEntries;
         completedEntries.reserve(batch.size());
+        size_t waveOkCount = 0;
+        size_t waveErrCount = 0;
         for (size_t i = 0; i < batch.size(); ++i) {
             const Query& q = batch[i];
             RayDecision decision{};
@@ -324,6 +330,7 @@ void RayQueryBroker::Run() {
                 decision.hitEntityId = result.entityId;
                 switch (result.status) {
                     case Status::Ok:
+                        ++waveOkCount;
                         if (std::isfinite(result.fraction) &&
                             result.fraction >= 0.0f && result.fraction <= 1.0f) {
                             decision.fraction = result.fraction;
@@ -372,6 +379,7 @@ void RayQueryBroker::Run() {
                         decision.world = RayDecisionStatus::Unavailable;
                         break;
                     case Status::Error:
+                        ++waveErrCount;
                         decision.world = RayDecisionStatus::Invalid;
                         break;
                 }
@@ -384,6 +392,13 @@ void RayQueryBroker::Run() {
             completedEntries.push_back(CacheEntry{
                 decision, q.request, q.boneId, q.segmentKind, q.segmentIndex
             });
+        }
+
+        lastWaveLatencyUs_.store(wallLatencyUs, std::memory_order_release);
+        if (waveOkCount > 0) {
+            consecutiveErrorWaves_.store(0, std::memory_order_release);
+        } else if (waveErrCount > 0) {
+            consecutiveErrorWaves_.fetch_add(1, std::memory_order_acq_rel);
         }
 
         {

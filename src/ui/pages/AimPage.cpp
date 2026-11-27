@@ -447,7 +447,7 @@ void UI::AimbotPage() {
         ImGui::SetNextWindowSize(ImVec2(650,650),ImGuiCond_FirstUseEver);
         if(ImGui::BeginPopup("##MotionEditor",ImGuiWindowFlags_NoSavedSettings)) {
             if(ImGui::Button(L("Restore mode defaults"))) {OW::Config::ResolveHeroBehaviorMode(activePreset,true);presetChanged=true;}
-            presetChanged|=UI::BehaviorTuningEditor(activePreset,activePreset.aimBehavior,false);
+            presetChanged|=UI::BehaviorTuningEditor(activePreset,activePreset.aimBehavior,true);
             presetChanged|=UI::AimPlanEditor::Motion(activePreset.aimPlan.motion,false);
             if(activePreset.aimBehavior==OW::Config::kAimBehaviorFlick2nd && activePreset.flick2ndInnerMethod>=0 &&
                 activePreset.flick2ndInnerMethod!=activePreset.aimMethod) {

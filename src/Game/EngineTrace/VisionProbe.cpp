@@ -56,6 +56,7 @@ bool VisionProbe::Start(uint64_t sceneEpoch) {
         config.instructionLimit = config_.instructionLimit;
         config.timeoutUs = config_.timeoutUs;
         config.refreshTouchedPages = config_.refreshTouchedPages;
+        config.skipCodeHook = config_.skipCodeHook;
 
         auto backend = std::make_unique<UnicornBackend>(config);
         backend->SetPageStore(store_);

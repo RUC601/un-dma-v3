@@ -281,7 +281,8 @@ bool UnicornBackend::EnsurePage(uint64_t page) {
             pageBytes_.emplace(page, bytes);
         }
     }
-    if (uc_mem_map(reinterpret_cast<uc_engine*>(uc_), page, kPage, UC_PROT_ALL) != UC_ERR_OK) {
+    const uint32_t pagePerms = InImage(page) ? UC_PROT_ALL : (UC_PROT_READ | UC_PROT_WRITE);
+    if (uc_mem_map(reinterpret_cast<uc_engine*>(uc_), page, kPage, pagePerms) != UC_ERR_OK) {
         return false;
     }
     if (uc_mem_write(reinterpret_cast<uc_engine*>(uc_), page, bytes.data(), kPage) != UC_ERR_OK) {

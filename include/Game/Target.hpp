@@ -139,6 +139,47 @@ namespace OW {
         return enabled;
     }
 
+    // Sample visibility on every hot scatter batch (8B/entity, zero extra round trips)
+    // so triggerbot/aimbot do not sit behind a 16-31ms corner-peek visibility blind spot.
+    inline bool HotVisibilityEveryCycleEnabled()
+    {
+        static const bool enabled =
+            ReadPresentEnvFlagState("UN_DMA_HOT_VISIBILITY_EVERY_CYCLE", 1) == 1;
+        return enabled;
+    }
+
+    // Compensate triggerbot hit tests for short DMA-to-consume sample age using live velocity.
+    inline bool TriggerSampleCompensationEnabled()
+    {
+        static const bool enabled =
+            ReadPresentEnvFlagState("UN_DMA_TRIGGER_SAMPLE_COMP", 1) == 1;
+        return enabled;
+    }
+
+    inline Vector3 TriggerSampleAgeDisplacement(const c_entity& entity, uint64_t nowUs) noexcept
+    {
+        if (!TriggerSampleCompensationEnabled() || entity.sample_time_us == 0 || nowUs <= entity.sample_time_us)
+            return {};
+        const Vector3 velocity = entity.velocity;
+        if (!std::isfinite(velocity.X) || !std::isfinite(velocity.Y) || !std::isfinite(velocity.Z))
+            return {};
+        const float speed = velocity.Size();
+        if (!std::isfinite(speed) || speed <= 0.05f || speed > 35.0f)
+            return {};
+        float leadSeconds = static_cast<float>(nowUs - entity.sample_time_us) / 1000000.0f;
+        leadSeconds = std::clamp(leadSeconds, 0.0f, 0.025f);
+        if (leadSeconds <= 0.0f)
+            return {};
+        Vector3 offset = velocity * leadSeconds;
+        constexpr float kMaxTriggerSampleOffsetMeters = 0.20f;
+        const float offsetLength = offset.Size();
+        if (!std::isfinite(offsetLength) || offsetLength <= 0.0001f)
+            return {};
+        if (offsetLength > kMaxTriggerSampleOffsetMeters)
+            offset = offset * (kMaxTriggerSampleOffsetMeters / offsetLength);
+        return offset;
+    }
+
     inline DWORD PresentEntityHz()
     {
         static const DWORD hz = ReadPresentEnvDword("UN_DMA_ENTITY_PRESENT_HZ", 120, 30, 144);
@@ -392,7 +433,7 @@ namespace OW {
         };
 
         struct VelocitySample {
-            Vector3 velocity{}, acceleration{};
+            Vector3 velocity{}, filteredVelocity{}, acceleration{};
             uint64_t tick = 0;
             bool initialized = false;
         };
@@ -978,8 +1019,10 @@ namespace OW {
 
                 if (selectionMode == 1 && boneId == preferredBoneId)
                     score *= 0.35f;
+                else if (boneId == BONE_CHEST || boneId == BONE_PELVIS)
+                    score *= 0.90f;
                 if (boneId == retainedBoneId)
-                    score *= 0.82f;
+                    score *= 0.72f;
                 if (!found || score < bestScore) {
                     found = true;
                     bestScore = score;
@@ -991,6 +1034,79 @@ namespace OW {
             if (found && outScore)
                 *outScore = bestScore;
             return found;
+        }
+
+        struct OrderedSkeletonPoint {
+            int boneId = Plexies20260609::kUnusedRenderSkeletonBone;
+            Vector3 point{};
+            float score = (std::numeric_limits<float>::max)();
+        };
+
+        // Collects all valid skeleton bone points inside rawMask ordered closest-first (deduplicated
+        // by boneId) so Ray mode NearestHitbox can fall back cleanly to exposed bones when the
+        // nearest bone is occluded behind cover.
+        inline std::size_t CollectOrderedSelectedSkeletonPoints(
+            const c_entity& entity,
+            SkeletonBoneMask rawMask,
+            const FovRuntimeContext& fovContext,
+            const Matrix& view,
+            const Vector2& crosshair,
+            std::array<OrderedSkeletonPoint, 8>& outPoints,
+            int preferredBoneId = Plexies20260609::kUnusedRenderSkeletonBone,
+            int selectionMode = 2,
+            int retainedBoneId = Plexies20260609::kUnusedRenderSkeletonBone) {
+            const SkeletonBoneMask mask = NormalizeSkeletonBoneMask(rawMask);
+            std::array<OrderedSkeletonPoint, Plexies20260609::kSkeletonSlotCount> all{};
+            std::size_t allCount = 0;
+
+            for (std::size_t renderSlot = 0;
+                 renderSlot < kSkeletonBoneGroupForRenderSlot.size();
+                 ++renderSlot) {
+                if (!SkeletonBoneMaskIncludesRenderSlot(mask, renderSlot))
+                    continue;
+
+                int boneId = Plexies20260609::kUnusedRenderSkeletonBone;
+                Vector3 point{};
+                if (!TryResolveSkeletonBonePoint(entity, renderSlot, boneId, point))
+                    continue;
+
+                float score = fovContext.valid
+                    ? TargetingDetail::FovScoreDeg(fovContext, point)
+                    : crosshair.Distance(view.WorldToScreen(point));
+                if (!std::isfinite(score))
+                    continue;
+
+                if (selectionMode == 1 && boneId == preferredBoneId)
+                    score *= 0.35f;
+                else if (boneId == BONE_CHEST || boneId == BONE_PELVIS)
+                    score *= 0.90f;
+                if (boneId == retainedBoneId)
+                    score *= 0.72f;
+
+                bool updated = false;
+                for (std::size_t k = 0; k < allCount; ++k) {
+                    if (all[k].boneId == boneId) {
+                        if (score < all[k].score) {
+                            all[k].point = point;
+                            all[k].score = score;
+                        }
+                        updated = true;
+                        break;
+                    }
+                }
+                if (!updated && allCount < all.size()) {
+                    all[allCount++] = OrderedSkeletonPoint{boneId, point, score};
+                }
+            }
+
+            std::sort(all.begin(), all.begin() + static_cast<std::ptrdiff_t>(allCount),
+                [](const OrderedSkeletonPoint& a, const OrderedSkeletonPoint& b) {
+                    return a.score < b.score;
+                });
+            const std::size_t outCount = (std::min)(allCount, outPoints.size());
+            for (std::size_t i = 0; i < outCount; ++i)
+                outPoints[i] = all[i];
+            return outCount;
         }
 
         inline bool ComputeAngularErrorDeg(const FovRuntimeContext& fovContext,
@@ -1955,10 +2071,9 @@ namespace OW {
                 for (size_t index = 0; index < sample.shapes.size() && index < sample.poses.size(); ++index) {
                     const auto& source = sample.shapes[index];
                     const auto& pose = sample.poses[index];
-                    if (source.boneId != boneId || !pose.Valid() ||
+                    if (!NativeShapeMatchesBoneId(source.boneId, boneId, source.critical, requireExplicitCritical) ||
+                        !pose.Valid() ||
                         !std::isfinite(source.radius) || source.radius <= 0.0f) continue;
-                    if (requireExplicitCritical &&
-                        source.critical != ModelShapes::CriticalState::Critical) continue;
                     const float poseScale = (std::min)({pose.scale[0], pose.scale[1], pose.scale[2]});
                     if (!std::isfinite(poseScale) || poseScale <= 0.0f) continue;
                     V3Raycast::WorldShape shape{};
@@ -2629,6 +2744,38 @@ namespace OW {
             }
         };
 
+        // Appends unresolved (missing/stale) chord queries into dst without clearing earlier
+        // urgent fallback probes in the same tick so multiple occluded-fallback bones can be
+        // traced concurrently in a single 6-engine VisionProbe wave.
+        auto appendUrgentChordGroup = [&](TrajectoryRay::RayChordGroup& dst,
+                                          const c_entity& ent,
+                                          uint64_t entKey,
+                                          int bId,
+                                          const TrajectoryRay::ParabolicChordPlan& plan,
+                                          uint32_t maxAgeMs) {
+            const uint8_t nSeg = (std::min<uint8_t>)(
+                plan.segmentCount,
+                static_cast<uint8_t>(TrajectoryRay::kMaxParabolicSegments));
+            const RaySegmentKind segKind = nSeg > 1
+                ? RaySegmentKind::ParabolicChord : RaySegmentKind::Direct;
+            for (uint8_t s = 0; s < nSeg && dst.count < TrajectoryRay::kMaxParabolicSegments; ++s) {
+                const auto& [segStart, segEnd] = plan.segments[s];
+                EngineTrace::Request req{};
+                req.start = {segStart.X, segStart.Y, segStart.Z};
+                req.end = {segEnd.X, segEnd.Y, segEnd.Z};
+                req.mask = worldRayMask;
+                req.sceneEpoch = liveRayScene;
+                const auto cached = RayRuntime::Broker().Latest(
+                    req, frame.sequence, ent.connection_epoch, liveRayScene,
+                    entKey, ent.actor_generation, bId, maxAgeMs,
+                    EngineTrace::RayQueryBroker::kDefaultMaxEndpointDriftMeters,
+                    segKind, s);
+                if (!cached.has_value() || cached->IsObservationVacuum()) {
+                    dst.PushUrgent(makeBrokerQuery(ent, entKey, bId, segStart, segEnd, segKind, s));
+                }
+            }
+        };
+
         size_t stage2RankIdx = 0;
         for (const size_t stage1Idx : stage2Order) {
             const auto& ranked = stage1[stage1Idx];
@@ -2670,13 +2817,20 @@ namespace OW {
             const bool allowLimbExecute = (aimPriority == AimPriority::HeadThenBody) &&
                 entity.Team && std::isfinite(entity.PlayerHealth) &&
                 entity.PlayerHealth > 0.0f && entity.PlayerHealth <= 45.0f;
+            // In Ray mode, user-enabled non-core bones serve as final leak-shot fallbacks strictly
+            // after torso core / body-center bones are verified occluded behind cover.
+            const bool allowRayLimbLeakFallback = hybridLiveWorldGate && !contourFallback &&
+                ((aimPriority == AimPriority::HeadThenBody &&
+                  (rawCandidateMask & TargetPipeline::kLimbBoneMask) != 0) ||
+                 (aimPriority == AimPriority::BodyCenter &&
+                  (rawCandidateMask & ~(kSkeletonBoneChest | kSkeletonBonePelvis)) != 0));
 
             const TargetPipeline::GuidanceBoneLadder ladder = TargetPipeline::BuildGuidanceBoneLadder(
                 aimPriority,
                 rawCandidateMask,
                 ranked.s0.coarseDistance,
                 Config::View_aimbotMaxHead(),
-                allowLimbExecute);
+                allowLimbExecute || allowRayLimbLeakFallback);
             if (ladder.Empty())
                 continue;
 
@@ -2685,9 +2839,29 @@ namespace OW {
                 : Plexies20260609::kUnusedRenderSkeletonBone;
             const bool preferExplicitCritical =
                 aimPriority == AimPriority::HeadOnly || aimPriority == AimPriority::HeadThenBody;
+            std::array<TargetingDetail::OrderedSkeletonPoint, 8> rayNearestBones{};
+            size_t rayNearestBoneCount = 0;
+            if (ladder.nearestMode && hybridLiveWorldGate && !contourFallback) {
+                rayNearestBoneCount = TargetingDetail::CollectOrderedSelectedSkeletonPoints(
+                    entity,
+                    ladder.nearestMask,
+                    fovContext,
+                    aimViewMatrix,
+                    CrossHair,
+                    rayNearestBones,
+                    AimBoneToSkeletonBoneId(preferredBone),
+                    boneSelectionMode == 1 && entity.velocity.Size() > 2.0f ? 1 : 2,
+                    retainedBoneId);
+                if (rayNearestBoneCount == 0)
+                    continue;
+            }
             // Enforce the guidance ladder for BOTH standard and contour fallback (Finding #6):
             // BodyCenter and HeadThenBody torso cutoff apply to contour as well.
-            const size_t attemptCount = ladder.nearestMode ? 1 : ladder.count;
+            // In Ray mode NearestHitbox, iterate ordered bones so occluded nearest bones fall back
+            // to exposed bones inside nearestMask (leak-shot support).
+            const size_t attemptCount = ladder.nearestMode
+                ? (rayNearestBoneCount > 0 ? rayNearestBoneCount : 1)
+                : ladder.count;
             // Tighten cache maxAge for fast-moving targets (§6.2: 50-65 ms vs 100 ms default).
             const uint32_t candidateRayMaxAgeMs =
                 TargetPipeline::ResolveCandidateRayMaxAgeMs(entity.velocity.Size());
@@ -2703,6 +2877,7 @@ namespace OW {
 
             bool foundEngageableForCandidate = false;
             bool sawOccludedForCandidate = false;
+            bool sawUnresolvedFallbackForCandidate = false;
             bool hasPreAimSeed = false;
             int preAimSeedBoneId = BONE_HEAD;
             Vector3 preAimSeedRoot{};
@@ -2732,7 +2907,10 @@ namespace OW {
                     candidateBoneId = contourObservation.boneId;
                     rootPosition = contourObservation.aimWorld;
                 } else if (ladder.nearestMode) {
-                    if (!TargetingDetail::TrySelectClosestSelectedSkeletonPoint(
+                    if (rayNearestBoneCount > 0) {
+                        candidateBoneId = rayNearestBones[step].boneId;
+                        rootPosition = rayNearestBones[step].point;
+                    } else if (!TargetingDetail::TrySelectClosestSelectedSkeletonPoint(
                             entity,
                             ladder.nearestMask,
                             fovContext,
@@ -2978,12 +3156,18 @@ namespace OW {
                                                entity, candidateKey, candidateBoneId, chordPlan,
                                                candidateRayMaxAgeMs, true);
                         } else if (step > 0) {
-                            if (stepUnresolved && !top1FallbackHasUnresolved) {
-                                populateChordGroup(batchInput.top1FallbackOrWarmup,
-                                                   entity, candidateKey, candidateBoneId, chordPlan,
-                                                   candidateRayMaxAgeMs, false);
-                                if (batchInput.top1FallbackOrWarmup.count > 0)
-                                    top1FallbackHasUnresolved = true;
+                            if (stepUnresolved) {
+                                if (!top1FallbackHasUnresolved) {
+                                    populateChordGroup(batchInput.top1FallbackOrWarmup,
+                                                       entity, candidateKey, candidateBoneId, chordPlan,
+                                                       candidateRayMaxAgeMs, false);
+                                    if (batchInput.top1FallbackOrWarmup.count > 0)
+                                        top1FallbackHasUnresolved = true;
+                                } else {
+                                    appendUrgentChordGroup(batchInput.top1FallbackOrWarmup,
+                                                           entity, candidateKey, candidateBoneId, chordPlan,
+                                                           candidateRayMaxAgeMs);
+                                }
                             } else if (batchInput.top1FallbackOrWarmup.count == 0) {
                                 populateChordGroup(batchInput.top1FallbackOrWarmup,
                                                    entity, candidateKey, candidateBoneId, chordPlan,
@@ -2996,12 +3180,18 @@ namespace OW {
                                                entity, candidateKey, candidateBoneId, chordPlan,
                                                candidateRayMaxAgeMs, true);
                         } else if (step > 0) {
-                            if (stepUnresolved && !top2FallbackHasUnresolved) {
-                                populateChordGroup(batchInput.top2Fallback,
-                                                   entity, candidateKey, candidateBoneId, chordPlan,
-                                                   candidateRayMaxAgeMs, false);
-                                if (batchInput.top2Fallback.count > 0)
-                                    top2FallbackHasUnresolved = true;
+                            if (stepUnresolved) {
+                                if (!top2FallbackHasUnresolved) {
+                                    populateChordGroup(batchInput.top2Fallback,
+                                                       entity, candidateKey, candidateBoneId, chordPlan,
+                                                       candidateRayMaxAgeMs, false);
+                                    if (batchInput.top2Fallback.count > 0)
+                                        top2FallbackHasUnresolved = true;
+                                } else {
+                                    appendUrgentChordGroup(batchInput.top2Fallback,
+                                                           entity, candidateKey, candidateBoneId, chordPlan,
+                                                           candidateRayMaxAgeMs);
+                                }
                             } else if (batchInput.top2Fallback.count == 0) {
                                 populateChordGroup(batchInput.top2Fallback,
                                                    entity, candidateKey, candidateBoneId, chordPlan,
@@ -3025,10 +3215,10 @@ namespace OW {
                 }
 
                 // If step 0 only entered this block via IdleHold PreAim window (failed shrunk Engage FOV),
-                // record occlusion for PreAim and do NOT admit as Engageable!
+                // record verified world occlusion for PreAim and do NOT admit as Engageable.
+                // Never treat a cold-cache Unknown vacuum as occluded before the ray completes.
                 if (!passesEngageFov) {
-                    if (rayDecision.world == RayDecisionStatus::Occluded ||
-                        (hybridLiveWorldGate && rayDecision.IsObservationVacuum() && !entity.Vis)) {
+                    if (rayDecision.world == RayDecisionStatus::Occluded) {
                         sawOccludedForCandidate = true;
                     }
                     break;
@@ -3114,9 +3304,15 @@ namespace OW {
                             vacElapsedMs, RayDecision::kDefaultTrackingVacuumGraceMs, candidateRayMaxAgeMs)) {
                         allowedAsEngageable = true;
                         admittedViaVacuumGrace = true;
-                    } else if (!entity.Vis) {
-                        sawOccludedForCandidate = true;
                     }
+                    if (hybridLiveWorldGate && !contourFallback && step > 0 &&
+                        rayDecision.IsObservationVacuum()) {
+                        sawUnresolvedFallbackForCandidate = true;
+                    }
+                    // Do NOT set sawOccludedForCandidate on a cold-cache observation vacuum
+                    // (Unknown/Stale): let the queued bone ray return a real Clear/Occluded verdict
+                    // instead of prematurely entering PreAim, arming ReactionDelayGate, and
+                    // starving bone rays with EdgeFanBorrow.
                 } else if (!allowedAsEngageable && rayDecision.world == RayDecisionStatus::Occluded) {
                     sawOccludedForCandidate = true;
                 }
@@ -3136,11 +3332,14 @@ namespace OW {
                         rayDecision.fraction,
                         static_cast<unsigned>(chordPlan.segmentCount),
                         rayDecision.ageMs, rayDecision.latencyUs);
-                    // In Hybrid mode, if the top ladder bone is occluded (by world or partial barrier),
-                    // try the next torso bone (§1.2, §2).
-                    if (hybridLiveWorldGate && !contourFallback && !ladder.nearestMode &&
+                    // In Ray mode, if this bone is occluded (world or partial barrier) or still
+                    // pending its async ray verdict, continue walking the remaining fallback bones
+                    // so exposed leak-shot bones are either engaged immediately (if cached Clear)
+                    // or probed concurrently in the same 6-engine VisionProbe wave.
+                    if (hybridLiveWorldGate && !contourFallback &&
                         (rayDecision.world == RayDecisionStatus::Occluded ||
-                         rayDecision.BarrierOccluded()) &&
+                         rayDecision.BarrierOccluded() ||
+                         rayDecision.IsObservationVacuum()) &&
                         step + 1 < attemptCount) {
                         continue;
                     }
@@ -3366,7 +3565,11 @@ namespace OW {
             // §5.1-§5.4: Occluded candidate evaluation for PreAim / ReactionDelayGate memory.
             // Note (Decision #4, §8.1): Barrier-blocked WaitBarrierDrop holds PreAim without
             // arming wall-peek ReactionDelayGate so shield drop re-engages immediately.
-            if (!foundEngageableForCandidate && sawOccludedForCandidate) {
+            // In Ray mode, do not enter a NEW PreAim or arm ReactionDelayGate while fallback
+            // leak-shot bones for this candidate are still pending their first 5-6ms ray wave.
+            const bool waitingForRayLeakFallback = hybridLiveWorldGate && !contourFallback &&
+                !isTrackedPreAimSnapshot && sawUnresolvedFallbackForCandidate;
+            if (!foundEngageableForCandidate && sawOccludedForCandidate && !waitingForRayLeakFallback) {
                 if (preAimSeedHitKind != TraceHitKind::Barrier) {
                     std::lock_guard<std::mutex> preAimLock(TargetingDetail::RuntimePreAimMutex());
                     TargetingDetail::RuntimeReactionDelayGateStorage()
@@ -3649,7 +3852,10 @@ namespace OW {
                     hasParkPoint = tracker.HasParkPoint();
                     parkPoint = tracker.ParkPoint();
                     phase = tracker.Phase();
-                    if (tracker.NeedsEdgeFanPass(isRefinePass, fanLo, fanHi)) {
+                    const bool hasUrgentBoneProbe =
+                        batchInput.top1Primary.urgentCount > 0 ||
+                        batchInput.top1FallbackOrWarmup.urgentCount > 0;
+                    if (!hasUrgentBoneProbe && tracker.NeedsEdgeFanPass(isRefinePass, fanLo, fanHi)) {
                         const auto nextFanRays = PreAim::BuildEdgeFanRays(
                             fovContext.camera, tracker.FanAnchorTargetPos(), tracker.LateralDir(),
                             fanLo, fanHi, isRefinePass);
@@ -3955,6 +4161,7 @@ namespace OW {
         const ProjectileRuntimeSpec projectileSpec =
             TargetingDetail::ResolveProjectileRuntimeSpec(weaponSpec, localEntity, secondary);
         const float hitboxScale = secondary ? Config::hitbox2 : Config::View_hitbox();
+        const uint64_t triggerNowUs = RuntimeTrace::NowUs();
         const int activeVisibilityMode = UI::Preferences::ActiveVisibilityMode();
         const bool globalVisionMode =
             activeVisibilityMode == static_cast<int>(UI::Preferences::VisibilityMode::Vision);
@@ -4003,6 +4210,7 @@ namespace OW {
                     !entity.SameTeamAs(localEntity)) {
                     continue;
                 }
+                const Vector3 sampleDisplacement = TriggerSampleAgeDisplacement(entity, triggerNowUs);
 
                 const Vector3 distanceAnchor = !TargetingDetail::IsZeroVector(entity.chest_pos)
                     ? entity.chest_pos
@@ -4052,7 +4260,7 @@ namespace OW {
                         projectileSpec,
                         resolvedPrediction,
                         secondary);
-                    const Vector3 aimPoint = lead.finalAimPoint;
+                    const Vector3 aimPoint = lead.finalAimPoint + sampleDisplacement;
                     if (TargetingDetail::IsZeroVector(aimPoint) ||
                         !TargetingDetail::IsFiniteVector(aimPoint))
                         continue;
@@ -4084,7 +4292,7 @@ namespace OW {
                         nativeInput = MakeNativeHitWindowInput(lead, weaponSpec->aimClass, hitboxScale);
                         // Use the crosshair direction and preserve range for projectile flight time.
                         nativeScore = NativeHitWindowScore(entity, boneId, now, fovContext.camera,
-                            fovContext.forward * distance, nativeInput);
+                            fovContext.forward * distance, nativeInput, sampleDisplacement);
                     }
                     if (nativeUsable && !nativeScore)
                         continue;

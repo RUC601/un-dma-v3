@@ -226,8 +226,42 @@ Vector3 NativeBoneReference(const c_entity& entity, int boneId)
     case BONE_HEAD: return entity.head_pos;
     case BONE_NECK: return entity.neck_pos;
     case BONE_CHEST: return entity.chest_pos;
+    case BONE_PELVIS:
+        if (entity.skeleton_bone_valid.size() > 3 && entity.skeleton_bone_valid[3])
+            return entity.skeleton_bones[3];
+        return entity.pos;
     default: return entity.pos;
     }
+}
+
+// Fallback index for exotic/future hero rigs when no shape matches NativeShapeMatchesBoneId:
+// selects the single valid native shape closest to NativeBoneReference within 0.55 m.
+std::optional<size_t> FindClosestFallbackNativeShapeIndex(const c_entity& entity, int boneId)
+{
+    const auto& sample = entity.native_hitboxes;
+    const Vector3 reference = NativeBoneReference(entity, boneId);
+    if (!IsFiniteVector(reference) || IsZeroOffset(reference))
+        return std::nullopt;
+    constexpr float kMaxFallbackDistanceM = 0.55f;
+    std::optional<size_t> bestIndex;
+    float bestDistance = kMaxFallbackDistanceM;
+    for (size_t i = 0; i < sample.shapes.size() && i < sample.poses.size(); ++i) {
+        const auto& shape = sample.shapes[i];
+        const auto& pose = sample.poses[i];
+        if (!std::isfinite(shape.radius) || shape.radius <= 0.0f || !pose.Valid())
+            continue;
+        if (boneId != BONE_HEAD && shape.critical == ModelShapes::CriticalState::Critical)
+            continue;
+        const Vector3 center = NativeShapeCenter(entity, shape, pose);
+        if (!IsFiniteVector(center))
+            continue;
+        const float dist = reference.DistTo(center);
+        if (std::isfinite(dist) && dist < bestDistance) {
+            bestDistance = dist;
+            bestIndex = i;
+        }
+    }
+    return bestIndex;
 }
 
 } // namespace
@@ -358,7 +392,8 @@ float ResolveEffectiveHitWindow(const c_entity& entity,
         float nativeRadius = 0.0f;
         for (size_t index = 0; index < entity.native_hitboxes.shapes.size(); ++index) {
             const auto& shape = entity.native_hitboxes.shapes[index];
-            if (shape.boneId != boneId || index >= entity.native_hitboxes.poses.size())
+            if (!NativeShapeMatchesBoneId(shape.boneId, boneId, shape.critical, false) ||
+                index >= entity.native_hitboxes.poses.size())
                 continue;
             const Vector3 center = NativeShapeCenter(entity, shape, entity.native_hitboxes.poses[index]);
             const float distance = IsFiniteVector(reference) && IsFiniteVector(center)
@@ -426,7 +461,8 @@ bool TryResolveNativeHitboxCenter(const c_entity& entity, int boneId, Vector3& o
     float nearestDistance = (std::numeric_limits<float>::max)();
     for (size_t index = 0; index < entity.native_hitboxes.shapes.size(); ++index) {
         const auto& shape = entity.native_hitboxes.shapes[index];
-        if (shape.boneId != boneId || index >= entity.native_hitboxes.poses.size())
+        if (!NativeShapeMatchesBoneId(shape.boneId, boneId, shape.critical, false) ||
+            index >= entity.native_hitboxes.poses.size())
             continue;
         const auto& pose = entity.native_hitboxes.poses[index];
         const Vector3 center = NativeShapeCenter(entity, shape, pose);
@@ -459,13 +495,12 @@ std::optional<float> NativeHitWindowScore(const c_entity& entity, int boneId, ui
     const float worldScale = (std::min)({sample.world.record.scale[0], sample.world.record.scale[1],
         sample.world.record.scale[2]});
     std::optional<float> score;
-    for (size_t i = 0; i < sample.shapes.size(); ++i) {
+    bool matchedAnyShape = false;
+    auto evaluateShape = [&](size_t i) {
         const auto& shape = sample.shapes[i];
         const auto& pose = sample.poses[i];
-        if (shape.boneId != boneId || !std::isfinite(shape.radius) || shape.radius <= 0.0f || !pose.Valid())
-            continue;
-        if (requireExplicitCritical && shape.critical != ModelShapes::CriticalState::Critical)
-            continue;
+        if (!std::isfinite(shape.radius) || shape.radius <= 0.0f || !pose.Valid())
+            return;
         const Vector3 a = sample.world.TransformPoint(ModelShapes::Transform(shape.a, pose)) + relativeAnchor;
         const Vector3 b = sample.world.TransformPoint(ModelShapes::Transform(shape.b, pose)) + relativeAnchor;
         // Minimum axis scale gives an inscribed radius for non-uniform transforms.
@@ -473,10 +508,21 @@ std::optional<float> NativeHitWindowScore(const c_entity& entity, int boneId, ui
         const float radius = EffectiveExpandedHitboxRadius(
             shape.radius * poseScale * worldScale, projectileRadius, hitboxScalePercent);
         if (!IsFiniteVector(a) || !IsFiniteVector(b) || !std::isfinite(radius) || radius <= 0.0f)
-            continue;
+            return;
         const float normalized = std::sqrt(RayAxisDistanceSquared(a, b, unitRay)) / radius;
         if (std::isfinite(normalized) && (!score || normalized < *score))
             score = normalized;
+    };
+    for (size_t i = 0; i < sample.shapes.size() && i < sample.poses.size(); ++i) {
+        const auto& shape = sample.shapes[i];
+        if (!NativeShapeMatchesBoneId(shape.boneId, boneId, shape.critical, requireExplicitCritical))
+            continue;
+        matchedAnyShape = true;
+        evaluateShape(i);
+    }
+    if (!matchedAnyShape && !requireExplicitCritical) {
+        if (const auto fallbackIdx = FindClosestFallbackNativeShapeIndex(entity, boneId))
+            evaluateShape(*fallbackIdx);
     }
     return score;
 }
@@ -531,20 +577,19 @@ std::optional<float> NativeHitWindowScore(const c_entity& entity, int boneId, ui
         sample.world.record.scale[2]});
     std::optional<float> bestHitTime;
     std::optional<float> bestHitScore;
-    for (size_t i = 0; i < sample.shapes.size(); ++i) {
+    bool matchedAnyShape = false;
+    auto evaluateTrajectoryShape = [&](size_t i) {
         const auto& shape = sample.shapes[i];
         const auto& pose = sample.poses[i];
-        if (shape.boneId != boneId || !std::isfinite(shape.radius) || shape.radius <= 0.0f || !pose.Valid())
-            continue;
-        if (requireExplicitCritical && shape.critical != ModelShapes::CriticalState::Critical)
-            continue;
+        if (!std::isfinite(shape.radius) || shape.radius <= 0.0f || !pose.Valid())
+            return;
         const Vector3 a = sample.world.TransformPoint(ModelShapes::Transform(shape.a, pose)) + relativeAnchor;
         const Vector3 b = sample.world.TransformPoint(ModelShapes::Transform(shape.b, pose)) + relativeAnchor;
         const float poseScale = (std::min)({pose.scale[0], pose.scale[1], pose.scale[2]});
         const float radius = EffectiveExpandedHitboxRadius(
             shape.radius * poseScale * worldScale, input.projectileRadius, input.hitboxScalePercent);
         if (!IsFiniteVector(a) || !IsFiniteVector(b) || !std::isfinite(radius) || radius <= 0.0f)
-            continue;
+            return;
         float hitTime = 0.0f;
         if (ContinuousTrajectoryIntersectsHitboxInternal(trajectory, {a, b, radius}, 0.0f, &hitTime)) {
             const Vector3 impact = TrajectoryPosition(trajectory, hitTime);
@@ -554,6 +599,17 @@ std::optional<float> NativeHitWindowScore(const c_entity& entity, int boneId, ui
                 bestHitScore = score;
             }
         }
+    };
+    for (size_t i = 0; i < sample.shapes.size() && i < sample.poses.size(); ++i) {
+        const auto& shape = sample.shapes[i];
+        if (!NativeShapeMatchesBoneId(shape.boneId, boneId, shape.critical, requireExplicitCritical))
+            continue;
+        matchedAnyShape = true;
+        evaluateTrajectoryShape(i);
+    }
+    if (!matchedAnyShape && !requireExplicitCritical) {
+        if (const auto fallbackIdx = FindClosestFallbackNativeShapeIndex(entity, boneId))
+            evaluateTrajectoryShape(*fallbackIdx);
     }
     if (!bestHitTime || !bestHitScore)
         return std::nullopt;

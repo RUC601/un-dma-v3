@@ -15,25 +15,53 @@
             const uint64_t now = entity.sample_time_us ? entity.sample_time_us : uint64_t(entity.render_sample_tick_ms)*1000;
             const float safeSpeed = (std::max)(projectileSpeed, 1.0f);
             const float leadTime = std::clamp(distance / safeSpeed, 0.0f, 1.0f);
-            Vector3 adjusted = baseVelocity;
 
             std::lock_guard<std::mutex> lock(velocity_history_mutex);
             if (velocity_history.size() > 256) velocity_history.clear();
 
             VelocitySample& sample = velocity_history[key];
-            if (sample.initialized && now > sample.tick) {
+            constexpr float kVelocityTauSec = 0.030f;
+            constexpr float kAccelerationTauSec = 0.080f;
+            constexpr float kMaxReasonableAccelMps2 = 28.0f;
+            constexpr float kAccelDeadbandMps2 = 1.0f;
+            constexpr float kStaleGapSec = 0.25f;
+
+            if (!sample.initialized) {
+                sample.velocity = baseVelocity;
+                sample.filteredVelocity = baseVelocity;
+                sample.acceleration = Vector3{};
+                sample.tick = now;
+                sample.initialized = true;
+                return baseVelocity;
+            }
+
+            if (now > sample.tick) {
                 const float dt = static_cast<float>(now - sample.tick) / 1000000.0f;
-                if (dt > 0.001f && dt < 0.5f) {
-                    Vector3 acceleration = (baseVelocity - sample.velocity) / dt;
-                    acceleration = ClampMagnitude(acceleration, 250.0f);
-                    sample.acceleration = acceleration;
+                if (dt > kStaleGapSec) {
+                    sample.velocity = baseVelocity;
+                    sample.filteredVelocity = baseVelocity;
+                    sample.acceleration = Vector3{};
+                    sample.tick = now;
+                    return baseVelocity;
+                }
+                if (dt > 0.0005f) {
+                    const float alphaVel = 1.0f - std::exp(-dt / kVelocityTauSec);
+                    const Vector3 prevFiltered = sample.filteredVelocity;
+                    const Vector3 nextFiltered = prevFiltered + (baseVelocity - prevFiltered) * alphaVel;
+                    const Vector3 rawAccel = (nextFiltered - prevFiltered) / dt;
+                    const Vector3 clampedAccel = ClampMagnitude(rawAccel, kMaxReasonableAccelMps2);
+                    const float alphaAcc = 1.0f - std::exp(-dt / kAccelerationTauSec);
+                    sample.acceleration = sample.acceleration + (clampedAccel - sample.acceleration) * alphaAcc;
+                    sample.filteredVelocity = nextFiltered;
+                    sample.velocity = baseVelocity;
+                    sample.tick = now;
                 }
             }
 
-            if(!sample.initialized || now>sample.tick) {
-                sample.velocity=baseVelocity;sample.tick=now;sample.initialized=true;
-            }
-            return adjusted + sample.acceleration * std::clamp(leadTime*0.5f,0.0f,0.25f);
+            Vector3 effectiveAccel = sample.acceleration;
+            if (effectiveAccel.get_length() < kAccelDeadbandMps2)
+                effectiveAccel = Vector3{};
+            return sample.filteredVelocity + effectiveAccel * std::clamp(leadTime * 0.25f, 0.0f, 0.10f);
         }
 
         inline ProjectileRuntimeSpec ResolveProjectileRuntimeSpec(const WeaponSpec* weapon,

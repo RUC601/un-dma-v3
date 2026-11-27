@@ -57,6 +57,7 @@ public:
         uint64_t instructionLimit = 4'000'000;
         uint64_t timeoutUs = 0;
         bool refreshTouchedPages = false;
+        bool skipCodeHook = false;
         // Product seam: resolves the level context that `setup + 0x1F0` must hold
         // (Game/Decrypt.hpp TryGetRayContext in the product). Start() uses it when
         // `context` is 0, and CheckScene() uses it to detect a map/match change.

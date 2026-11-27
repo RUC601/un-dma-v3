@@ -3,12 +3,14 @@
 #include "Game/AimPlan.hpp"
 #include "Game/IntentEngine.hpp"
 #include "Game/LeadPrediction.hpp"
+#include "Game/Motion.hpp"
 #include "Game/PreAimState.hpp"
 #include "Game/RoleUtilityPlugin.hpp"
 #include "Game/TargetHitWindow.hpp"
 #include "Game/TargetPipeline.hpp"
 #include "Game/TargetSolutionTypes.hpp"
 #include "Game/TrajectoryRayPlanner.hpp"
+#include "config/AimModeJson.hpp"
 #include "config/AimTargetMigration.hpp"
 
 #include <rapidjson/document.h>
@@ -1757,6 +1759,100 @@ bool TestPhase3VisibilityBarrierAndRolePlugins()
     return true;
 }
 
+bool TestProjectileStabilityAndHitboxStopToggle()
+{
+    // 1. 200 Hz DMA quantization screen in Motion::EstimateEntityMotion:
+    //    Fake-zero (delta=0 while reported=5.5 m/s) and >2x tick-bunching spike (16.5 m/s)
+    //    must reject quantized WorldDelta and fall through cleanly to Reported velocity.
+    {
+        // Case A: Fake-zero frame at 5ms DMA sample interval while target moves at 5.5 m/s.
+        OW::c_entity e{};
+        e.pos = OW::Vector3(10.0f, 1.0f, 5.0f);
+        e.previous_pos = OW::Vector3(10.0f, 1.0f, 5.0f);
+        e.velocity = OW::Vector3(5.5f, 0.0f, 0.0f);
+        e.sample_time_us = 1005000;
+        e.previous_sample_time_us = 1000000; // 5 ms (inside 4-10 ms Tier-1 gate)
+        e.has_previous_render_sample = true;
+        const auto est = OW::Motion::EstimateEntityMotion(e);
+        if (!est.valid ||
+            est.velocitySource != OW::Motion::VelocitySource::Reported ||
+            !Near(est.effectiveVelocity.X, 5.5f, 0.01f)) {
+            return false;
+        }
+    }
+
+    {
+        // Case B: 3x tick-bunching spike frame at 5ms DMA interval (0.0825 m / 0.005 s = 16.5 m/s vs reported 5.5 m/s).
+        OW::c_entity e{};
+        e.previous_pos = OW::Vector3(10.0f, 1.0f, 5.0f);
+        e.pos = OW::Vector3(10.0825f, 1.0f, 5.0f);
+        e.velocity = OW::Vector3(5.5f, 0.0f, 0.0f);
+        e.sample_time_us = 1015000;
+        e.previous_sample_time_us = 1010000; // 5 ms
+        e.has_previous_render_sample = true;
+        const auto est = OW::Motion::EstimateEntityMotion(e);
+        if (!est.valid ||
+            est.velocitySource != OW::Motion::VelocitySource::Reported ||
+            !Near(est.effectiveVelocity.X, 5.5f, 0.01f)) {
+            return false;
+        }
+    }
+
+    {
+        // Case C: Legitimate matched world delta (0.0275 m / 0.005 s = 5.5 m/s) still takes Tier 1.
+        OW::c_entity e{};
+        e.previous_pos = OW::Vector3(10.0f, 1.0f, 5.0f);
+        e.pos = OW::Vector3(10.0275f, 1.0f, 5.0f);
+        e.velocity = OW::Vector3(5.5f, 0.0f, 0.0f);
+        e.sample_time_us = 1020000;
+        e.previous_sample_time_us = 1015000; // 5 ms
+        e.has_previous_render_sample = true;
+        const auto est = OW::Motion::EstimateEntityMotion(e);
+        if (!est.valid ||
+            est.velocitySource != OW::Motion::VelocitySource::WorldDeltaFallback ||
+            !Near(est.effectiveVelocity.X, 5.5f, 0.05f)) {
+            return false;
+        }
+    }
+
+    // 2. stopAssistInsideHitbox JSON round-trip & backward-compatible default (true).
+    {
+        rapidjson::Document legacyDoc;
+        legacyDoc.Parse(R"({"smooth":25.0,"firePolicy":2})");
+        const auto legacyTuning = OW::Config::ModeJson::ReadTuning(
+            legacyDoc, OW::Config::AimBehaviorTuning{}, static_cast<int>(OW::AimBehaviorType::Flick));
+        if (!legacyTuning.stopAssistInsideHitbox)
+            return false;
+
+        OW::Config::AimBehaviorTuning custom{};
+        custom.stopAssistInsideHitbox = false;
+        custom.firePolicy = static_cast<int>(OW::FirePolicyType::SingleShot);
+        rapidjson::Document outDoc;
+        auto val = OW::Config::ModeJson::TuningJson(custom, outDoc.GetAllocator());
+        const auto roundTripped = OW::Config::ModeJson::ReadTuning(
+            val, OW::Config::AimBehaviorTuning{}, static_cast<int>(OW::AimBehaviorType::Flick));
+        if (roundTripped.stopAssistInsideHitbox)
+            return false;
+    }
+
+    // 3. BodyCenter Ray leak-shot fallback ladder: Chest -> Pelvis -> Neck -> Head -> Shoulders -> Knees ...
+    {
+        const auto rayBodyLadder = OW::TargetPipeline::BuildGuidanceBoneLadder(
+            OW::AimPriority::BodyCenter, OW::kSkeletonBoneAllMask, 15.0f, 100.0f, true);
+        if (rayBodyLadder.nearestMode || rayBodyLadder.count != 10 ||
+            rayBodyLadder.groups[0] != OW::kSkeletonBoneChest ||
+            rayBodyLadder.groups[1] != OW::kSkeletonBonePelvis ||
+            rayBodyLadder.groups[2] != OW::kSkeletonBoneNeck ||
+            rayBodyLadder.groups[3] != OW::kSkeletonBoneHead ||
+            rayBodyLadder.groups[4] != OW::kSkeletonBoneShoulders ||
+            rayBodyLadder.groups[5] != OW::kSkeletonBoneKnees) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 } // namespace
 
 int main()
@@ -1773,7 +1869,9 @@ int main()
         return Fail("Phase 2 PreAim theta_peek / EdgeFan / 4 exits / ReactionDelayGate");
     if (!TestPhase3VisibilityBarrierAndRolePlugins())
         return Fail("Phase 3 VisibilityPolicy / BarrierPolicy / hitNormal EdgeFan / IRoleUtilityPlugin Smart Ana");
+    if (!TestProjectileStabilityAndHitboxStopToggle())
+        return Fail("Phase C Motion 200Hz quantization screen / stopAssistInsideHitbox JSON / BodyCenter Ray fallback");
 
-    std::cout << "PASS V3TargetPipelineSelfTest: IntentEngine + Utility/FirePhase + AimPriority/HitAcceptance + TargetHitWindow + LegacyMigration + Phase2(PreAim/EdgeFan/ReactionDelayGate) + Phase3(VisibilityPolicy/Barrier/SmartAna)\n";
+    std::cout << "PASS V3TargetPipelineSelfTest: IntentEngine + Utility/FirePhase + AimPriority/HitAcceptance + TargetHitWindow + LegacyMigration + Phase2 + Phase3 + PhaseC\n";
     return EXIT_SUCCESS;
 }
