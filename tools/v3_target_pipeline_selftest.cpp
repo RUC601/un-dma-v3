@@ -4,6 +4,7 @@
 #include "Game/IntentEngine.hpp"
 #include "Game/LeadPrediction.hpp"
 #include "Game/PreAimState.hpp"
+#include "Game/RoleUtilityPlugin.hpp"
 #include "Game/TargetHitWindow.hpp"
 #include "Game/TargetPipeline.hpp"
 #include "Game/TargetSolutionTypes.hpp"
@@ -1327,6 +1328,391 @@ bool TestPreAimAndReactionDelayGate()
     return true;
 }
 
+bool TestPhase3VisibilityBarrierAndRolePlugins()
+{
+    // 1) Consolidated VisibilityPolicy resolution (§2, §6.3).
+    const int native = static_cast<int>(OW::RayDecisionPolicy::NativeOnly);
+    const int hybrid = static_cast<int>(OW::RayDecisionPolicy::Hybrid);
+    if (OW::ResolveVisibilityPolicy(native, false, OW::BarrierPolicy::IgnoreBarrier, 0) != OW::VisibilityPolicy::Lite ||
+        OW::ResolveVisibilityPolicy(native, true, OW::BarrierPolicy::IgnoreBarrier, 0) != OW::VisibilityPolicy::Vision ||
+        OW::ResolveVisibilityPolicy(hybrid, false, OW::BarrierPolicy::IgnoreBarrier, 0x55ull) != OW::VisibilityPolicy::RayWorld ||
+        OW::ResolveVisibilityPolicy(hybrid, false, OW::BarrierPolicy::WaitBarrierDrop, 0) != OW::VisibilityPolicy::RayWorld ||
+        OW::ResolveVisibilityPolicy(hybrid, false, OW::BarrierPolicy::WaitBarrierDrop, 0x55ull) != OW::VisibilityPolicy::RayWorldAndBarrier) {
+        return false;
+    }
+
+    // 2) Stage 3 TraceHitKind::Barrier consumption matrix (§8.2, Decision #4).
+    OW::TargetSolution barPreSol{};
+    barPreSol.valid = true;
+    barPreSol.tier = OW::VisibilityTier::PreAim;
+    barPreSol.preAimPhase = OW::PreAimPhase::Positioning;
+    barPreSol.preAimParkPointValid = true;
+    barPreSol.hitKind = OW::TraceHitKind::Barrier;
+    barPreSol.barrierPolicy = OW::BarrierPolicy::WaitBarrierDrop;
+    barPreSol.visibilityPolicy = OW::VisibilityPolicy::RayWorldAndBarrier;
+    barPreSol.guidanceBoneId = OW::BONE_HEAD;
+    barPreSol.ray.actor = OW::RayDecisionStatus::Hit;
+    barPreSol.ray.world = OW::RayDecisionStatus::Clear;
+    barPreSol.ray.barrierCheckRequired = true;
+    barPreSol.ray.barrier = OW::RayDecisionStatus::Occluded;
+    const OW::TargetCandidate barPreCand = barPreSol.ToCandidate();
+    // Tracking must emit zero movement on Barrier PreAim, and Flick/Magnetic/Trigger must not fire.
+    if (OW::EvaluateTrackingStageDecision(barPreCand, hybrid) != OW::TrackingStageDecision::NoOutput ||
+        OW::CandidateAutoFireGateAllowed(barPreCand, hybrid) ||
+        barPreCand.visibilityPolicy != OW::VisibilityPolicy::RayWorldAndBarrier ||
+        barPreCand.barrierPolicy != OW::BarrierPolicy::WaitBarrierDrop) {
+        return false;
+    }
+    // Even if a stale caller left tier=Engageable with hitKind=Barrier, auto-fire stays blocked.
+    OW::TargetCandidate barEngageCand = barPreCand;
+    barEngageCand.tier = OW::VisibilityTier::Engageable;
+    if (OW::CandidateAutoFireGateAllowed(barEngageCand, hybrid) ||
+        OW::EvaluateTrackingStageDecision(barEngageCand, hybrid) != OW::TrackingStageDecision::EngagePullOnly) {
+        return false;
+    }
+    // Barrier observation vacuum (world Clear, barrier Unknown/Stale): Tracking holds (EngagePullOnly),
+    // auto-fire strictly waits for Fresh Clear!
+    barEngageCand.hitKind = OW::TraceHitKind::Unknown;
+    barEngageCand.ray.barrier = OW::RayDecisionStatus::Unknown;
+    if (OW::CandidateAutoFireGateAllowed(barEngageCand, hybrid) ||
+        OW::EvaluateTrackingStageDecision(barEngageCand, hybrid) != OW::TrackingStageDecision::EngagePullOnly) {
+        return false;
+    }
+    // Barrier drops -> Fresh Clear -> EngagePullAndFire immediately!
+    barEngageCand.hitKind = OW::TraceHitKind::None;
+    barEngageCand.ray.barrier = OW::RayDecisionStatus::Clear;
+    barEngageCand.ray.barrierAgeMs = 10;
+    if (!OW::CandidateAutoFireGateAllowed(barEngageCand, hybrid) ||
+        OW::EvaluateTrackingStageDecision(barEngageCand, hybrid) != OW::TrackingStageDecision::EngagePullAndFire) {
+        return false;
+    }
+
+    // 2b) IgnoreBarrier x TraceHitKind::Barrier cell (§8.2): even if a stale candidate carries
+    //     TraceHitKind::Barrier under IgnoreBarrier, Tracking / Flick / Trigger MUST allow engaging!
+    {
+        OW::TargetCandidate ignoreBarCand = barPreCand;
+        ignoreBarCand.tier = OW::VisibilityTier::Engageable;
+        ignoreBarCand.barrierPolicy = OW::BarrierPolicy::IgnoreBarrier;
+        ignoreBarCand.visibilityPolicy = OW::VisibilityPolicy::RayWorld;
+        ignoreBarCand.hitKind = OW::TraceHitKind::Barrier;
+        ignoreBarCand.boneId = OW::BONE_HEAD;
+        ignoreBarCand.aimPoint = OW::Vector3(0.0f, 0.0f, 10.0f);
+        ignoreBarCand.nativeHitWindow.projectileRadius = 0.05f;
+        ignoreBarCand.hitAcceptance = OW::HitAcceptance::SelectedOnly;
+        UI::Preferences::g_testRayBackend = hybrid;
+        OW::g_fixtureHitBoneId = OW::BONE_HEAD;
+        const bool allowedGate = OW::CandidateAutoFireGateAllowed(ignoreBarCand, hybrid);
+        const auto trackDec = OW::EvaluateTrackingStageDecision(ignoreBarCand, hybrid);
+        const bool hitWinOk = OW::InCandidateHitWindow(
+            ignoreBarCand, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, ignoreBarCand.aimPoint);
+        UI::Preferences::g_testRayBackend = native;
+        if (!allowedGate || trackDec != OW::TrackingStageDecision::EngagePullAndFire || !hitWinOk) {
+            return false;
+        }
+    }
+
+    // 2c) Off-guidance AnyValidHitbox under WaitBarrierDrop: guidance Chest is world+barrier Clear,
+    //     off-guidance Head is world-Clear but barrier-BLOCKED (missing Head bit in barrierClearSlotMask).
+    //     InCandidateHitWindow MUST reject Head (no shield-piercing!) and accept Chest; once Head's
+    //     barrierClearSlotMask bit is set, InCandidateHitWindow MUST accept Head.
+    {
+        OW::TargetCandidate anyBarCand{};
+        anyBarCand.valid = true;
+        anyBarCand.tier = OW::VisibilityTier::Engageable;
+        anyBarCand.barrierPolicy = OW::BarrierPolicy::WaitBarrierDrop;
+        anyBarCand.visibilityPolicy = OW::VisibilityPolicy::RayWorldAndBarrier;
+        anyBarCand.hitKind = OW::TraceHitKind::None;
+        anyBarCand.aimPriority = OW::AimPriority::BodyCenter;
+        anyBarCand.hitAcceptance = OW::HitAcceptance::AnyValidHitbox;
+        anyBarCand.boneId = OW::BONE_CHEST;
+        anyBarCand.acceptanceMask = OW::kSkeletonBoneHead | OW::kSkeletonBoneChest;
+        const uint32_t chestBit = OW::TargetPipeline::RenderSlotBitForBoneId(OW::BONE_CHEST);
+        const uint32_t headBit = OW::TargetPipeline::RenderSlotBitForBoneId(OW::BONE_HEAD);
+        anyBarCand.worldClearSlotMask = chestBit | headBit;  // Both world-clear
+        anyBarCand.barrierClearSlotMask = chestBit;          // Only Chest barrier-clear; Head behind shield!
+        anyBarCand.aimPoint = OW::Vector3(0.0f, 0.0f, 10.0f);
+        anyBarCand.nativeHitWindow.projectileRadius = 0.05f;
+        anyBarCand.ray.actor = OW::RayDecisionStatus::Hit;
+        anyBarCand.ray.world = OW::RayDecisionStatus::Clear;
+        anyBarCand.ray.barrierCheckRequired = true;
+        anyBarCand.ray.barrier = OW::RayDecisionStatus::Clear;
+        anyBarCand.ray.barrierAgeMs = 10;
+
+        UI::Preferences::g_testRayBackend = hybrid;
+        OW::g_fixtureHitBoneId = OW::BONE_HEAD;
+        const bool headBlockedByBarrier = !OW::InCandidateHitWindow(
+            anyBarCand, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, anyBarCand.aimPoint);
+        OW::g_fixtureHitBoneId = OW::BONE_CHEST;
+        const bool chestAllowed = OW::InCandidateHitWindow(
+            anyBarCand, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, anyBarCand.aimPoint);
+        anyBarCand.barrierClearSlotMask |= headBit;
+        OW::g_fixtureHitBoneId = OW::BONE_HEAD;
+        const bool headAllowedAfterDrop = OW::InCandidateHitWindow(
+            anyBarCand, {0, 0, 0}, {0, 0, 0}, {0, 0, 0}, anyBarCand.aimPoint);
+        UI::Preferences::g_testRayBackend = native;
+        if (!headBlockedByBarrier || !chestAllowed || !headAllowedAfterDrop) {
+            return false;
+        }
+    }
+
+    // 3) Phase 3 hitNormal refinement in PreAim::AnalyzeEdgeFanResults (§9).
+    {
+        const OW::Vector3 eye(0.0f, 1.5f, 0.0f);
+        const OW::Vector3 target(0.0f, 1.5f, 20.0f);
+        const OW::Vector3 lateral(1.0f, 0.0f, 0.0f);
+        const auto rays = OW::PreAim::BuildEdgeFanRays(eye, target, lateral, 0.0f, 2.5f, false);
+        std::array<std::optional<OW::RayDecision>, OW::PreAim::kEdgeFanRayCount> decNoNorm{};
+        for (size_t i = 0; i < OW::PreAim::kEdgeFanRayCount; ++i) {
+            OW::RayDecision d{};
+            if (i < 2) {
+                d.world = OW::RayDecisionStatus::Occluded;
+                d.fraction = 0.50f;
+            } else {
+                d.world = OW::RayDecisionStatus::Clear;
+                d.fraction = 1.0f;
+            }
+            decNoNorm[i] = d;
+        }
+        const auto noNormRes = OW::PreAim::AnalyzeEdgeFanResults(eye, target, lateral, rays, decNoNorm, 2.5f);
+        if (noNormRes.status != OW::PreAim::EdgeFanStatus::EdgeFound || noNormRes.usedHitNormal)
+            return false;
+
+        // Perpendicular wall (normal = (0,0,-1)): tangent aligns 1.0 with lateral -> same offset, usedHitNormal=true.
+        auto decPerp = decNoNorm;
+        decPerp[1]->hasHitNormal = true;
+        decPerp[1]->hitNormalX = 0.0f;
+        decPerp[1]->hitNormalY = 0.0f;
+        decPerp[1]->hitNormalZ = -1.0f;
+        const auto perpRes = OW::PreAim::AnalyzeEdgeFanResults(eye, target, lateral, rays, decPerp, 2.5f);
+        if (!perpRes.usedHitNormal || !Near(perpRes.parkPoint.X, noNormRes.parkPoint.X, 1e-4f))
+            return false;
+
+        // 45-deg angled wall (normal = (-0.7071, 0, -0.7071)): tangent alignment ~0.7071 tightens lateral margin.
+        auto decAngled = decNoNorm;
+        decAngled[1]->hasHitNormal = true;
+        decAngled[1]->hitNormalX = -0.70710678f;
+        decAngled[1]->hitNormalY = 0.0f;
+        decAngled[1]->hitNormalZ = -0.70710678f;
+        const auto angledRes = OW::PreAim::AnalyzeEdgeFanResults(eye, target, lateral, rays, decAngled, 2.5f);
+        if (!angledRes.usedHitNormal ||
+            !(angledRes.parkPoint.X < perpRes.parkPoint.X) ||
+            !(angledRes.parkPoint.X > angledRes.edgeOffsetMeters)) {
+            return false;
+        }
+    }
+
+    // 4) IRoleUtilityPlugin + Smart Ana (§4.2, §9 Phase 3).
+    {
+        const auto& reg = OW::TargetPipeline::RoleUtilityRegistry::Default();
+        const char* pluginName = nullptr;
+
+        auto evalAnaUtility = [&](bool isEnemy, float hp, float maxHp, float angleDeg,
+                                  OW::RoleUtilityMode mode = OW::RoleUtilityMode::Auto,
+                                  uint64_t localHero = OW::TargetPipeline::kHeroAnaId) {
+            OW::TargetPipeline::RoleUtilityContext rCtx{};
+            rCtx.localHeroId = localHero;
+            rCtx.teamMode = 2;  // All (allies + enemies)
+            rCtx.candidateIsEnemy = isEnemy;
+            rCtx.hp = hp;
+            rCtx.maxHp = maxHp;
+            rCtx.angleDeg = angleDeg;
+            rCtx.effectiveFovDeg = 15.0f;
+            const float roleU = reg.Evaluate(mode, rCtx, &pluginName);
+
+            OW::TargetPipeline::UtilityInput uIn{};
+            uIn.angleDeg = angleDeg;
+            uIn.effectiveFovDeg = 15.0f;
+            uIn.hp = hp;
+            uIn.maxHp = maxHp;
+            uIn.visibilityPrior = 1.0f;
+            uIn.roleUtility = roleU;
+            return OW::TargetPipeline::ComputeCandidateUtility(uIn);
+        };
+
+        // 4a) Near-crosshair 1-shot enemy (65/200 HP, 1.5 deg) beats moderate ally (140/200 HP, 1.5 deg).
+        const auto killEnemy = evalAnaUtility(true, 65.0f, 200.0f, 1.5f);
+        if (!pluginName || std::string(pluginName) != "smart-ana")
+            return false;
+        const auto modAlly = evalAnaUtility(false, 140.0f, 200.0f, 1.5f);
+        if (!(killEnemy.total > modAlly.total))
+            return false;
+
+        // 4b) Critical-low dying ally (50/200 = 25% HP, 4 deg) beats full-HP enemy (200/200, 1 deg).
+        const auto dyingAlly = evalAnaUtility(false, 50.0f, 200.0f, 4.0f);
+        const auto fullEnemy = evalAnaUtility(true, 200.0f, 200.0f, 1.0f);
+        if (!(dyingAlly.total > fullEnemy.total))
+            return false;
+
+        // 4c) Near-crosshair 1-shot enemy (60/200, 1 deg) beats dying ally far at FOV edge (13.5 deg).
+        const auto edgeDyingAlly = evalAnaUtility(false, 50.0f, 200.0f, 13.5f);
+        const auto centerKillEnemy = evalAnaUtility(true, 60.0f, 200.0f, 1.0f);
+        if (!(centerKillEnemy.total > edgeDyingAlly.total))
+            return false;
+
+        // 4d) Full-HP (200/200) and high-HP (190/200 = 95%) allies at 0.5 deg MUST NOT steal focus from 3 deg enemy.
+        const auto fullAlly = evalAnaUtility(false, 200.0f, 200.0f, 0.5f);
+        const auto highAlly = evalAnaUtility(false, 190.0f, 200.0f, 0.5f);
+        const auto midEnemy = evalAnaUtility(true, 200.0f, 200.0f, 3.0f);
+        if (!(midEnemy.total > fullAlly.total) || !(midEnemy.total > highAlly.total))
+            return false;
+
+        // 4e) Low-HP frontline tank (200/500 = 40% HP) gets tank burst-save bonus over same-% squishy (80/200 = 40%).
+        const auto lowTank = evalAnaUtility(false, 200.0f, 500.0f, 3.0f);
+        const auto lowSquishy = evalAnaUtility(false, 80.0f, 200.0f, 3.0f);
+        if (!(lowTank.total > lowSquishy.total))
+            return false;
+
+        // 4f) Off mode returns 0, non-Ana hero under Auto returns 0, and NaN/Inf/zero/overheal edge cases.
+        OW::TargetPipeline::RoleUtilityContext nonAnaCtx{};
+        nonAnaCtx.localHeroId = OW::GameData::MakeHeroId(0x00A); // Widowmaker
+        nonAnaCtx.candidateIsEnemy = false;
+        nonAnaCtx.hp = 30.0f;
+        nonAnaCtx.maxHp = 200.0f;
+        if (!Near(reg.Evaluate(OW::RoleUtilityMode::Auto, nonAnaCtx), 0.0f, 1e-6f))
+            return false;
+        nonAnaCtx.localHeroId = OW::TargetPipeline::kHeroAnaId;
+        if (!Near(reg.Evaluate(OW::RoleUtilityMode::Off, nonAnaCtx), 0.0f, 1e-6f))
+            return false;
+        // NaN / +Inf / zero maxHp must return 0.0f deterministically (matching Python parity).
+        OW::TargetPipeline::RoleUtilityContext edgeCtx = nonAnaCtx;
+        edgeCtx.candidateIsEnemy = true;
+        edgeCtx.hp = std::numeric_limits<float>::quiet_NaN();
+        if (!Near(reg.Evaluate(OW::RoleUtilityMode::Auto, edgeCtx), 0.0f, 1e-6f))
+            return false;
+        edgeCtx.hp = std::numeric_limits<float>::infinity();
+        if (!Near(reg.Evaluate(OW::RoleUtilityMode::Auto, edgeCtx), 0.0f, 1e-6f))
+            return false;
+        edgeCtx.hp = 50.0f;
+        edgeCtx.maxHp = 0.0f;
+        if (!Near(reg.Evaluate(OW::RoleUtilityMode::Auto, edgeCtx), 0.0f, 1e-6f))
+            return false;
+        // Overhealed ally (250/200) must clamp to full-health ally penalty (-0.50f).
+        edgeCtx.candidateIsEnemy = false;
+        edgeCtx.hp = 250.0f;
+        edgeCtx.maxHp = 200.0f;
+        if (!Near(reg.Evaluate(OW::RoleUtilityMode::Auto, edgeCtx), -0.50f, 1e-5f))
+            return false;
+
+        // 4g) Pluggable custom IRoleUtilityPlugin registration & dispatch.
+        class CustomMercyPlugin final : public OW::TargetPipeline::IRoleUtilityPlugin {
+        public:
+            const char* Name() const noexcept override { return "custom-mercy"; }
+            bool AppliesTo(const OW::TargetPipeline::RoleUtilityContext& ctx) const noexcept override {
+                return ctx.localHeroId == OW::GameData::MakeHeroId(0x004);
+            }
+            float EvaluateUtility(const OW::TargetPipeline::RoleUtilityContext& ctx) const noexcept override {
+                return !ctx.candidateIsEnemy && ctx.hp < 100.0f ? 0.33f : 0.0f;
+            }
+        };
+        CustomMercyPlugin mercyPlugin;
+        OW::TargetPipeline::RoleUtilityRegistry customReg;
+        if (!customReg.Register(&mercyPlugin) || customReg.Register(&mercyPlugin))
+            return false;
+        OW::TargetPipeline::RoleUtilityContext mercyCtx{};
+        mercyCtx.localHeroId = OW::GameData::MakeHeroId(0x004);
+        mercyCtx.candidateIsEnemy = false;
+        mercyCtx.hp = 60.0f;
+        mercyCtx.maxHp = 200.0f;
+        const char* customName = nullptr;
+        const float customScore = customReg.Evaluate(OW::RoleUtilityMode::Auto, mercyCtx, &customName);
+        if (!Near(customScore, 0.33f, 1e-6f) || !customName || std::string(customName) != "custom-mercy")
+            return false;
+    }
+
+    // 5) Stage 0 ProtectionFilterPasses redline (§1.2, §4.1) — directly calls the production seam:
+    //    NEVER rejects friendly healing (even when ally has imort=true / barrprot=true or stale health tick),
+    //    MUST reject enemy when imort=true or barrprot=true or stale health tick.
+    {
+        bool staleFlag = false;
+        // Bubbled / lamp-protected ally with stale health sample MUST PASS.
+        if (!OW::TargetPipeline::ProtectionFilterPasses(false, true, true, true, 0, 1000, &staleFlag) ||
+            staleFlag) {
+            return false;
+        }
+        // Immortal enemy MUST FAIL.
+        if (OW::TargetPipeline::ProtectionFilterPasses(true, true, true, false, 900, 1000, &staleFlag) ||
+            staleFlag) {
+            return false;
+        }
+        // Barrier-projected (Zarya bubble) enemy MUST FAIL.
+        if (OW::TargetPipeline::ProtectionFilterPasses(true, true, false, true, 900, 1000, &staleFlag) ||
+            staleFlag) {
+            return false;
+        }
+        // Enemy with stale health sample (>500ms) MUST FAIL and flag stale.
+        if (OW::TargetPipeline::ProtectionFilterPasses(true, true, false, false, 400, 1000, &staleFlag) ||
+            !staleFlag) {
+            return false;
+        }
+        // Normal fresh enemy MUST PASS.
+        if (!OW::TargetPipeline::ProtectionFilterPasses(true, true, false, false, 900, 1000, &staleFlag) ||
+            staleFlag) {
+            return false;
+        }
+    }
+
+    // 6) Config clamp defaults & Aim/Trigger SlotTargetRules propagation (PopulateSlotTargetRulesFromPreset).
+    if (OW::ClampBarrierPolicy(-1) != OW::BarrierPolicy::IgnoreBarrier ||
+        OW::ClampBarrierPolicy(99) != OW::BarrierPolicy::WaitBarrierDrop ||
+        OW::ClampRoleUtilityMode(-1) != OW::RoleUtilityMode::Auto ||
+        OW::ClampRoleUtilityMode(99) != OW::RoleUtilityMode::SmartAna) {
+        return false;
+    }
+    {
+        struct MockRules {
+            bool active = false, ignoreSombraStealth = false, requireTargetable = false;
+            float allyHealthMaxPercent = 100.0f, maxTargetSpeedMps = 0.0f;
+            OW::SkeletonBoneMask allyBoneMask = 0;
+            int predictionAlgorithm = 0, boneSelectionMode = 2, preferredBone = 0;
+            int aimPriority = 0, hitAcceptance = 0, barrierPolicy = 0, roleUtilityMode = 0;
+        };
+        struct MockPreset {
+            bool ignoreSombraStealth = false;
+            bool requireTargetable = true;
+            float allyHealthMaxPercent = 85.0f, maxTargetSpeedMps = 18.0f;
+            OW::SkeletonBoneMask allyBoneMask = OW::kSkeletonBoneChest;
+            int predictionAlgorithm = 1, boneSelectionMode = 1, preferredBone = 2;
+            int aimPriority = static_cast<int>(OW::AimPriority::BodyCenter);
+            int hitAcceptance = static_cast<int>(OW::HitAcceptance::AnyValidHitbox);
+            int barrierPolicy = static_cast<int>(OW::BarrierPolicy::WaitBarrierDrop);
+            int roleUtilityMode = static_cast<int>(OW::RoleUtilityMode::SmartAna);
+        };
+        MockPreset triggerPreset{};
+        MockRules rules{};
+        // Case A: UI ignoreInvisible=true, preset.ignoreSombraStealth=false -> ignoreSombraStealth=true.
+        OW::Config::PopulateSlotTargetRulesFromPreset(rules, triggerPreset, true);
+        if (!rules.active || !rules.ignoreSombraStealth || !rules.requireTargetable ||
+            rules.aimPriority != static_cast<int>(OW::AimPriority::BodyCenter) ||
+            rules.hitAcceptance != static_cast<int>(OW::HitAcceptance::AnyValidHitbox) ||
+            rules.barrierPolicy != static_cast<int>(OW::BarrierPolicy::WaitBarrierDrop) ||
+            rules.roleUtilityMode != static_cast<int>(OW::RoleUtilityMode::SmartAna)) {
+            return false;
+        }
+        // Case B: UI ignoreInvisible=false, preset.ignoreSombraStealth=true -> MUST NOT drop stealth filter!
+        triggerPreset.ignoreSombraStealth = true;
+        OW::Config::PopulateSlotTargetRulesFromPreset(rules, triggerPreset, false);
+        if (!rules.ignoreSombraStealth ||
+            rules.barrierPolicy != static_cast<int>(OW::BarrierPolicy::WaitBarrierDrop) ||
+            rules.roleUtilityMode != static_cast<int>(OW::RoleUtilityMode::SmartAna)) {
+            return false;
+        }
+        // Case C: Both false -> ignoreSombraStealth=false.
+        triggerPreset.ignoreSombraStealth = false;
+        OW::Config::PopulateSlotTargetRulesFromPreset(rules, triggerPreset, false);
+        if (rules.ignoreSombraStealth) {
+            return false;
+        }
+        // Fast-target ray maxAge threshold (60 ms > 4.5 m/s vs 100 ms <= 4.5 m/s).
+        if (OW::TargetPipeline::ResolveCandidateRayMaxAgeMs(5.5f) != 60u ||
+            OW::TargetPipeline::ResolveCandidateRayMaxAgeMs(4.5f) != 100u ||
+            OW::TargetPipeline::ResolveCandidateRayMaxAgeMs(0.0f) != 100u) {
+            return false;
+        }
+    }
+
+    return true;
+}
+
 } // namespace
 
 int main()
@@ -1341,7 +1727,9 @@ int main()
         return Fail("Legacy config JSON migration for aimPriority & hitAcceptance");
     if (!TestPreAimAndReactionDelayGate())
         return Fail("Phase 2 PreAim theta_peek / EdgeFan / 4 exits / ReactionDelayGate");
+    if (!TestPhase3VisibilityBarrierAndRolePlugins())
+        return Fail("Phase 3 VisibilityPolicy / BarrierPolicy / hitNormal EdgeFan / IRoleUtilityPlugin Smart Ana");
 
-    std::cout << "PASS V3TargetPipelineSelfTest: IntentEngine + Utility/FirePhase + AimPriority/HitAcceptance + TargetHitWindow + LegacyMigration + Phase2(PreAim/EdgeFan/ReactionDelayGate)\n";
+    std::cout << "PASS V3TargetPipelineSelfTest: IntentEngine + Utility/FirePhase + AimPriority/HitAcceptance + TargetHitWindow + LegacyMigration + Phase2(PreAim/EdgeFan/ReactionDelayGate) + Phase3(VisibilityPolicy/Barrier/SmartAna)\n";
     return EXIT_SUCCESS;
 }

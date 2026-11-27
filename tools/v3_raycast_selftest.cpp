@@ -1,4 +1,5 @@
 #include "Game/V3Raycast.hpp"
+#include "Game/Offsets.hpp"
 #include "Game/RayDecision.hpp"
 #include "Game/RayQueryBroker.hpp"
 #include "Game/TrajectoryRayPlanner.hpp"
@@ -947,6 +948,306 @@ int main(int argc, char** argv) {
             if (ok != c.accepted || (ok && out != c.expected)) return Fail("rayBackend preference migration");
         }
         if (UI::Preferences::kCurrentVersion <= UI::Preferences::kLegacyVersion) return Fail("preference version not bumped");
+    }
+
+    // Phase 3: Three-region profile contract (CN 155284N / World 155284 / Nexon 155284KB),
+    // Nexon copy-inheritance guard, hitNormal broker propagation, and Slot 3 barrier layer.
+    {
+        const auto& cn = OW::offset::kCnRuntimeProfile;
+        const auto& world = OW::offset::kWorld155284RuntimeProfile;
+        const auto& nexon = OW::offset::kNexon155284RuntimeProfile;
+        if (cn.rayEntryRva != 0x10222E0 || world.rayEntryRva != 0xD0E030 || nexon.rayEntryRva != 0x100C5E0)
+            return Fail("three-region rayEntryRva mismatch");
+        if (cn.rayContextVtableRva == nexon.rayContextVtableRva ||
+            cn.raySceneSub60VtableRva == nexon.raySceneSub60VtableRva ||
+            cn.clientGameRva == nexon.clientGameRva)
+            return Fail("Nexon profile must not inherit CN ray/ClientGame RVAs");
+        if (nexon.rayAuxCallbackRva != 0 || world.rayAuxCallbackRva != 0)
+            return Fail("World/Nexon must keep unverified rayAuxCallbackRva=0");
+        if (cn.rayWorldMask != 0x0690000000000002ull ||
+            world.rayWorldMask != 0x0690000000000002ull ||
+            nexon.rayWorldMask != 0x0690000000000002ull)
+            return Fail("three-region rayWorldMask mismatch");
+        if (cn.rayBarrierMask != 0 || world.rayBarrierMask != 0 || nexon.rayBarrierMask != 0)
+            return Fail("unverified rayBarrierMask must stay 0 (no fabricated legacy 149004 masks)");
+
+        // RayPolicyNeedsBarrierNotice truth table.
+        const int native = static_cast<int>(OW::RayDecisionPolicy::NativeOnly);
+        const int hybrid = static_cast<int>(OW::RayDecisionPolicy::Hybrid);
+        if (OW::RayPolicyNeedsBarrierNotice(native, OW::BarrierPolicy::IgnoreBarrier, 0) ||
+            OW::RayPolicyNeedsBarrierNotice(hybrid, OW::BarrierPolicy::IgnoreBarrier, 0) ||
+            OW::RayPolicyNeedsBarrierNotice(hybrid, OW::BarrierPolicy::WaitBarrierDrop, 0x0690000000000055ull) ||
+            !OW::RayPolicyNeedsBarrierNotice(native, OW::BarrierPolicy::WaitBarrierDrop, 0x0690000000000055ull) ||
+            !OW::RayPolicyNeedsBarrierNotice(hybrid, OW::BarrierPolicy::WaitBarrierDrop, 0)) {
+            return Fail("RayPolicyNeedsBarrierNotice truth table");
+        }
+
+        // RayDecisionAllowsAutoFire barrier enforcement truth table.
+        OW::RayDecision d{OW::RayDecisionStatus::Hit, OW::RayDecisionStatus::Clear};
+        d.barrierCheckRequired = true;
+        d.barrier = OW::RayDecisionStatus::Unknown;
+        if (OW::RayDecisionAllowsAutoFire(d, false, hybrid))
+            return Fail("WaitBarrierDrop auto-fire must block barrier Unknown vacuum");
+        d.barrier = OW::RayDecisionStatus::Stale;
+        if (OW::RayDecisionAllowsAutoFire(d, false, hybrid))
+            return Fail("WaitBarrierDrop auto-fire must block barrier Stale vacuum");
+        d.barrier = OW::RayDecisionStatus::Occluded;
+        if (OW::RayDecisionAllowsAutoFire(d, false, hybrid) ||
+            OW::RayDecisionAllowsSelection(d, false, hybrid))
+            return Fail("WaitBarrierDrop must block selection and auto-fire on barrier Occluded");
+        d.barrier = OW::RayDecisionStatus::Clear;
+        d.barrierAgeMs = 150;
+        if (OW::RayDecisionAllowsAutoFire(d, false, hybrid, 100))
+            return Fail("WaitBarrierDrop auto-fire must reject expired barrier verdict");
+        d.barrierAgeMs = 15;
+        if (!OW::RayDecisionAllowsAutoFire(d, false, hybrid, 100))
+            return Fail("WaitBarrierDrop auto-fire must allow fresh barrier Clear");
+
+        // Multi-mask broker isolation + hitPosition/hitNormal propagation + EvaluateBarrierLayerDecision.
+        constexpr uint64_t kTestBarrierMask = 0x0690000000000055ull;
+        class MaskAwareBackend final : public OW::EngineTrace::IBackend {
+        public:
+            std::atomic<bool> barrierUp{true};
+            const char* Name() const override { return "mask-aware-test"; }
+            bool BindScene(uint64_t) override { return true; }
+            OW::EngineTrace::Status Trace(const OW::EngineTrace::Request& req,
+                                          OW::EngineTrace::Result& res) override {
+                res.status = OW::EngineTrace::Status::Ok;
+                if (req.mask == kTestBarrierMask && barrierUp.load(std::memory_order_acquire)) {
+                    res.fraction = 0.40f;
+                    res.hitPosition = {4.0f, 1.5f, 0.0f};
+                    res.hasHitPosition = true;
+                    res.hitNormal = {-3.0f, 0.0f, 4.0f};  // unnormalized; broker normalizes to (-0.6, 0, 0.8)
+                    res.hasHitNormal = true;
+                    res.hitFlags = 0x24;
+                    res.entityId = 77;
+                } else {
+                    res.fraction = 1.0f;
+                }
+                return res.status;
+            }
+            void ReleaseScene() override {}
+        };
+
+        MaskAwareBackend backend;
+        OW::EngineTrace::Service svc(&backend);
+        OW::EngineTrace::RayQueryBroker broker;
+        broker.Attach(&svc);
+        broker.Start();
+        broker.SetScene(11);
+
+        const OW::Vector3 cam(0.0f, 1.5f, 0.0f);
+        const OW::Vector3 target(10.0f, 1.5f, 0.0f);
+
+        // 1) IgnoreBarrier -> Slot 3 skipped even if barrier is up.
+        const auto ignoredEval = OW::TrajectoryRay::EvaluateBarrierLayerDecision(
+            broker, OW::VisibilityPolicy::RayWorld, OW::BarrierPolicy::IgnoreBarrier,
+            kTestBarrierMask, true, cam, target,
+            100, 1, 11, 0x9001, 2, 17, 1, 100, true);
+        if (ignoredEval.barrierActive || ignoredEval.barrierBlocked ||
+            ignoredEval.hitKind != OW::TraceHitKind::None || ignoredEval.slot3Query.has_value()) {
+            broker.Stop();
+            return Fail("IgnoreBarrier must skip Slot 3 barrier query");
+        }
+
+        // 2) WaitBarrierDrop with barrierMask==0 -> unsupported, Slot 3 skipped honestly.
+        const auto unsupportedEval = OW::TrajectoryRay::EvaluateBarrierLayerDecision(
+            broker, OW::VisibilityPolicy::RayWorld, OW::BarrierPolicy::WaitBarrierDrop,
+            0, true, cam, target,
+            100, 1, 11, 0x9001, 2, 17, 1, 100, true);
+        if (unsupportedEval.barrierActive || unsupportedEval.slot3Query.has_value()) {
+            broker.Stop();
+            return Fail("WaitBarrierDrop with barrierMask==0 must not emit dummy Slot 3 query");
+        }
+
+        // 3) WaitBarrierDrop with RayWorldAndBarrier + barrierMask!=0: cold vacuum -> submit -> Occluded with hitNormal!
+        const auto coldEval = OW::TrajectoryRay::EvaluateBarrierLayerDecision(
+            broker, OW::VisibilityPolicy::RayWorldAndBarrier, OW::BarrierPolicy::WaitBarrierDrop,
+            kTestBarrierMask, true, cam, target,
+            100, 1, 11, 0x9001, 2, 17, 1, 100, true);
+        if (!coldEval.barrierActive || !coldEval.barrierVacuum || !coldEval.slot3Urgent ||
+            !coldEval.slot3Query.has_value() ||
+            coldEval.slot3Query->request.mask != kTestBarrierMask ||
+            coldEval.slot3Query->segmentKind != OW::RaySegmentKind::Barrier) {
+            broker.Stop();
+            return Fail("WaitBarrierDrop cold lookup must report barrierVacuum and schedule urgent Slot 3");
+        }
+
+        // Also submit world query for the exact same entity/bone to verify cache isolation!
+        OW::EngineTrace::RayQueryBroker::Query worldQ = *coldEval.slot3Query;
+        worldQ.request.mask = OW::EngineTrace::kDefaultWorldMask;
+        worldQ.segmentKind = OW::RaySegmentKind::Direct;
+        broker.Submit(worldQ);
+
+        OW::TrajectoryRay::BarrierEvaluationResult blockedEval{};
+        for (int i = 0; i < 100; ++i) {
+            blockedEval = OW::TrajectoryRay::EvaluateBarrierLayerDecision(
+                broker, OW::VisibilityPolicy::RayWorldAndBarrier, OW::BarrierPolicy::WaitBarrierDrop,
+                kTestBarrierMask, true, cam, target,
+                100, 1, 11, 0x9001, 2, 17, 1, 100, false);
+            if (blockedEval.barrierBlocked) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        const auto worldCached = broker.Latest(
+            worldQ.request, 100, 1, 11, 0x9001, 2, 17, 100,
+            OW::EngineTrace::RayQueryBroker::kDefaultMaxEndpointDriftMeters,
+            OW::RaySegmentKind::Direct, 0);
+        if (!blockedEval.barrierBlocked ||
+            blockedEval.hitKind != OW::TraceHitKind::Barrier ||
+            !blockedEval.barrierDecision.hasHitPosition ||
+            !Near(blockedEval.barrierDecision.hitPosX, 4.0f, 1e-3f) ||
+            !blockedEval.barrierDecision.hasHitNormal ||
+            !Near(blockedEval.barrierDecision.hitNormalX, -0.6f, 1e-3f) ||
+            !Near(blockedEval.barrierDecision.hitNormalZ, 0.8f, 1e-3f)) {
+            broker.Stop();
+            return Fail("WaitBarrierDrop must classify TraceHitKind::Barrier and propagate hitPosition/hitNormal");
+        }
+        if (!worldCached.has_value() || !worldCached->WorldClear()) {
+            broker.Stop();
+            return Fail("Barrier cache entry polluted Direct world cache slot");
+        }
+
+        // 4) Barrier drops -> next Slot 3 refresh transitions to barrierClear / TraceHitKind::None!
+        backend.barrierUp.store(false, std::memory_order_release);
+        broker.Submit(*blockedEval.slot3Query);
+        OW::TrajectoryRay::BarrierEvaluationResult droppedEval{};
+        for (int i = 0; i < 100; ++i) {
+            droppedEval = OW::TrajectoryRay::EvaluateBarrierLayerDecision(
+                broker, OW::VisibilityPolicy::RayWorldAndBarrier, OW::BarrierPolicy::WaitBarrierDrop,
+                kTestBarrierMask, true, cam, target,
+                101, 1, 11, 0x9001, 2, 17, 1, 100, false);
+            if (droppedEval.barrierClear) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (!droppedEval.barrierClear || droppedEval.barrierBlocked ||
+            droppedEval.hitKind != OW::TraceHitKind::None) {
+            broker.Stop();
+            return Fail("Barrier drop must transition WaitBarrierDrop back to Clear / TraceHitKind::None");
+        }
+
+        // 5) Mixed Head vs Chest barrier outcome on the same actor (head bone 17 behind partial
+        //    barrier vs chest bone 4 clear): cache slots are keyed by boneId so fallback bone
+        //    can resolve Clear independently while head stays TraceHitKind::Barrier!
+        backend.barrierUp.store(true, std::memory_order_release);
+        const OW::Vector3 headPt(10.0f, 1.8f, 0.0f);
+        const OW::Vector3 chestPt(10.0f, 1.2f, 0.0f);
+        // Submit barrier query for head (bone 17) while barrierUp==true -> Occluded.
+        (void)OW::TrajectoryRay::EvaluateBarrierLayerDecision(
+            broker, OW::VisibilityPolicy::RayWorldAndBarrier, OW::BarrierPolicy::WaitBarrierDrop,
+            kTestBarrierMask, true, cam, headPt,
+            102, 1, 11, 0x9002, 3, 17, 1, 100, true);
+        OW::TrajectoryRay::BarrierEvaluationResult headBar{};
+        for (int i = 0; i < 100; ++i) {
+            headBar = OW::TrajectoryRay::EvaluateBarrierLayerDecision(
+                broker, OW::VisibilityPolicy::RayWorldAndBarrier, OW::BarrierPolicy::WaitBarrierDrop,
+                kTestBarrierMask, true, cam, headPt,
+                102, 1, 11, 0x9002, 3, 17, 1, 100, false);
+            if (headBar.barrierBlocked) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        // Now chest (bone 4) sees clear barrier (simulating head above/behind partial barrier).
+        backend.barrierUp.store(false, std::memory_order_release);
+        (void)OW::TrajectoryRay::EvaluateBarrierLayerDecision(
+            broker, OW::VisibilityPolicy::RayWorldAndBarrier, OW::BarrierPolicy::WaitBarrierDrop,
+            kTestBarrierMask, true, cam, chestPt,
+            102, 1, 11, 0x9002, 3, 4, 1, 100, true);
+        OW::TrajectoryRay::BarrierEvaluationResult chestBar{};
+        for (int i = 0; i < 100; ++i) {
+            chestBar = OW::TrajectoryRay::EvaluateBarrierLayerDecision(
+                broker, OW::VisibilityPolicy::RayWorldAndBarrier, OW::BarrierPolicy::WaitBarrierDrop,
+                kTestBarrierMask, true, cam, chestPt,
+                102, 1, 11, 0x9002, 3, 4, 1, 100, false);
+            if (chestBar.barrierClear) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        // Re-read head (bone 17) to confirm chest Clear did not clobber head Barrier!
+        headBar = OW::TrajectoryRay::EvaluateBarrierLayerDecision(
+            broker, OW::VisibilityPolicy::RayWorldAndBarrier, OW::BarrierPolicy::WaitBarrierDrop,
+            kTestBarrierMask, true, cam, headPt,
+            102, 1, 11, 0x9002, 3, 17, 1, 100, false);
+        if (!headBar.barrierBlocked || headBar.hitKind != OW::TraceHitKind::Barrier ||
+            !chestBar.barrierClear || chestBar.hitKind != OW::TraceHitKind::None) {
+            broker.Stop();
+            return Fail("Mixed head/chest barrier cache slots must resolve independently per boneId");
+        }
+
+        // 6) Off-guidance barrier warmup via PlanRayBatch Slot 1 alongside guidance Slot 3:
+        //    proves an uncached off-guidance bone (head=17) gets warmed via Slot 1 Barrier query
+        //    without colliding with guidance bone (chest=4) Slot 3 Barrier query, and transitions
+        //    to fresh Clear once the shield drops!
+        OW::TrajectoryRay::RayBatchPlanInput warmIn{};
+        warmIn.barrierPolicy = OW::BarrierPolicy::WaitBarrierDrop;
+        warmIn.top1WorldClear = true;
+        OW::EngineTrace::RayQueryBroker::Query chestWorldQ{};
+        chestWorldQ.request.start = {cam.X, cam.Y, cam.Z};
+        chestWorldQ.request.end = {chestPt.X, chestPt.Y, chestPt.Z};
+        chestWorldQ.request.mask = OW::EngineTrace::kDefaultWorldMask;
+        chestWorldQ.request.sceneEpoch = 11;
+        chestWorldQ.frame = 103;
+        chestWorldQ.connectionEpoch = 1;
+        chestWorldQ.sceneEpoch = 11;
+        chestWorldQ.entityKey = 0x9003;
+        chestWorldQ.actorGeneration = 4;
+        chestWorldQ.boneId = 4;
+        chestWorldQ.segmentKind = OW::RaySegmentKind::Direct;
+        warmIn.top1Primary.PushRefresh(chestWorldQ);
+
+        OW::EngineTrace::RayQueryBroker::Query chestBarQ = chestWorldQ;
+        chestBarQ.request.mask = kTestBarrierMask;
+        chestBarQ.segmentKind = OW::RaySegmentKind::Barrier;
+        warmIn.top1BarrierQuery = chestBarQ;
+        warmIn.top1BarrierUrgent = false;
+
+        OW::EngineTrace::RayQueryBroker::Query headWarmBarQ = chestBarQ;
+        headWarmBarQ.request.end = {headPt.X, headPt.Y, headPt.Z};
+        headWarmBarQ.boneId = 17;
+        warmIn.top1FallbackOrWarmup.PushUrgent(headWarmBarQ);
+
+        const auto warmPlan = OW::TrajectoryRay::PlanRayBatch(warmIn);
+        if (warmPlan.count != 3) {
+            broker.Stop();
+            return Fail("PlanRayBatch must preserve both guidance Slot 3 and off-guidance Slot 1 barrier warmup");
+        }
+        broker.SubmitBatch(warmPlan.Span());
+        OW::TrajectoryRay::BarrierEvaluationResult headWarmed{};
+        for (int i = 0; i < 100; ++i) {
+            headWarmed = OW::TrajectoryRay::EvaluateBarrierLayerDecision(
+                broker, OW::VisibilityPolicy::RayWorldAndBarrier, OW::BarrierPolicy::WaitBarrierDrop,
+                kTestBarrierMask, true, cam, headPt,
+                103, 1, 11, 0x9003, 4, 17, 1, 100, false);
+            if (headWarmed.barrierClear) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (!headWarmed.barrierClear || headWarmed.hitKind != OW::TraceHitKind::None) {
+            broker.Stop();
+            return Fail("Off-guidance Slot 1 barrier warmup failed to populate fresh Clear cache entry");
+        }
+
+        // 7) Fast-target 60-100 ms age-boundary regression: after 75 ms, a fast target (maxAgeMs=60)
+        //    must classify the cached barrier entry as Stale (AgeExpired) / barrierVacuum=true and
+        //    mark slot3Urgent=true for immediate resubmission, while a slow target (maxAgeMs=100)
+        //    still treats the same 75 ms entry as fresh Clear.
+        std::this_thread::sleep_for(std::chrono::milliseconds(75));
+        const auto fastAgeEval = OW::TrajectoryRay::EvaluateBarrierLayerDecision(
+            broker, OW::VisibilityPolicy::RayWorldAndBarrier, OW::BarrierPolicy::WaitBarrierDrop,
+            kTestBarrierMask, true, cam, headPt,
+            104, 1, 11, 0x9003, 4, 17, 1, /*fastMaxAgeMs=*/60, false);
+        const auto slowAgeEval = OW::TrajectoryRay::EvaluateBarrierLayerDecision(
+            broker, OW::VisibilityPolicy::RayWorldAndBarrier, OW::BarrierPolicy::WaitBarrierDrop,
+            kTestBarrierMask, true, cam, headPt,
+            104, 1, 11, 0x9003, 4, 17, 1, /*slowMaxAgeMs=*/100, false);
+        const auto fastWarmupLookup = broker.Latest(
+            headWarmBarQ.request, 104, 1, 11, 0x9003, 4, 17, /*fastMaxAgeMs=*/60,
+            OW::EngineTrace::RayQueryBroker::kDefaultMaxEndpointDriftMeters,
+            OW::RaySegmentKind::Barrier, 0);
+        broker.Stop();
+        if (!fastAgeEval.barrierVacuum || !fastAgeEval.slot3Urgent ||
+            fastAgeEval.barrierDecision.world != OW::RayDecisionStatus::Stale ||
+            fastAgeEval.barrierDecision.staleReason != OW::RayStaleReason::AgeExpired ||
+            !fastWarmupLookup.has_value() || !fastWarmupLookup->IsObservationVacuum() ||
+            !slowAgeEval.barrierClear || slowAgeEval.slot3Urgent) {
+            return Fail("Fast-target 60-100ms age boundary mismatch between acceptance and warmup");
+        }
     }
 
     if (argc > 1) WriteSvg(argv[1], worldShapes);

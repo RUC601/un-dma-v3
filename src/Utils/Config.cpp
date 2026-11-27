@@ -1891,6 +1891,8 @@ namespace OW { namespace Config {
             preset.preferredBone = NormalizeAimBone(preset.preferredBone);
             preset.aimPriority = static_cast<int>(ClampAimPriority(preset.aimPriority));
             preset.hitAcceptance = static_cast<int>(ClampHitAcceptance(preset.hitAcceptance));
+            preset.barrierPolicy = static_cast<int>(ClampBarrierPolicy(preset.barrierPolicy));
+            preset.roleUtilityMode = static_cast<int>(ClampRoleUtilityMode(preset.roleUtilityMode));
             preset.hitbox = ClampHitboxScalePercent(preset.hitbox);
             preset.aimMode = std::clamp(preset.aimMode, 0, 1);
             if (preset.aimMode == 1 && preset.aimBehavior == 0)
@@ -2300,6 +2302,8 @@ namespace OW { namespace Config {
                 lhs.preferredBone == rhs.preferredBone &&
                 lhs.aimPriority == rhs.aimPriority &&
                 lhs.hitAcceptance == rhs.hitAcceptance &&
+                lhs.barrierPolicy == rhs.barrierPolicy &&
+                lhs.roleUtilityMode == rhs.roleUtilityMode &&
                 SameFloatForDefaultMigration(lhs.hitbox, rhs.hitbox) &&
                 lhs.aimMode == rhs.aimMode &&
                 lhs.aimBehavior == rhs.aimBehavior &&
@@ -2840,6 +2844,8 @@ namespace OW { namespace Config {
             aimPreferredBone = kAimBoneChest;
             aimPriority = static_cast<int>(AimPriority::HeadOnly);
             aimHitAcceptance = static_cast<int>(HitAcceptance::SelectedOnly);
+            aimBarrierPolicy = static_cast<int>(BarrierPolicy::IgnoreBarrier);
+            aimRoleUtilityMode = static_cast<int>(RoleUtilityMode::Auto);
             switch_team = false;          // default: false
             switch_team2 = false;         // default: false
             BoneName = "Head";            // default: Head
@@ -3155,6 +3161,8 @@ namespace OW { namespace Config {
             preset.preferredBone = aimPreferredBone;
             preset.aimPriority = aimPriority;
             preset.hitAcceptance = aimHitAcceptance;
+            preset.barrierPolicy = aimBarrierPolicy;
+            preset.roleUtilityMode = aimRoleUtilityMode;
             preset.hitbox = hitbox;
             preset.aimMode = CurrentAimMode();
             if (preset.aimMode < 0 || preset.aimMode > 1)
@@ -3261,6 +3269,8 @@ namespace OW { namespace Config {
             aimPreferredBone = preset.preferredBone;
             aimPriority = preset.aimPriority;
             aimHitAcceptance = preset.hitAcceptance;
+            aimBarrierPolicy = preset.barrierPolicy;
+            aimRoleUtilityMode = preset.roleUtilityMode;
             hitbox = preset.hitbox;
             Prediction = true;
             aimbotPredictionMode = 0;
@@ -3457,6 +3467,8 @@ namespace OW { namespace Config {
             AddJsonInt(value, "preferredBone", preset.preferredBone, allocator);
             AddJsonInt(value, "aimPriority", preset.aimPriority, allocator);
             AddJsonInt(value, "hitAcceptance", preset.hitAcceptance, allocator);
+            AddJsonInt(value, "barrierPolicy", preset.barrierPolicy, allocator);
+            AddJsonInt(value, "roleUtilityMode", preset.roleUtilityMode, allocator);
             AddJsonFloat(value, "hitboxScale", preset.hitbox, allocator);
             AddJsonInt(value, "aimMode", preset.aimMode, allocator);
             AddJsonInt(value, "aimBehavior", preset.aimBehavior, allocator);
@@ -4601,6 +4613,10 @@ namespace OW { namespace Config {
                 defaults.aimPriority = static_cast<int>(migratedPriority);
                 defaults.hitAcceptance = static_cast<int>(migratedAcceptance);
             }
+            defaults.barrierPolicy = static_cast<int>(ClampBarrierPolicy(
+                ReadJsonInt(value, "barrierPolicy", defaults.barrierPolicy)));
+            defaults.roleUtilityMode = static_cast<int>(ClampRoleUtilityMode(
+                ReadJsonInt(value, "roleUtilityMode", defaults.roleUtilityMode)));
             defaults.hitbox = ReadJsonHitboxScaleCompat(
                 value,
                 "hitboxScale",
@@ -5031,6 +5047,10 @@ namespace OW { namespace Config {
                 preset.aimPriority = static_cast<int>(migratedPriority);
                 preset.hitAcceptance = static_cast<int>(migratedAcceptance);
             }
+            preset.barrierPolicy = static_cast<int>(ClampBarrierPolicy(
+                ReadInt(ini, section, "barrierPolicy", preset.barrierPolicy)));
+            preset.roleUtilityMode = static_cast<int>(ClampRoleUtilityMode(
+                ReadInt(ini, section, "roleUtilityMode", preset.roleUtilityMode)));
             preset.hitbox = ReadHitboxScaleCompat(
                 ini,
                 section,
@@ -5171,6 +5191,10 @@ namespace OW { namespace Config {
                 slot.preset.aimPriority = static_cast<int>(migratedPriority);
                 slot.preset.hitAcceptance = static_cast<int>(migratedAcceptance);
             }
+            slot.preset.barrierPolicy = static_cast<int>(ClampBarrierPolicy(
+                ReadInt(ini, section, "barrierPolicy", slot.preset.barrierPolicy)));
+            slot.preset.roleUtilityMode = static_cast<int>(ClampRoleUtilityMode(
+                ReadInt(ini, section, "roleUtilityMode", slot.preset.roleUtilityMode)));
             slot.preset.hitbox = ReadHitboxScaleCompat(
                 ini,
                 section,
@@ -7494,6 +7518,10 @@ namespace OW { namespace Config {
                 aimPriority = static_cast<int>(migratedPriority);
                 aimHitAcceptance = static_cast<int>(migratedAcceptance);
             }
+            aimBarrierPolicy = static_cast<int>(ClampBarrierPolicy(
+                ReadInt(ini, kAimbotSection, "barrierPolicy", aimBarrierPolicy)));
+            aimRoleUtilityMode = static_cast<int>(ClampRoleUtilityMode(
+                ReadInt(ini, kAimbotSection, "roleUtilityMode", aimRoleUtilityMode)));
             LoadOutputSettingsUnlocked(ini);
             V2::HeroSettings::Migrate(V2::Alerts::GetSettings());
             rapidjson::Document defaults;
@@ -7997,9 +8025,7 @@ namespace OW { namespace Config {
         void ApplyLocalHeroAimPreset(const HeroPreset& rawPreset)
         {
             const HeroPreset preset = ValidateHeroPresetValue(rawPreset);
-            slotTargetRules={true,preset.ignoreInvisible,preset.requireTargetable,preset.allyHealthMaxPercent,
-                preset.maxTargetSpeedMps,preset.allyBoneMask,preset.predictionAlgorithm,
-                preset.boneSelectionMode,preset.preferredBone,preset.aimPriority,preset.hitAcceptance};
+            PopulateSlotTargetRulesFromPreset(slotTargetRules, preset, preset.ignoreInvisible);
             View_aimModeState()={true,static_cast<const AimBehaviorTuning&>(preset),preset.aimPlan.motion,preset.behaviorConfigs};
             View_Fov() = preset.fov;
             View_minFov1() = preset.fov;
@@ -8073,7 +8099,7 @@ namespace OW { namespace Config {
         void ApplyLocalHeroTriggerPreset(const HeroPreset& rawPreset)
         {
             const HeroPreset preset = ValidateHeroPresetValue(rawPreset);
-            slotTargetRules={true,preset.trigger.ignoreInvisible,preset.requireTargetable,preset.allyHealthMaxPercent,preset.maxTargetSpeedMps,preset.allyBoneMask,preset.predictionAlgorithm};
+            PopulateSlotTargetRulesFromPreset(slotTargetRules, preset, preset.trigger.ignoreInvisible);
             View_aimPlan() = {};
             View_aimPlan().selection = preset.aimPlan.selection;
             View_triggerbot() = preset.trigger.enabled;

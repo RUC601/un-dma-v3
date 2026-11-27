@@ -665,4 +665,102 @@ inline RayBatchPlan PlanRayBatch(const RayBatchPlanInput& in) noexcept {
     return plan;
 }
 
+// Phase 3 (§6.3 Slot 3, §8.1, §8.2, Decision #4): shared production + selftest seam for
+// dynamic barrier-layer evaluation when VisibilityPolicy::RayWorldAndBarrier is active.
+// Only runs when WaitBarrierDrop is selected, barrierMask != 0, and the world path is Clear.
+struct BarrierEvaluationResult {
+    bool barrierActive = false;         // True when Slot 3 barrier check governs this segment
+    bool barrierBlocked = false;        // Fresh barrier ray returned Occluded -> TraceHitKind::Barrier
+    bool barrierClear = false;          // Fresh barrier ray returned Clear
+    bool barrierVacuum = false;         // Barrier ray missing/Stale/Timeout/Unavailable/Invalid
+    TraceHitKind hitKind = TraceHitKind::None;
+    RayDecision barrierDecision{};
+    std::optional<EngineTrace::RayQueryBroker::Query> slot3Query{};
+    bool slot3Urgent = false;
+};
+
+inline BarrierEvaluationResult EvaluateBarrierLayerDecision(
+    EngineTrace::RayQueryBroker& broker,
+    VisibilityPolicy visibilityPolicy,
+    BarrierPolicy barrierPolicy,
+    uint64_t barrierMask,
+    bool worldClear,
+    const Vector3& rayStart,
+    const Vector3& rayEnd,
+    uint64_t frame,
+    uint64_t connectionEpoch,
+    uint64_t sceneEpoch,
+    uint64_t entityKey,
+    uint64_t actorGeneration,
+    int boneId,
+    uint32_t sampleTick,
+    uint32_t maxAgeMs,
+    bool submitImmediately = false) noexcept {
+    BarrierEvaluationResult out{};
+    if (!worldClear) {
+        out.hitKind = TraceHitKind::World;
+        return out;
+    }
+    if (visibilityPolicy != VisibilityPolicy::RayWorldAndBarrier ||
+        barrierPolicy != BarrierPolicy::WaitBarrierDrop ||
+        barrierMask == 0 ||
+        sceneEpoch == 0) {
+        out.hitKind = TraceHitKind::None;
+        return out;
+    }
+
+    out.barrierActive = true;
+
+    EngineTrace::RayQueryBroker::Query q{};
+    q.request.start = {rayStart.X, rayStart.Y, rayStart.Z};
+    q.request.end = {rayEnd.X, rayEnd.Y, rayEnd.Z};
+    q.request.mask = barrierMask;
+    q.request.sceneEpoch = sceneEpoch;
+    q.frame = frame;
+    q.connectionEpoch = connectionEpoch;
+    q.sceneEpoch = sceneEpoch;
+    q.entityKey = entityKey;
+    q.actorGeneration = actorGeneration;
+    q.boneId = boneId;
+    q.sampleTick = sampleTick;
+    q.segmentKind = RaySegmentKind::Barrier;
+    q.segmentIndex = 0;
+
+    const auto cached = broker.Latest(
+        q.request, frame, connectionEpoch, sceneEpoch,
+        entityKey, actorGeneration, boneId, maxAgeMs,
+        EngineTrace::RayQueryBroker::kDefaultMaxEndpointDriftMeters,
+        RaySegmentKind::Barrier, 0);
+
+    out.slot3Query = q;
+    if (!cached.has_value()) {
+        out.barrierVacuum = true;
+        out.slot3Urgent = true;
+        out.hitKind = TraceHitKind::Unknown;
+        out.barrierDecision.world = RayDecisionStatus::Unknown;
+        out.barrierDecision.segmentKind = RaySegmentKind::Barrier;
+        out.barrierDecision.segmentIndex = 0;
+    } else {
+        out.barrierDecision = *cached;
+        if (cached->world == RayDecisionStatus::Occluded && cached->Fresh(maxAgeMs)) {
+            out.barrierBlocked = true;
+            out.slot3Urgent = false;
+            out.hitKind = TraceHitKind::Barrier;
+        } else if (cached->world == RayDecisionStatus::Clear && cached->Fresh(maxAgeMs)) {
+            out.barrierClear = true;
+            out.slot3Urgent = false;
+            out.hitKind = TraceHitKind::None;
+        } else {
+            out.barrierVacuum = true;
+            out.slot3Urgent = true;
+            out.hitKind = TraceHitKind::Unknown;
+        }
+    }
+
+    if (submitImmediately) {
+        broker.Submit(q);
+    }
+    return out;
+}
+
 }  // namespace OW::TrajectoryRay

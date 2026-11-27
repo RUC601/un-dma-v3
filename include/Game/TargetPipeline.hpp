@@ -426,4 +426,39 @@ struct AcquisitionContext {
     std::size_t stage1TopK = 3;
 };
 
+inline constexpr uint32_t kFastTargetRayMaxAgeMs = 60u;
+inline constexpr float kFastTargetSpeedThresholdMps = 4.5f;
+
+// Shared ray-cache freshness threshold (§6.2): fast-moving targets (> 4.5 m/s) tighten
+// maxAgeMs from 100 ms to 60 ms across BOTH acceptance lookup and off-guidance warmup.
+inline constexpr uint32_t ResolveCandidateRayMaxAgeMs(float targetSpeedMps) noexcept
+{
+    return (targetSpeedMps > kFastTargetSpeedThresholdMps)
+        ? kFastTargetRayMaxAgeMs
+        : 100u;
+}
+
+// Shared Stage 0 protection-state hard filter seam (§1.2, §4.1):
+// ONLY rejects enemy targets (isEnemy == true) with stale health samples (>500ms),
+// imort == true, or barrprot == true. NEVER rejects allies receiving healing.
+inline constexpr bool ProtectionFilterPasses(bool isEnemy,
+                                             bool requireTargetable,
+                                             bool imort,
+                                             bool barrprot,
+                                             uint32_t healthSampleTickMs,
+                                             uint32_t nowMs,
+                                             bool* outStaleHealthSample = nullptr) noexcept
+{
+    if (outStaleHealthSample) *outStaleHealthSample = false;
+    if (!requireTargetable || !isEnemy)
+        return true;
+    const bool protectionFresh = healthSampleTickMs != 0 &&
+        static_cast<uint32_t>(nowMs - healthSampleTickMs) <= 500u;
+    if (!protectionFresh) {
+        if (outStaleHealthSample) *outStaleHealthSample = true;
+        return false;
+    }
+    return !imort && !barrprot;
+}
+
 } // namespace OW::TargetPipeline

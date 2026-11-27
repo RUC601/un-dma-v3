@@ -135,6 +135,20 @@ void DrawMiscGeneralPage() {
                       : "Hybrid is selected but the ray scene is not established yet (not in a match, or switching maps): world occlusion is unavailable and non-contour targets are rejected."));
             ImGui::PopStyleColor();
         }
+        const uint64_t worldMask = OW::RayRuntime::WorldRayMask();
+        const uint64_t barrierMask = OW::RayRuntime::BarrierRayMask();
+        const OW::VisibilityPolicy effectivePolicy = OW::ResolveVisibilityPolicy(
+            UI::Preferences::values.rayBackend,
+            OW::Config::View_aimbotContourEnabled(),
+            OW::ClampBarrierPolicy(OW::Config::aimBarrierPolicy),
+            barrierMask);
+        ImGui::TextDisabled(zh ? "全局默认可见性策略: %s（各英雄槽位可单独覆盖屏障策略）| 世界掩码: 0x%llX | 屏障掩码: %s"
+                               : "Default visibility policy (global; slots may override barrier): %s | World mask: 0x%llX | Barrier mask: %s",
+                            OW::VisibilityPolicyName(effectivePolicy),
+                            static_cast<unsigned long long>(worldMask),
+                            barrierMask != 0
+                                ? "configured"
+                                : (zh ? "未验证 (0)" : "unsupported (0)"));
     }
     SettingRow(zh ? "本地场景" : "Local scene");
     static bool sceneOpenFailed = false;

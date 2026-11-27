@@ -266,6 +266,43 @@ void UI::AimbotPage() {
         if (ImGui::IsItemHovered())
             ImGui::SetTooltip("%s", L("Controls whether firing requires the selected guidance bone or accepts any allowed hitbox."));
 
+        SettingRow(L("Barrier policy"));
+        const char* barrierPolicies[] = { L("Ignore barrier"), L("Wait barrier drop") };
+        activePreset.barrierPolicy = static_cast<int>(OW::ClampBarrierPolicy(activePreset.barrierPolicy));
+        PushControlWidth();
+        presetChanged |= UISelect("##aimBarrierPolicy", &activePreset.barrierPolicy,
+                                  barrierPolicies, IM_ARRAYSIZE(barrierPolicies));
+        ImGui::PopItemWidth();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", L("Wait barrier drop holds PreAim on dynamic shields (Slot 3) and fires once the barrier drops."));
+        {
+            const uint64_t barrierMask = OW::RayRuntime::BarrierRayMask();
+            const int activeRayBackend = UI::Preferences::ActiveRayBackend();
+            if (OW::RayPolicyNeedsBarrierNotice(activeRayBackend,
+                                                OW::ClampBarrierPolicy(activePreset.barrierPolicy),
+                                                barrierMask)) {
+                const bool zh = OW::Config::uiLanguage == 1;
+                ImGui::PushStyleColor(ImGuiCol_Text, ImVec4(1.0f, 0.72f, 0.30f, 1.0f));
+                ImGui::TextWrapped("%s",
+                    activeRayBackend != static_cast<int>(OW::RayDecisionPolicy::Hybrid)
+                        ? (zh ? "Wait barrier drop 需要 Misc -> 射线查询 启用 Hybrid；当前按 Lite/Vision 运行。"
+                              : "Wait barrier drop requires Hybrid ray policy in Misc -> Ray queries; running in Lite/Vision.")
+                        : (zh ? "当前构建尚无实机验证的动态屏障掩码（rayBarrierMask=0），Slot 3 将让渡给次候选并仅执行世界层射线。"
+                              : "Active build has no live-verified barrier mask yet (rayBarrierMask=0); Slot 3 yields and world-only ray checks remain active."));
+                ImGui::PopStyleColor();
+            }
+        }
+
+        SettingRow(L("Role utility"));
+        const char* roleUtilityModes[] = { L("Auto"), L("Off"), L("Smart Ana") };
+        activePreset.roleUtilityMode = static_cast<int>(OW::ClampRoleUtilityMode(activePreset.roleUtilityMode));
+        PushControlWidth();
+        presetChanged |= UISelect("##aimRoleUtilityMode", &activePreset.roleUtilityMode,
+                                  roleUtilityModes, IM_ARRAYSIZE(roleUtilityModes));
+        ImGui::PopItemWidth();
+        if (ImGui::IsItemHovered())
+            ImGui::SetTooltip("%s", L("Pluggable Stage 1/2 hero utility scoring (Auto enables Smart Ana ally-crisis vs enemy-execute when playing Ana)."));
+
         // Legacy NearestHitbox velocity tie-breaker: only visible when Aim priority is Nearest hitbox (Finding #13).
         if (activePreset.aimPriority == static_cast<int>(OW::AimPriority::NearestHitbox)) {
             SettingRow(L("Nearest tie-breaker"));

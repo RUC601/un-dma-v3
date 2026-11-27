@@ -218,6 +218,7 @@ struct TargetCandidate {
     bool requireExplicitCritical = false;
     SkeletonBoneMask acceptanceMask = 0;
     uint32_t worldClearSlotMask = 0;
+    uint32_t barrierClearSlotMask = 0;
     Vector3 rawAimPoint{};
     Vector3 predictedAimPoint{};
     Vector3 aimPoint{};
@@ -227,10 +228,13 @@ struct TargetCandidate {
     float effectiveFovDeg = 0.0f;
     float peekGateDeg = 0.0f;
     float utilityScore = 0.0f;
+    float roleUtility = 0.0f;
     float commitment = 0.0f;
     float intentAlignment = 0.0f;
     float intentGain = 1.0f;
     InputStance stance = InputStance::ActiveDrag;
+    VisibilityPolicy visibilityPolicy = VisibilityPolicy::Lite;
+    BarrierPolicy barrierPolicy = BarrierPolicy::IgnoreBarrier;
     int dynamicFovPresetId = -1;
     bool dynamicFov = false;
     bool predictedFovEntry = false;
@@ -275,15 +279,19 @@ struct TargetSolution {
     Vector2 guidanceScreenPoint{};
     SkeletonBoneMask acceptanceMask = 0;
     uint32_t worldClearSlotMask = 0;
+    uint32_t barrierClearSlotMask = 0;
     float effectiveHitWindow = 0.0f;
     NativeHitWindowInput nativeHitWindow{};
 
     // Utility scoring, commitment, and intent evidence snapshot
     float utilityScore = 0.0f;
+    float roleUtility = 0.0f;
     float commitment = 0.0f;
     float intentAlignment = 0.0f;
     float intentGain = 1.0f;
     InputStance stance = InputStance::ActiveDrag;
+    VisibilityPolicy visibilityPolicy = VisibilityPolicy::Lite;
+    BarrierPolicy barrierPolicy = BarrierPolicy::IgnoreBarrier;
     float distance = 0.0f;
     float angularErrorDeg = 0.0f;
     float effectiveFovDeg = 0.0f;
@@ -332,6 +340,7 @@ struct TargetSolution {
         c.requireExplicitCritical = requireExplicitCritical;
         c.acceptanceMask = acceptanceMask;
         c.worldClearSlotMask = worldClearSlotMask;
+        c.barrierClearSlotMask = barrierClearSlotMask;
         c.rawAimPoint = rawGuidancePoint;
         c.predictedAimPoint = predictedGuidancePoint;
         c.aimPoint = guidanceAimPoint;
@@ -341,10 +350,13 @@ struct TargetSolution {
         c.effectiveFovDeg = effectiveFovDeg;
         c.peekGateDeg = peekGateDeg;
         c.utilityScore = utilityScore;
+        c.roleUtility = roleUtility;
         c.commitment = commitment;
         c.intentAlignment = intentAlignment;
         c.intentGain = intentGain;
         c.stance = stance;
+        c.visibilityPolicy = visibilityPolicy;
+        c.barrierPolicy = barrierPolicy;
         c.dynamicFovPresetId = dynamicFovPresetId;
         c.dynamicFov = dynamicFov;
         c.predictedFovEntry = predictedFovEntry;
@@ -387,13 +399,17 @@ struct TargetSolution {
         s.guidanceScreenPoint = c.screenPoint;
         s.acceptanceMask = c.acceptanceMask;
         s.worldClearSlotMask = c.worldClearSlotMask;
+        s.barrierClearSlotMask = c.barrierClearSlotMask;
         s.effectiveHitWindow = c.effectiveHitWindow;
         s.nativeHitWindow = c.nativeHitWindow;
         s.utilityScore = c.utilityScore;
+        s.roleUtility = c.roleUtility;
         s.commitment = c.commitment;
         s.intentAlignment = c.intentAlignment;
         s.intentGain = c.intentGain;
         s.stance = c.stance;
+        s.visibilityPolicy = c.visibilityPolicy;
+        s.barrierPolicy = c.barrierPolicy;
         s.distance = c.distance;
         s.angularErrorDeg = c.fovScore;
         s.effectiveFovDeg = c.effectiveFovDeg;

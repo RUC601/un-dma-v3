@@ -189,6 +189,8 @@ struct EdgeFanAnalysis {
     float edgeOffsetMeters = 0.0f;
     float wallFraction = 0.0f;
     float clearFraction = 1.0f;
+    bool usedHitNormal = false;    // Phase 3: true when wall hitNormal refined edge clearance
+    Vector3 wallNormal{};          // Unit surface normal from the blocking wall ray (when available)
     Vector3 parkPoint{};           // Expected wall-edge emerge point (with outward body margin)
 };
 
@@ -263,7 +265,37 @@ inline EdgeFanAnalysis AnalyzeEdgeFanResults(
                 ? bodyMarginMeters : kDefaultBodyRadiusMeters;
             const float boundedMax = (std::isfinite(maxFanWidthMeters) && maxFanWidthMeters > 0.0f)
                 ? maxFanWidthMeters : out.bracketHiMeters;
-            const float parkOffset = (std::min)(boundedMax, out.edgeOffsetMeters + margin);
+
+            // Phase 3 (§9): when the blocking wall ray carries a valid surface normal, align
+            // the outward park offset with the horizontal wall tangent so angled walls neither
+            // over-shoot into open space nor clip behind the wall face.
+            float effectiveMargin = margin;
+            const RayDecision& wallDec = *decisions[i - 1];
+            if (wallDec.hasHitNormal &&
+                std::isfinite(wallDec.hitNormalX) &&
+                std::isfinite(wallDec.hitNormalY) &&
+                std::isfinite(wallDec.hitNormalZ)) {
+                out.wallNormal = Vector3(wallDec.hitNormalX, wallDec.hitNormalY, wallDec.hitNormalZ);
+                const float horizNorm = std::hypot(wallDec.hitNormalX, wallDec.hitNormalZ);
+                if (horizNorm > 0.25f) {
+                    const float nx = wallDec.hitNormalX / horizNorm;
+                    const float nz = wallDec.hitNormalZ / horizNorm;
+                    // Horizontal wall tangent perpendicular to (nx, 0, nz), oriented along lateralDir.
+                    float tx = -nz;
+                    float tz = nx;
+                    const float latDot = tx * lateralDir.X + tz * lateralDir.Z;
+                    if (latDot < 0.0f) {
+                        tx = -tx;
+                        tz = -tz;
+                    }
+                    const float tangentAlign = std::clamp(
+                        std::fabs(tx * lateralDir.X + tz * lateralDir.Z), 0.35f, 1.0f);
+                    effectiveMargin = margin * tangentAlign;
+                    out.usedHitNormal = true;
+                }
+            }
+
+            const float parkOffset = (std::min)(boundedMax, out.edgeOffsetMeters + effectiveMargin);
             out.parkPoint = targetPos + lateralDir * parkOffset;
             out.parkPoint.Y = targetPos.Y;  // Keep target head/torso elevation
             return out;

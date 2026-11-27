@@ -44,4 +44,15 @@ uint64_t SceneEpoch() noexcept;
 // Configured concurrent Unicorn engine count for live VisionProbe batches (default 6).
 int ProbeEngineCount() noexcept;
 
+// Active profile's verified static world-occlusion mask (setup + 0x58).
+uint64_t WorldRayMask() noexcept;
+
+// Active profile's verified dynamic barrier-layer mask for Slot 3 WaitBarrierDrop queries.
+// Returns 0 when the active build has no live-verified barrier mask yet.
+uint64_t BarrierRayMask() noexcept;
+
+// Explicit test-only seam to exercise the full Slot 3 barrier pipeline offline without
+// fabricating unverified profile offsets. Passing 0 restores the active profile value.
+void SetBarrierRayMaskOverrideForTest(uint64_t mask) noexcept;
+
 }  // namespace OW::RayRuntime

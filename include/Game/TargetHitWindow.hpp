@@ -63,7 +63,10 @@ inline bool InSelectedAimHitWindow(const TargetCandidate& candidate,
     const Vector3& aimPoint)
 {
     const bool contourExposed = candidate.contour.evidence.exposed && candidate.contour.evidence.fresh;
-    if (!RayDecisionAllowsSelection(candidate.ray, contourExposed,
+    RayDecision effectiveRay = candidate.ray;
+    if (candidate.barrierPolicy != BarrierPolicy::WaitBarrierDrop)
+        effectiveRay.barrierCheckRequired = false;
+    if (!RayDecisionAllowsSelection(effectiveRay, contourExposed,
                                     UI::Preferences::ActiveRayBackend()))
         return false;
     if (NativeHitboxSampleUsable(candidate.entitySnapshot, GetTickCount())) {
@@ -102,7 +105,10 @@ inline bool InAllowedAimHitWindow(const TargetCandidate& candidate,
     if (!candidate.valid)
         return false;
     const bool contourExposed = candidate.contour.evidence.exposed && candidate.contour.evidence.fresh;
-    if (!RayDecisionAllowsSelection(candidate.ray, contourExposed,
+    RayDecision effectiveRay = candidate.ray;
+    if (candidate.barrierPolicy != BarrierPolicy::WaitBarrierDrop)
+        effectiveRay.barrierCheckRequired = false;
+    if (!RayDecisionAllowsSelection(effectiveRay, contourExposed,
                                     UI::Preferences::ActiveRayBackend()))
         return false;
     if (allowedBoneMask == 0)
@@ -112,6 +118,10 @@ inline bool InAllowedAimHitWindow(const TargetCandidate& candidate,
     const bool requirePerBoneWorldClear =
         !contourExposed &&
         UI::Preferences::ActiveRayBackend() == static_cast<int>(RayDecisionPolicy::Hybrid);
+    const bool requirePerBoneBarrierClear =
+        requirePerBoneWorldClear &&
+        candidate.barrierPolicy == BarrierPolicy::WaitBarrierDrop &&
+        candidate.ray.barrierCheckRequired;
     if (NativeHitboxSampleUsable(candidate.entitySnapshot, now) &&
         candidate.nativeHitWindow.projectileRadius >= 0.0f &&
         (candidate.aimPoint + sampleDisplacement).DistTo(aimPoint) <= 0.0001f) {
@@ -129,11 +139,13 @@ inline bool InAllowedAimHitWindow(const TargetCandidate& candidate,
             if (boneId == candidate.boneId) {
                 checkedSelectedBone = true;
             } else if (requirePerBoneWorldClear) {
-                // Under Hybrid world ray occlusion, guidance-bone Clear cannot authorize
+                // Under Hybrid world/barrier ray occlusion, guidance-bone Clear cannot authorize
                 // firing at a different render slot unless THAT exact slot (left/right distinct)
-                // also has fresh WorldClear (R2 fix).
+                // also has fresh WorldClear (and fresh BarrierClear under WaitBarrierDrop).
                 const uint32_t slotBit = slot < 32 ? (1u << static_cast<uint32_t>(slot)) : 0u;
                 if ((candidate.worldClearSlotMask & slotBit) == 0)
+                    continue;
+                if (requirePerBoneBarrierClear && (candidate.barrierClearSlotMask & slotBit) == 0)
                     continue;
             }
             const bool slotCriticalOnly =
@@ -158,9 +170,10 @@ inline bool InAllowedAimHitWindow(const TargetCandidate& candidate,
     return InSelectedAimHitWindow(candidate, viewAngle, targetAngle, camera, aimPoint);
 }
 
-// Unified Phase 2 program-generated auto-fire gate (§5.4, §5.5, §8.2, Decision #7):
-// enforces valid Engageable tier, expired PeekEmerge ReactionDelayGate, and Fresh Clear
-// under Hybrid ray policy (blocking PreAim, Ignored, reaction delay, and observation vacuum).
+// Unified Phase 2/3 program-generated auto-fire gate (§5.4, §5.5, §8.2, Decision #4, #7):
+// enforces valid Engageable tier, expired PeekEmerge ReactionDelayGate, policy-gated Barrier block
+// (WaitBarrierDrop blocks Barrier; IgnoreBarrier honors §8.2 IgnoreBarrier x Barrier cell),
+// and Fresh Clear (world + active Slot 3 barrier) under Hybrid ray policy.
 inline bool CandidateAutoFireGateAllowed(const TargetCandidate& candidate,
                                          int activeRayBackend) noexcept
 {
@@ -169,15 +182,23 @@ inline bool CandidateAutoFireGateAllowed(const TargetCandidate& candidate,
         candidate.reactionRemainingMs > 0.0f) {
         return false;
     }
+    const bool waitBarrierDrop = candidate.barrierPolicy == BarrierPolicy::WaitBarrierDrop;
+    if (waitBarrierDrop && candidate.hitKind == TraceHitKind::Barrier) {
+        return false;
+    }
     const bool contourExposed =
         candidate.contour.evidence.exposed && candidate.contour.evidence.fresh;
-    return RayDecisionAllowsAutoFire(candidate.ray, contourExposed, activeRayBackend);
+    RayDecision effectiveRay = candidate.ray;
+    if (!waitBarrierDrop) {
+        effectiveRay.barrierCheckRequired = false;
+    }
+    return RayDecisionAllowsAutoFire(effectiveRay, contourExposed, activeRayBackend);
 }
 
 // Shared Stage 3 tracking output & fire-eligibility decision seam (§5.4, §5.5, §8.2, F9):
 // consumed directly by BehaviorController::RunTracking and exercised by offline selftests.
 enum class TrackingStageDecision : uint8_t {
-    NoOutput = 0,       // Ignored, PreAim Parked, PreAim pending EdgeFan, or ReactionDelayGate active
+    NoOutput = 0,       // Ignored, PreAim Parked, Barrier PreAim, PreAim pending EdgeFan, or ReactionDelayGate active
     PreAimParkMove,     // PreAim Positioning with valid P_park (auto-fire strictly forbidden)
     EngagePullOnly,     // Engageable + reaction expired, auto-fire blocked (e.g. Hybrid vacuum grace)
     EngagePullAndFire,  // Engageable + reaction expired + auto-fire gate allowed
@@ -189,6 +210,10 @@ inline TrackingStageDecision EvaluateTrackingStageDecision(const TargetCandidate
     if (!candidate.valid)
         return TrackingStageDecision::NoOutput;
     if (candidate.tier == VisibilityTier::PreAim) {
+        if (candidate.barrierPolicy == BarrierPolicy::WaitBarrierDrop &&
+            candidate.hitKind == TraceHitKind::Barrier) {
+            return TrackingStageDecision::NoOutput;
+        }
         return (candidate.preAimPhase == PreAimPhase::Positioning && candidate.preAimParkPointValid)
             ? TrackingStageDecision::PreAimParkMove
             : TrackingStageDecision::NoOutput;
@@ -213,7 +238,10 @@ inline bool InCandidateHitWindow(const TargetCandidate& candidate,
     if (candidate.hitAcceptance == HitAcceptance::SelectedOnly) {
         if (NativeHitboxSampleUsable(candidate.entitySnapshot, GetTickCount())) {
             const bool contourExposed = candidate.contour.evidence.exposed && candidate.contour.evidence.fresh;
-            if (!RayDecisionAllowsSelection(candidate.ray, contourExposed,
+            RayDecision effectiveRay = candidate.ray;
+            if (candidate.barrierPolicy != BarrierPolicy::WaitBarrierDrop)
+                effectiveRay.barrierCheckRequired = false;
+            if (!RayDecisionAllowsSelection(effectiveRay, contourExposed,
                                             UI::Preferences::ActiveRayBackend()))
                 return false;
             const auto score = SelectedAimNativeHitScore(

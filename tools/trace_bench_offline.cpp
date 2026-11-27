@@ -6,6 +6,8 @@
 #include <bit>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
+#include <fstream>
 #include <span>
 
 namespace {
@@ -42,6 +44,35 @@ constexpr unsigned char kEchoStartXToFraction[] = {
     0x8B, 0x01,             // mov eax, [rcx]
     0x89, 0x42, 0x30,       // mov [rdx+0x30], eax
     0xC3
+};
+// Phase 3: branches on low byte of [rcx+0x58] (per-request mask).
+//   mask low byte != 0x55 -> writes fraction=1.0f (miss, no hitPos/hitNormal)
+//   mask low byte == 0x55 -> writes hitPos=(10,2,5) at +0x00, hitNormal=(3,0,4) at +0x10,
+//                            and fraction=0.25f at +0x30.
+constexpr unsigned char kMaskBranchAndHitNormal[] = {
+    0x8A, 0x41, 0x58,                               // mov al, [rcx+0x58]
+    0x3C, 0x55,                                     // cmp al, 0x55
+    0x74, 0x0B,                                     // je +11
+    0xC7, 0x42, 0x30, 0x00, 0x00, 0x80, 0x3F,       // mov dword [rdx+0x30], 1.0f
+    0xC3,                                           // ret
+    0x90, 0x90, 0x90,                               // pad to +11
+    0xC7, 0x02, 0x00, 0x00, 0x20, 0x41,             // mov dword [rdx+0x00], 10.0f
+    0xC7, 0x42, 0x04, 0x00, 0x00, 0x00, 0x40,       // mov dword [rdx+0x04], 2.0f
+    0xC7, 0x42, 0x08, 0x00, 0x00, 0xA0, 0x40,       // mov dword [rdx+0x08], 5.0f
+    0xC7, 0x42, 0x10, 0x00, 0x00, 0x40, 0x40,       // mov dword [rdx+0x10], 3.0f
+    0xC7, 0x42, 0x14, 0x00, 0x00, 0x00, 0x00,       // mov dword [rdx+0x14], 0.0f
+    0xC7, 0x42, 0x18, 0x00, 0x00, 0x80, 0x40,       // mov dword [rdx+0x18], 4.0f
+    0xC7, 0x42, 0x30, 0x00, 0x00, 0x80, 0x3E,       // mov dword [rdx+0x30], 0.25f
+    0xC3                                            // ret
+};
+// Phase 3 edge case: blocking hit at fraction=0.0f, exact world origin (0,0,0), and NaN hitNormal.
+constexpr unsigned char kOriginHitZeroFractionNanNormal[] = {
+    0xC7, 0x02, 0x00, 0x00, 0x00, 0x00,             // mov dword [rdx+0x00], 0.0f
+    0xC7, 0x42, 0x04, 0x00, 0x00, 0x00, 0x00,       // mov dword [rdx+0x04], 0.0f
+    0xC7, 0x42, 0x08, 0x00, 0x00, 0x00, 0x00,       // mov dword [rdx+0x08], 0.0f
+    0xC7, 0x42, 0x10, 0x00, 0x00, 0xC0, 0x7F,       // mov dword [rdx+0x10], qNaN
+    0xC7, 0x42, 0x30, 0x00, 0x00, 0x00, 0x00,       // mov dword [rdx+0x30], 0.0f
+    0xC3                                            // ret
 };
 
 struct Fixture {
@@ -221,6 +252,90 @@ int RunTraceBackendSelfTest() {
         }
         waveProbe.Stop();
         check(restartOk, "6-engine VisionProbe restarts cleanly on new sceneEpoch");
+    }
+
+    // Phase 3: per-request mask propagation (kSetup+0x58) + hitPosition (+0x00) & normalized
+    // hitNormal (+0x10) backfill across a concurrent multi-mask VisionProbe wave.
+    {
+        Fixture maskFixture{kMaskBranchAndHitNormal};
+        VisionProbe::Config probeCfg;
+        probeCfg.entryRva = 0;
+        probeCfg.context = kContext;
+        probeCfg.mask = kDefaultWorldMask;
+        probeCfg.engines = 2;
+        probeCfg.timeoutUs = 0;
+        VisionProbe maskProbe(probeCfg, maskFixture.Reader(), kImage, kPageSize);
+        const bool started = maskProbe.Start(kScene);
+        Request worldReq = request;
+        worldReq.mask = kDefaultWorldMask;
+        Request barrierReq = request;
+        barrierReq.mask = 0x0690000000000055ull;
+        const auto res = started ? maskProbe.Probe({worldReq, barrierReq}) : std::vector<Result>{};
+        maskProbe.Stop();
+        const bool worldMissOk =
+            started && res.size() == 2 &&
+            res[0].status == Status::Ok &&
+            res[0].fraction == 1.0f &&
+            !res[0].hasHitPosition &&
+            !res[0].hasHitNormal;
+        const auto nearf = [](float a, float b) { return std::abs(a - b) <= 1e-4f; };
+        const bool barrierHitOk =
+            started && res.size() == 2 &&
+            res[1].status == Status::Ok &&
+            nearf(res[1].fraction, 0.25f) &&
+            res[1].hasHitPosition &&
+            nearf(res[1].hitPosition.x, 10.0f) &&
+            nearf(res[1].hitPosition.y, 2.0f) &&
+            nearf(res[1].hitPosition.z, 5.0f) &&
+            res[1].hasHitNormal &&
+            nearf(res[1].hitNormal.x, 0.6f) &&
+            nearf(res[1].hitNormal.y, 0.0f) &&
+            nearf(res[1].hitNormal.z, 0.8f);
+        check(worldMissOk, "per-request world mask leaves miss hitPosition/hitNormal unset");
+        check(barrierHitOk, "per-request mask reaches setup+0x58 and backfills hitPosition + unit hitNormal");
+
+        // Edge case: fraction=0.0f blocking hit at exact origin (0,0,0) with NaN hitNormal
+        // must keep hasHitPosition=true at (0,0,0) and reject NaN normal (hasHitNormal=false).
+        Fixture originFixture{kOriginHitZeroFractionNanNormal};
+        UnicornBackend originBackend(OfflineConfig());
+        Result originRes{};
+        const bool originBound = Bind(originBackend, originFixture);
+        const auto originStatus = originBound ? originBackend.Trace(worldReq, originRes) : Status::Error;
+        check(originBound && originStatus == Status::Ok &&
+              originRes.fraction == 0.0f &&
+              originRes.hasHitPosition &&
+              originRes.hitPosition.x == 0.0f &&
+              originRes.hitPosition.y == 0.0f &&
+              originRes.hitPosition.z == 0.0f &&
+              !originRes.hasHitNormal,
+              "fraction=0 origin (0,0,0) preserves hasHitPosition and rejects NaN hitNormal");
+
+        // Template-based setup: request.mask must override template bytes at setup+0x58.
+        const auto tmpPath = std::filesystem::temp_directory_path() / "v3_phase3_mask_template.bin";
+        bool templateMaskOk = false;
+        {
+            std::array<uint8_t, 0x240> tpl{};
+            const uint64_t staleMask = 0x0690000000000011ull;
+            std::memcpy(tpl.data() + 0x58, &staleMask, sizeof(staleMask));
+            std::memcpy(tpl.data() + 0x1F0, &kContext, sizeof(kContext));
+            std::ofstream out(tmpPath, std::ios::binary | std::ios::trunc);
+            out.write(reinterpret_cast<const char*>(tpl.data()), static_cast<std::streamsize>(tpl.size()));
+            out.close();
+
+            UnicornConfig tplCfg = OfflineConfig();
+            tplCfg.setupTemplatePath = tmpPath.string();
+            UnicornBackend tplBackend(tplCfg);
+            Result tplRes{};
+            if (Bind(tplBackend, maskFixture) &&
+                tplBackend.Trace(barrierReq, tplRes) == Status::Ok &&
+                nearf(tplRes.fraction, 0.25f) &&
+                tplRes.hasHitNormal) {
+                templateMaskOk = true;
+            }
+            std::error_code ec;
+            std::filesystem::remove(tmpPath, ec);
+        }
+        check(templateMaskOk, "template-based setup still honors per-request mask at setup+0x58");
     }
 
     for (const auto code : {std::span<const unsigned char>(kWriteOnlyFlags),

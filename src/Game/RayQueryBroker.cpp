@@ -330,6 +330,33 @@ void RayQueryBroker::Run() {
                             decision.world = result.fraction < 1.0f
                                 ? RayDecisionStatus::Occluded
                                 : RayDecisionStatus::Clear;
+                            if (result.fraction < 1.0f) {
+                                if (result.hasHitPosition &&
+                                    std::isfinite(result.hitPosition.x) &&
+                                    std::isfinite(result.hitPosition.y) &&
+                                    std::isfinite(result.hitPosition.z)) {
+                                    decision.hitPosX = result.hitPosition.x;
+                                    decision.hitPosY = result.hitPosition.y;
+                                    decision.hitPosZ = result.hitPosition.z;
+                                    decision.hasHitPosition = true;
+                                }
+                                if (result.hasHitNormal &&
+                                    std::isfinite(result.hitNormal.x) &&
+                                    std::isfinite(result.hitNormal.y) &&
+                                    std::isfinite(result.hitNormal.z)) {
+                                    const float normSq =
+                                        result.hitNormal.x * result.hitNormal.x +
+                                        result.hitNormal.y * result.hitNormal.y +
+                                        result.hitNormal.z * result.hitNormal.z;
+                                    if (std::isfinite(normSq) && normSq > 1e-6f) {
+                                        const float invLen = 1.0f / std::sqrt(normSq);
+                                        decision.hitNormalX = result.hitNormal.x * invLen;
+                                        decision.hitNormalY = result.hitNormal.y * invLen;
+                                        decision.hitNormalZ = result.hitNormal.z * invLen;
+                                        decision.hasHitNormal = true;
+                                    }
+                                }
+                            }
                         } else {
                             decision.world = RayDecisionStatus::Invalid;
                         }

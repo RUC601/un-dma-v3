@@ -552,12 +552,16 @@ Status UnicornBackend::Trace(const Request& request, Result& result) {
     uc_engine* engine = reinterpret_cast<uc_engine*>(uc_);
     const float fractionInit = 0.5f;
     const uint32_t flagsZero = 0, hitboxNone = 0xFFFFu;
+    const uint64_t effectiveMask = request.mask != 0 ? request.mask : config_.mask;
     uc_mem_write(engine, kSetup + 0x00, &request.start.x, 4);
     uc_mem_write(engine, kSetup + 0x04, &request.start.y, 4);
     uc_mem_write(engine, kSetup + 0x08, &request.start.z, 4);
     uc_mem_write(engine, kSetup + 0x10, &request.end.x, 4);
     uc_mem_write(engine, kSetup + 0x14, &request.end.y, 4);
     uc_mem_write(engine, kSetup + 0x18, &request.end.z, 4);
+    // Phase 3: honor per-request layer mask (world vs barrier) on every call, including
+    // template setups and multi-mask concurrent VisionProbe waves.
+    uc_mem_write(engine, kSetup + 0x58, &effectiveMask, sizeof(effectiveMask));
     uc_mem_write(engine, kFraction, &fractionInit, 4);
     uc_mem_write(engine, kResult + 0x28, &flagsZero, 4);
     uc_mem_write(engine, kResult + 0x38, &hitboxNone, 4);
@@ -618,6 +622,31 @@ Status UnicornBackend::Trace(const Request& request, Result& result) {
     result.hitFlags = flags;
     result.hitbox = hitbox;
     result.entityId = entity;
+
+    // Phase 3: backfill hitPosition (+0x00) and hitNormal (+0x10) on blocking hits.
+    // Layout statically verified across World 155284 (0xD0D891..0xD0D8C9), CN 155284N
+    // (0x10213FD..0x102142D), and Nexon 155284KB (0x100B6FD..0x100B72D), and live-confirmed
+    // on World 155284 blocked-native.log.
+    if (fraction < 1.0f) {
+        float rawPos[3] = {};
+        float rawNorm[3] = {};
+        if (uc_mem_read(engine, kResult + 0x00, rawPos, sizeof(rawPos)) == UC_ERR_OK &&
+            std::isfinite(rawPos[0]) && std::isfinite(rawPos[1]) && std::isfinite(rawPos[2])) {
+            result.hitPosition = {rawPos[0], rawPos[1], rawPos[2]};
+            result.hasHitPosition = true;
+        }
+        if (uc_mem_read(engine, kResult + 0x10, rawNorm, sizeof(rawNorm)) == UC_ERR_OK &&
+            std::isfinite(rawNorm[0]) && std::isfinite(rawNorm[1]) && std::isfinite(rawNorm[2])) {
+            const float normSq = rawNorm[0] * rawNorm[0] +
+                                 rawNorm[1] * rawNorm[1] +
+                                 rawNorm[2] * rawNorm[2];
+            if (std::isfinite(normSq) && normSq > 1e-6f) {
+                const float invLen = 1.0f / std::sqrt(normSq);
+                result.hitNormal = {rawNorm[0] * invLen, rawNorm[1] * invLen, rawNorm[2] * invLen};
+                result.hasHitNormal = true;
+            }
+        }
+    }
     return result.status = Status::Ok;
 }
 

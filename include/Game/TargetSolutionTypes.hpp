@@ -58,9 +58,26 @@ enum class InputStance : uint8_t {
     IdleHold,           // Physically stationary 150-250ms with no locked target: FOV shrinks
 };
 
+// Stage 2 consolidated visibility verification policy (§2, §6.3).
+enum class VisibilityPolicy : uint8_t {
+    Lite = 0,               // Entity Vis + local native Hitbox only (zero ray, zero capture)
+    Vision,                 // Entity Vis + ContourService exposure-first fallback when Vis==false
+    RayWorld,               // Async TraceCache + 6-engine VisionProbe (world geometry mask)
+    RayWorldAndBarrier,     // Async TraceCache + 6-engine VisionProbe (world + Slot 3 barrier mask)
+};
+
+// Pluggable Stage 1/2 role utility mode (§4.2, Phase 3).
+enum class RoleUtilityMode : uint8_t {
+    Auto = 0,               // Activate built-in hero plugin matching local hero (e.g. Smart Ana)
+    Off,                    // Disable role utility plugins (roleUtility = 0)
+    SmartAna,               // Explicitly enable Smart Ana (ally low-HP crisis vs enemy execute)
+};
+
 inline constexpr int kAimPriorityCount = 5;
 inline constexpr int kHitAcceptanceCount = 2;
 inline constexpr int kBarrierPolicyCount = 2;
+inline constexpr int kVisibilityPolicyCount = 4;
+inline constexpr int kRoleUtilityModeCount = 3;
 
 inline constexpr AimPriority ClampAimPriority(int value) noexcept
 {
@@ -75,6 +92,32 @@ inline constexpr HitAcceptance ClampHitAcceptance(int value) noexcept
 inline constexpr BarrierPolicy ClampBarrierPolicy(int value) noexcept
 {
     return static_cast<BarrierPolicy>(std::clamp(value, 0, kBarrierPolicyCount - 1));
+}
+
+inline constexpr VisibilityPolicy ClampVisibilityPolicy(int value) noexcept
+{
+    return static_cast<VisibilityPolicy>(std::clamp(value, 0, kVisibilityPolicyCount - 1));
+}
+
+inline constexpr RoleUtilityMode ClampRoleUtilityMode(int value) noexcept
+{
+    return static_cast<RoleUtilityMode>(std::clamp(value, 0, kRoleUtilityModeCount - 1));
+}
+
+// Consolidates runtime ray policy, contour vision fallback, per-slot BarrierPolicy, and
+// profile barrier-mask availability into the single authoritative VisibilityPolicy (§2, §6.3).
+// rayDecisionPolicy: 0=NativeOnly, 1=Hybrid.
+inline constexpr VisibilityPolicy ResolveVisibilityPolicy(int rayDecisionPolicy,
+                                                          bool contourEnabled,
+                                                          BarrierPolicy barrierPolicy,
+                                                          uint64_t barrierMask) noexcept
+{
+    if (rayDecisionPolicy == 1) {
+        if (barrierPolicy == BarrierPolicy::WaitBarrierDrop && barrierMask != 0)
+            return VisibilityPolicy::RayWorldAndBarrier;
+        return VisibilityPolicy::RayWorld;
+    }
+    return contourEnabled ? VisibilityPolicy::Vision : VisibilityPolicy::Lite;
 }
 
 inline constexpr const char* AimPriorityName(AimPriority priority) noexcept
@@ -139,6 +182,36 @@ inline constexpr const char* InputStanceName(InputStance stance) noexcept
     case InputStance::IdleHold: return "IdleHold";
     }
     return "ActiveDrag";
+}
+
+inline constexpr const char* BarrierPolicyName(BarrierPolicy policy) noexcept
+{
+    switch (policy) {
+    case BarrierPolicy::IgnoreBarrier: return "IgnoreBarrier";
+    case BarrierPolicy::WaitBarrierDrop: return "WaitBarrierDrop";
+    }
+    return "IgnoreBarrier";
+}
+
+inline constexpr const char* VisibilityPolicyName(VisibilityPolicy policy) noexcept
+{
+    switch (policy) {
+    case VisibilityPolicy::Lite: return "Lite";
+    case VisibilityPolicy::Vision: return "Vision";
+    case VisibilityPolicy::RayWorld: return "Ray[World]";
+    case VisibilityPolicy::RayWorldAndBarrier: return "Ray[World+Barrier]";
+    }
+    return "Lite";
+}
+
+inline constexpr const char* RoleUtilityModeName(RoleUtilityMode mode) noexcept
+{
+    switch (mode) {
+    case RoleUtilityMode::Auto: return "Auto";
+    case RoleUtilityMode::Off: return "Off";
+    case RoleUtilityMode::SmartAna: return "SmartAna";
+    }
+    return "Auto";
 }
 
 } // namespace OW

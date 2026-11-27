@@ -295,6 +295,8 @@ namespace OW { namespace Config {
     inline int aimPreferredBone = kAimBoneChest;
     inline int aimPriority = static_cast<int>(AimPriority::HeadOnly);
     inline int aimHitAcceptance = static_cast<int>(HitAcceptance::SelectedOnly);
+    inline int aimBarrierPolicy = static_cast<int>(BarrierPolicy::IgnoreBarrier);
+    inline int aimRoleUtilityMode = static_cast<int>(RoleUtilityMode::Auto);
     inline SkeletonBoneMask aimbotBoneMask2 = kDefaultAimBoneMask;
     inline bool switch_team  = false;
     inline bool switch_team2 = false;
@@ -507,6 +509,8 @@ namespace OW { namespace Config {
         int preferredBone = kAimBoneChest;
         int aimPriority = static_cast<int>(AimPriority::HeadOnly);
         int hitAcceptance = static_cast<int>(HitAcceptance::SelectedOnly);
+        int barrierPolicy = static_cast<int>(BarrierPolicy::IgnoreBarrier);
+        int roleUtilityMode = static_cast<int>(RoleUtilityMode::Auto);
     };
     inline thread_local SlotTargetRules slotTargetRules{};
     inline thread_local bool targetAimPlanEnabled = false;
@@ -1525,6 +1529,8 @@ namespace OW { namespace Config {
         int preferredBone = kAimBoneChest;
         int aimPriority = static_cast<int>(AimPriority::HeadOnly);
         int hitAcceptance = static_cast<int>(HitAcceptance::SelectedOnly);
+        int barrierPolicy = static_cast<int>(BarrierPolicy::IgnoreBarrier);
+        int roleUtilityMode = static_cast<int>(RoleUtilityMode::Auto);
         float hitbox = kDefaultHitboxScalePercent; // percentage of resolved bone+projectile window
         int aimMode = 0;         // 0=Tracking, 1=Flick
         int aimBehavior = kAimBehaviorTracking; // 0=Tracking, 1=Flick, 2=Flick2nd, 3=Reacquire, 4=MagneticTrigger

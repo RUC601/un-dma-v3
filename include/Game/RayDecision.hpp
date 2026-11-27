@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Game/TargetSolutionTypes.hpp"
+
 #include <cstdint>
 #include <chrono>
 
@@ -53,30 +55,57 @@ struct RayDecision {
     uint32_t latencyUs = 0;
     uint64_t completedAtUs = 0;
     float fraction = 1.0f;
+    float hitPosX = 0.0f;
+    float hitPosY = 0.0f;
+    float hitPosZ = 0.0f;
+    bool hasHitPosition = false;
+    float hitNormalX = 0.0f;
+    float hitNormalY = 0.0f;
+    float hitNormalZ = 0.0f;
+    bool hasHitNormal = false;
     uint32_t hitFlags = 0;
     uint32_t hitbox = 0xFFFFFFFFu;
     uint32_t hitEntityId = 0xFFFFFFFFu;
     RayStaleReason staleReason = RayStaleReason::None;
     RaySegmentKind segmentKind = RaySegmentKind::Direct;
     uint8_t segmentIndex = 0;
+    // Phase 3 Slot 3 dynamic barrier verdict (§6.3, §8.1, §8.2).
+    // Only enforced when barrierCheckRequired == true (Ray[World+Barrier] + WaitBarrierDrop).
+    RayDecisionStatus barrier = RayDecisionStatus::Unknown;
+    uint32_t barrierAgeMs = 0;
+    bool barrierCheckRequired = false;
 
     static constexpr uint32_t kDefaultMaxAgeMs = 100;
     static constexpr uint32_t kDefaultTrackingVacuumGraceMs = 60;
 
     bool ActorHit() const noexcept { return actor == RayDecisionStatus::Hit; }
     bool WorldClear() const noexcept { return world == RayDecisionStatus::Clear; }
+    bool BarrierClear(uint32_t maxAgeMs = kDefaultMaxAgeMs) const noexcept {
+        return !barrierCheckRequired ||
+               (barrier == RayDecisionStatus::Clear && barrierAgeMs <= maxAgeMs);
+    }
+    bool BarrierOccluded() const noexcept {
+        return barrierCheckRequired && barrier == RayDecisionStatus::Occluded;
+    }
     bool IsObservationVacuum() const noexcept {
         return world == RayDecisionStatus::Unknown ||
                world == RayDecisionStatus::Stale ||
                world == RayDecisionStatus::Unavailable ||
                world == RayDecisionStatus::Timeout;
     }
+    bool IsBarrierObservationVacuum() const noexcept {
+        return barrierCheckRequired && (
+            barrier == RayDecisionStatus::Unknown ||
+            barrier == RayDecisionStatus::Stale ||
+            barrier == RayDecisionStatus::Unavailable ||
+            barrier == RayDecisionStatus::Timeout);
+    }
     bool Fresh(uint32_t maxAgeMs = kDefaultMaxAgeMs) const noexcept {
         return world != RayDecisionStatus::Stale && ageMs <= maxAgeMs;
     }
     bool AllowsNativeOnly() const noexcept { return ActorHit(); }
     bool AllowsHybrid(uint32_t maxAgeMs = kDefaultMaxAgeMs) const noexcept {
-        return ActorHit() && WorldClear() && Fresh(maxAgeMs);
+        return ActorHit() && WorldClear() && Fresh(maxAgeMs) && BarrierClear(maxAgeMs);
     }
 };
 
@@ -95,17 +124,24 @@ inline bool RayDecisionAllowsSelection(const RayDecision& decision, bool contour
                                  decision.actor == RayDecisionStatus::Unknown;
     if (!actorAcceptable) return false;
     if (backend == static_cast<int>(RayDecisionPolicy::Hybrid))
-        return decision.WorldClear() && decision.Fresh(maxAgeMs);
+        return decision.WorldClear() && decision.Fresh(maxAgeMs) && !decision.BarrierOccluded();
     return true;
 }
 
 // Strict gate for program-generated automatic fire (Trigger / Flick / MagneticTrigger / SingleShot):
 // under Hybrid policy, observation vacuum (Stale/Unknown/Unavailable/Timeout) NEVER authorizes fire
-// (Decision #7, §6.2, §8.2).
+// (Decision #7, §6.2, §8.2). When Slot 3 WaitBarrierDrop is active (barrierCheckRequired == true),
+// barrier occlusion or barrier vacuum also strictly blocks auto-fire (§8.2, Decision #4).
 inline bool RayDecisionAllowsAutoFire(const RayDecision& decision, bool contourFallback,
                                       int backend,
                                       uint32_t maxAgeMs = RayDecision::kDefaultMaxAgeMs) noexcept {
-    return RayDecisionAllowsSelection(decision, contourFallback, backend, maxAgeMs);
+    if (!RayDecisionAllowsSelection(decision, contourFallback, backend, maxAgeMs))
+        return false;
+    if (!contourFallback && backend == static_cast<int>(RayDecisionPolicy::Hybrid) &&
+        decision.barrierCheckRequired) {
+        return decision.BarrierClear(maxAgeMs);
+    }
+    return true;
 }
 
 // Tracking continuity grace gate during a brief Hybrid ray observation vacuum (5-15ms after blink
@@ -143,6 +179,14 @@ inline bool RayPolicyNeedsServiceNotice(int backend, bool serviceBound,
                                         uint64_t sceneEpoch) noexcept {
     return backend == static_cast<int>(RayDecisionPolicy::Hybrid) &&
            (!serviceBound || sceneEpoch == 0);
+}
+
+// WaitBarrierDrop requires BOTH Hybrid ray policy and a live-verified profile barrier mask.
+// Surfaces an honest notice whenever a slot requests WaitBarrierDrop on an unsupported build.
+inline bool RayPolicyNeedsBarrierNotice(int backend, BarrierPolicy barrierPolicy,
+                                        uint64_t barrierMask) noexcept {
+    return barrierPolicy == BarrierPolicy::WaitBarrierDrop &&
+           (backend != static_cast<int>(RayDecisionPolicy::Hybrid) || barrierMask == 0);
 }
 
 inline uint64_t RayDecisionNowUs() noexcept {

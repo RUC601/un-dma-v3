@@ -34,6 +34,7 @@
 #include "Game/HeroGeometrySpec.hpp"
 #include "Game/TargetHitWindow.hpp"
 #include "Game/TargetPipeline.hpp"
+#include "Game/RoleUtilityPlugin.hpp"
 #include "Game/PreAimState.hpp"
 #include "Game/TrajectoryRayPlanner.hpp"
 #include "output/InputOrchestrator.hpp"
@@ -771,16 +772,19 @@ namespace OW {
         // not accidentally reject protected targets when the filter is off.
         inline bool ProtectionFilterPasses(const c_entity& entity,
                                            bool requireTargetable) {
-            if (!requireTargetable || !entity.Team)
-                return true;
-            const DWORD now = GetTickCount();
-            const bool protectionFresh = entity.health_sample_tick_ms != 0 &&
-                now - entity.health_sample_tick_ms <= 500;
-            if (!protectionFresh) {
+            bool staleHealth = false;
+            const bool allowed = TargetPipeline::ProtectionFilterPasses(
+                entity.Team,
+                requireTargetable,
+                entity.imort,
+                entity.barrprot,
+                entity.health_sample_tick_ms,
+                GetTickCount(),
+                &staleHealth);
+            if (staleHealth) {
                 Diagnostics::Aim("target.protection rejected reason=stale_health_sample");
-                return false;
             }
-            return !entity.imort && !entity.barrprot;
+            return allowed;
         }
 
         inline bool ProtectionFilterPasses(const c_entity& entity) {
@@ -2034,7 +2038,7 @@ namespace OW {
             decision.actorGeneration,
             boneId,
             decision.sampleTick,
-            EngineTrace::Request{}.mask,
+            RayRuntime::WorldRayMask(),
             maxAgeMs,
             submitBrokerQuery);
         decision.world = worldVerdict.world;
@@ -2042,6 +2046,14 @@ namespace OW {
         decision.latencyUs = worldVerdict.latencyUs;
         decision.completedAtUs = worldVerdict.completedAtUs;
         decision.fraction = worldVerdict.fraction;
+        decision.hitPosX = worldVerdict.hitPosX;
+        decision.hitPosY = worldVerdict.hitPosY;
+        decision.hitPosZ = worldVerdict.hitPosZ;
+        decision.hasHitPosition = worldVerdict.hasHitPosition;
+        decision.hitNormalX = worldVerdict.hitNormalX;
+        decision.hitNormalY = worldVerdict.hitNormalY;
+        decision.hitNormalZ = worldVerdict.hitNormalZ;
+        decision.hasHitNormal = worldVerdict.hasHitNormal;
         decision.hitFlags = worldVerdict.hitFlags;
         decision.hitbox = worldVerdict.hitbox;
         decision.hitEntityId = worldVerdict.hitEntityId;
@@ -2143,6 +2155,36 @@ namespace OW {
             predit);
 
         const int activeRayBackend = UI::Preferences::ActiveRayBackend();
+        const uint64_t worldRayMask = RayRuntime::WorldRayMask();
+        const uint64_t barrierRayMask = RayRuntime::BarrierRayMask();
+        const BarrierPolicy slotBarrierPolicy = ClampBarrierPolicy(Config::slotTargetRules.active
+            ? Config::slotTargetRules.barrierPolicy : Config::aimBarrierPolicy);
+        const RoleUtilityMode slotRoleUtilityMode = ClampRoleUtilityMode(Config::slotTargetRules.active
+            ? Config::slotTargetRules.roleUtilityMode : Config::aimRoleUtilityMode);
+        const VisibilityPolicy slotVisibilityPolicy = ResolveVisibilityPolicy(
+            activeRayBackend, contour.enabled, slotBarrierPolicy, barrierRayMask);
+        const int activeTeamMode = Config::View_aimbotTeam();
+        const float activeAllyHealthMaxPercent = Config::slotTargetRules.active
+            ? Config::slotTargetRules.allyHealthMaxPercent : 100.0f;
+        const auto evaluateRoleUtility = [&](const c_entity& ent,
+                                             float angleDeg,
+                                             float effFovDeg,
+                                             float dist) noexcept -> float {
+            TargetPipeline::RoleUtilityContext rCtx{};
+            rCtx.localHeroId = local_entity.HeroID;
+            rCtx.teamMode = activeTeamMode;
+            rCtx.candidateIsEnemy = ent.Team;
+            rCtx.candidateHeroId = ent.HeroID;
+            rCtx.hp = ent.PlayerHealth;
+            rCtx.maxHp = ent.PlayerHealthMax;
+            rCtx.angleDeg = angleDeg;
+            rCtx.effectiveFovDeg = effFovDeg;
+            rCtx.distance = dist;
+            rCtx.allyHealthMaxPercent = activeAllyHealthMaxPercent;
+            rCtx.candidateImmortal = ent.imort;
+            rCtx.candidateBarrierProtected = ent.barrprot;
+            return TargetPipeline::RoleUtilityRegistry::Default().Evaluate(slotRoleUtilityMode, rCtx);
+        };
         const bool hybridLiveWorldGate =
             activeRayBackend == static_cast<int>(RayDecisionPolicy::Hybrid) &&
             RayRuntime::HasAttachedService() &&
@@ -2415,6 +2457,7 @@ namespace OW {
                 EngineTrace::Request probeReq{};
                 probeReq.start = {fovContext.camera.X, fovContext.camera.Y, fovContext.camera.Z};
                 probeReq.end = {entry.coarseAnchor.X, entry.coarseAnchor.Y, entry.coarseAnchor.Z};
+                probeReq.mask = worldRayMask;
                 probeReq.sceneEpoch = RayRuntime::SceneEpoch();
                 const int priorBone = entry.isLocked && activeLock.boneId != Plexies20260609::kUnusedRenderSkeletonBone
                     ? activeLock.boneId : BONE_HEAD;
@@ -2448,6 +2491,8 @@ namespace OW {
             uIn.intentConfidence = conf;
             uIn.visibilityPrior = visPrior;
             uIn.planPreferred = candidateConfig.Preferred(entity, entry.coarseDistance, entry.coarseAngleDeg);
+            uIn.roleUtility = evaluateRoleUtility(
+                entity, entry.coarseAngleDeg, uIn.effectiveFovDeg, entry.coarseDistance);
 
             const TargetPipeline::UtilityBreakdown breakdown =
                 TargetPipeline::ComputeCandidateUtility(uIn);
@@ -2515,10 +2560,12 @@ namespace OW {
         float bestPreAimFovBaseDeg = Config::View_Fov();
         float lockedPreAimFovBaseDeg = Config::View_Fov();
         TrajectoryRay::RayBatchPlanInput batchInput{};
+        batchInput.barrierPolicy = slotBarrierPolicy;
         static std::atomic<uint32_t> s_rayBatchRotationCursor{0};
         batchInput.rotationCursor = s_rayBatchRotationCursor.fetch_add(1, std::memory_order_relaxed);
         bool top1FallbackHasUnresolved = false;
         bool top2FallbackHasUnresolved = false;
+        bool top1WorldClearForBatch = false;
         const uint64_t liveRayScene = hybridLiveWorldGate ? RayRuntime::SceneEpoch() : 0;
 
         auto makeBrokerQuery = [&](const c_entity& ent,
@@ -2527,10 +2574,12 @@ namespace OW {
                                    const Vector3& segStart,
                                    const Vector3& segEnd,
                                    RaySegmentKind segKind,
-                                   uint8_t segIdx) {
+                                   uint8_t segIdx,
+                                   uint64_t maskOverride = 0) {
             EngineTrace::RayQueryBroker::Query q{};
             q.request.start = {segStart.X, segStart.Y, segStart.Z};
             q.request.end = {segEnd.X, segEnd.Y, segEnd.Z};
+            q.request.mask = maskOverride != 0 ? maskOverride : worldRayMask;
             q.request.sceneEpoch = liveRayScene;
             q.frame = frame.sequence;
             q.connectionEpoch = ent.connection_epoch;
@@ -2564,6 +2613,7 @@ namespace OW {
                 EngineTrace::Request req{};
                 req.start = {segStart.X, segStart.Y, segStart.Z};
                 req.end = {segEnd.X, segEnd.Y, segEnd.Z};
+                req.mask = worldRayMask;
                 req.sceneEpoch = liveRayScene;
                 const auto cached = RayRuntime::Broker().Latest(
                     req, frame.sequence, ent.connection_epoch, liveRayScene,
@@ -2639,8 +2689,8 @@ namespace OW {
             // BodyCenter and HeadThenBody torso cutoff apply to contour as well.
             const size_t attemptCount = ladder.nearestMode ? 1 : ladder.count;
             // Tighten cache maxAge for fast-moving targets (§6.2: 50-65 ms vs 100 ms default).
-            const uint32_t candidateRayMaxAgeMs = entity.velocity.Size() > 4.5f
-                ? 60u : RayDecision::kDefaultMaxAgeMs;
+            const uint32_t candidateRayMaxAgeMs =
+                TargetPipeline::ResolveCandidateRayMaxAgeMs(entity.velocity.Size());
 
             bool isTrackedPreAimSnapshot = false;
             bool isSuppressedPreAimSnapshot = false;
@@ -2662,6 +2712,7 @@ namespace OW {
             float preAimSeedFovBaseDeg = ranked.effectiveSelectionFovDeg;
             float preAimSeedPeekGateDeg = ranked.peekGateDeg;
             RayDecision preAimSeedRay{};
+            TraceHitKind preAimSeedHitKind = TraceHitKind::World;
             uint8_t preAimSeedSegments = 1;
 
             for (size_t step = 0; step < attemptCount; ++step) {
@@ -2986,10 +3037,67 @@ namespace OW {
                 bool allowedAsEngageable = RayDecisionAllowsSelection(
                     rayDecision, contourFallback, activeRayBackend, candidateRayMaxAgeMs);
                 bool admittedViaVacuumGrace = false;
+                TraceHitKind stepHitKind = rayDecision.world == RayDecisionStatus::Clear
+                    ? TraceHitKind::None
+                    : (rayDecision.world == RayDecisionStatus::Occluded ? TraceHitKind::World : TraceHitKind::Unknown);
                 if (allowedAsEngageable && hybridLiveWorldGate && !contourFallback) {
                     std::lock_guard<std::mutex> preAimLock(TargetingDetail::RuntimePreAimMutex());
                     TargetingDetail::RuntimeVacuumGraceTrackerStorage()
                         .RecordClear(candidateKey, entity.actor_generation, now64);
+                    if (currentRank == 0 && rayDecision.WorldClear()) {
+                        top1WorldClearForBatch = true;
+                    }
+                    // Phase 3 (§6.3 Slot 3, §8.1, §8.2, Decision #4): when VisibilityPolicy is
+                    // Ray[World+Barrier] (WaitBarrierDrop + live-verified barrierMask != 0) and
+                    // the world path is Clear, evaluate the dynamic barrier layer.
+                    if (slotVisibilityPolicy == VisibilityPolicy::RayWorldAndBarrier &&
+                        liveRayScene != 0 && rayDecision.WorldClear()) {
+                        const auto barrierEval = TrajectoryRay::EvaluateBarrierLayerDecision(
+                            RayRuntime::Broker(),
+                            slotVisibilityPolicy,
+                            slotBarrierPolicy,
+                            barrierRayMask,
+                            true,
+                            fovContext.camera,
+                            chordPlan.impactPoint,
+                            frame.sequence,
+                            entity.connection_epoch,
+                            liveRayScene,
+                            candidateKey,
+                            entity.actor_generation,
+                            candidateBoneId,
+                            entity.native_hitboxes.tick,
+                            candidateRayMaxAgeMs,
+                            /*submitImmediately=*/false);
+                        if (barrierEval.barrierActive) {
+                            rayDecision.barrierCheckRequired = true;
+                            rayDecision.barrier = barrierEval.barrierDecision.world;
+                            rayDecision.barrierAgeMs = barrierEval.barrierDecision.ageMs;
+                            if (currentRank == 0 && barrierEval.slot3Query.has_value() &&
+                                (!batchInput.top1BarrierQuery.has_value() || barrierEval.slot3Urgent)) {
+                                batchInput.top1BarrierQuery = barrierEval.slot3Query;
+                                batchInput.top1BarrierUrgent = barrierEval.slot3Urgent;
+                            }
+                            if (barrierEval.barrierBlocked) {
+                                allowedAsEngageable = false;
+                                sawOccludedForCandidate = true;
+                                stepHitKind = TraceHitKind::Barrier;
+                                if (step == 0 || preAimSeedHitKind != TraceHitKind::Barrier) {
+                                    preAimSeedBoneId = candidateBoneId;
+                                    preAimSeedRoot = rootPosition;
+                                    preAimSeedAim = resolvedAimPoint;
+                                    preAimSeedDistance = distance;
+                                    preAimSeedAngleDeg = fovScoreDeg;
+                                    preAimSeedRay = rayDecision;
+                                    preAimSeedHitKind = TraceHitKind::Barrier;
+                                }
+                            } else if (barrierEval.barrierClear) {
+                                stepHitKind = TraceHitKind::None;
+                            } else {
+                                stepHitKind = TraceHitKind::Unknown;
+                            }
+                        }
+                    }
                 } else if (!allowedAsEngageable && hybridLiveWorldGate && !contourFallback &&
                            rayDecision.IsObservationVacuum()) {
                     // Decision #7: During 5-15ms ray vacuum after blink/move, if native Vis==true,
@@ -3016,18 +3124,23 @@ namespace OW {
                 if (!allowedAsEngageable) {
                     ++rayRejectedCandidates;
                     Diagnostics::Aim(
-                        "target.primary.ray_reject index=%zu bone=%d vis=%d policy=%s actor=%s world=%s staleReason=%s frac=%.3f segs=%u ageMs=%u latencyUs=%u",
+                        "target.primary.ray_reject index=%zu bone=%d vis=%d policy=%s visPolicy=%s actor=%s world=%s barrier=%s hitKind=%s staleReason=%s frac=%.3f segs=%u ageMs=%u latencyUs=%u",
                         i, candidateBoneId, entity.Vis ? 1 : 0,
                         RayDecisionPolicyName(activeRayBackend),
+                        VisibilityPolicyName(slotVisibilityPolicy),
                         RayDecisionStatusName(rayDecision.actor),
                         RayDecisionStatusName(rayDecision.world),
+                        RayDecisionStatusName(rayDecision.barrier),
+                        TraceHitKindName(stepHitKind),
                         RayStaleReasonName(rayDecision.staleReason),
                         rayDecision.fraction,
                         static_cast<unsigned>(chordPlan.segmentCount),
                         rayDecision.ageMs, rayDecision.latencyUs);
-                    // In Hybrid mode, if the top ladder bone is occluded, try the next torso bone.
+                    // In Hybrid mode, if the top ladder bone is occluded (by world or partial barrier),
+                    // try the next torso bone (§1.2, §2).
                     if (hybridLiveWorldGate && !contourFallback && !ladder.nearestMode &&
-                        rayDecision.world == RayDecisionStatus::Occluded &&
+                        (rayDecision.world == RayDecisionStatus::Occluded ||
+                         rayDecision.BarrierOccluded()) &&
                         step + 1 < attemptCount) {
                         continue;
                     }
@@ -3076,6 +3189,8 @@ namespace OW {
                 finalUIn.visibilityPrior = rayDecision.WorldClear()
                     ? 1.0f : (contourFallback ? 0.85f : (entity.Vis ? 0.70f : 0.40f));
                 finalUIn.planPreferred = preferred;
+                finalUIn.roleUtility = evaluateRoleUtility(
+                    entity, fovScoreDeg, finalUIn.effectiveFovDeg, distance);
                 finalUIn.predictedFovEntry = fovEvaluation.acceptedByPrediction;
 
                 const TargetPipeline::UtilityBreakdown finalUtility =
@@ -3111,15 +3226,24 @@ namespace OW {
                 next.worldClearSlotMask = rayDecision.WorldClear()
                     ? TargetPipeline::RenderSlotBitForBoneId(candidateBoneId)
                     : 0u;
-                // Under Hybrid world occlusion + AnyValidHitbox, populate per-render-slot fresh
-                // WorldClear bits (left/right distinct, R2 fix) non-blocking from TraceCache.
+                next.barrierClearSlotMask = rayDecision.BarrierClear(candidateRayMaxAgeMs)
+                    ? TargetPipeline::RenderSlotBitForBoneId(candidateBoneId)
+                    : 0u;
+                // Under Hybrid world/barrier occlusion + AnyValidHitbox, populate per-render-slot
+                // fresh WorldClear (and BarrierClear when WaitBarrierDrop is active) bits
+                // non-blocking from TraceCache so off-guidance bones never fire through walls or shields.
                 if (hybridLiveWorldGate && liveRayScene != 0 && !contourFallback &&
                     hitAcceptance == HitAcceptance::AnyValidHitbox &&
                     next.acceptanceMask != 0 && fovContext.valid) {
+                    const bool checkOffGuidanceBarrier =
+                        slotVisibilityPolicy == VisibilityPolicy::RayWorldAndBarrier &&
+                        barrierRayMask != 0;
                     for (std::size_t slot = 0; slot < Plexies20260609::kSkeletonSlotCount; ++slot) {
                         const SkeletonBoneMask grpBit = kSkeletonBoneGroupForRenderSlot[slot];
                         const uint32_t slotBit = slot < 32 ? (1u << static_cast<uint32_t>(slot)) : 0u;
-                        if ((next.acceptanceMask & grpBit) == 0 || (next.worldClearSlotMask & slotBit) != 0)
+                        if ((next.acceptanceMask & grpBit) == 0 ||
+                            ((next.worldClearSlotMask & slotBit) != 0 &&
+                             (!checkOffGuidanceBarrier || (next.barrierClearSlotMask & slotBit) != 0)))
                             continue;
                         int slotBoneId = Plexies20260609::kUnusedRenderSkeletonBone;
                         Vector3 slotPoint{};
@@ -3130,12 +3254,30 @@ namespace OW {
                         EngineTrace::Request slotReq{};
                         slotReq.start = {fovContext.camera.X, fovContext.camera.Y, fovContext.camera.Z};
                         slotReq.end = {predictedSlotPoint.X, predictedSlotPoint.Y, predictedSlotPoint.Z};
+                        slotReq.mask = worldRayMask;
                         slotReq.sceneEpoch = liveRayScene;
                         if (const auto slotCached = RayRuntime::Broker().Latest(
                                 slotReq, frame.sequence, entity.connection_epoch, liveRayScene,
                                 candidateKey, entity.actor_generation, slotBoneId, candidateRayMaxAgeMs)) {
-                            if (slotCached->world == RayDecisionStatus::Clear)
+                            if (slotCached->world == RayDecisionStatus::Clear) {
                                 next.worldClearSlotMask |= slotBit;
+                                if (!checkOffGuidanceBarrier) {
+                                    next.barrierClearSlotMask |= slotBit;
+                                } else {
+                                    EngineTrace::Request slotBarReq = slotReq;
+                                    slotBarReq.mask = barrierRayMask;
+                                    if (const auto slotBarCached = RayRuntime::Broker().Latest(
+                                            slotBarReq, frame.sequence, entity.connection_epoch, liveRayScene,
+                                            candidateKey, entity.actor_generation, slotBoneId, candidateRayMaxAgeMs,
+                                            EngineTrace::RayQueryBroker::kDefaultMaxEndpointDriftMeters,
+                                            RaySegmentKind::Barrier, 0)) {
+                                        if (slotBarCached->world == RayDecisionStatus::Clear &&
+                                            slotBarCached->Fresh(candidateRayMaxAgeMs)) {
+                                            next.barrierClearSlotMask |= slotBit;
+                                        }
+                                    }
+                                }
+                            }
                         }
                     }
                 }
@@ -3163,10 +3305,13 @@ namespace OW {
                 next.guidanceScreenPoint = screenPt;
                 next.nativeHitWindow = nativeHitWindow;
                 next.utilityScore = finalUtility.total;
+                next.roleUtility = finalUIn.roleUtility;
                 next.commitment = finalUtility.effectiveCommitment;
                 next.intentAlignment = boneAlign;
                 next.intentGain = acqCtx.useIntentEngine ? intentSnapshot.activeTargetGain : 1.0f;
                 next.stance = acqCtx.useIntentEngine ? intentSnapshot.stance : InputStance::ActiveDrag;
+                next.visibilityPolicy = slotVisibilityPolicy;
+                next.barrierPolicy = slotBarrierPolicy;
                 next.distance = distance;
                 next.angularErrorDeg = fovScoreDeg;
                 next.effectiveFovDeg = effectiveFovDeg;
@@ -3174,9 +3319,7 @@ namespace OW {
                     distance, rawDynamicFovDeg, projectileSpec.projectileSpeed,
                     PreAim::DefaultPeekSpeedMps(entity.HeroID));
                 next.ray = rayDecision;
-                next.hitKind = rayDecision.world == RayDecisionStatus::Clear
-                    ? TraceHitKind::None
-                    : (rayDecision.world == RayDecisionStatus::Occluded ? TraceHitKind::World : TraceHitKind::Unknown);
+                next.hitKind = stepHitKind;
                 next.trajectorySegments = chordPlan.segmentCount;
                 next.contour = contourObservation;
                 next.plan = candidateConfig.value;
@@ -3221,8 +3364,10 @@ namespace OW {
             }
 
             // §5.1-§5.4: Occluded candidate evaluation for PreAim / ReactionDelayGate memory.
+            // Note (Decision #4, §8.1): Barrier-blocked WaitBarrierDrop holds PreAim without
+            // arming wall-peek ReactionDelayGate so shield drop re-engages immediately.
             if (!foundEngageableForCandidate && sawOccludedForCandidate) {
-                {
+                if (preAimSeedHitKind != TraceHitKind::Barrier) {
                     std::lock_guard<std::mutex> preAimLock(TargetingDetail::RuntimePreAimMutex());
                     TargetingDetail::RuntimeReactionDelayGateStorage()
                         .ObserveOccludedOrPreAim(candidateKey, entity.actor_generation, now64, false);
@@ -3278,6 +3423,8 @@ namespace OW {
                         preUIn.intentConfidence = ranked.intentConfidence;
                         preUIn.visibilityPrior = 0.30f;  // §4.2 PreAim visibility prior
                         preUIn.planPreferred = candidateConfig.Preferred(entity, preAimSeedDistance, preAimSeedAngleDeg);
+                        preUIn.roleUtility = evaluateRoleUtility(
+                            entity, preAimSeedAngleDeg, preUIn.effectiveFovDeg, preAimSeedDistance);
                         const auto preUtility = TargetPipeline::ComputeCandidateUtility(preUIn);
                         if (std::isfinite(preUtility.total) && !preUtility.hardBlockedByIntent) {
                             Vector2 screenPt = CrossHair;
@@ -3299,16 +3446,19 @@ namespace OW {
                             preSol.guidanceAimPoint = preAimSeedAim;
                             preSol.guidanceScreenPoint = screenPt;
                             preSol.utilityScore = preUtility.total;
+                            preSol.roleUtility = preUIn.roleUtility;
                             preSol.commitment = preUtility.effectiveCommitment;
                             preSol.intentAlignment = ranked.intentAlignment;
                             preSol.intentGain = acqCtx.useIntentEngine ? intentSnapshot.activeTargetGain : 1.0f;
                             preSol.stance = acqCtx.useIntentEngine ? intentSnapshot.stance : InputStance::ActiveDrag;
+                            preSol.visibilityPolicy = slotVisibilityPolicy;
+                            preSol.barrierPolicy = slotBarrierPolicy;
                             preSol.distance = preAimSeedDistance;
                             preSol.angularErrorDeg = preAimSeedAngleDeg;
                             preSol.effectiveFovDeg = preAimSeedFovBaseDeg;
                             preSol.peekGateDeg = preAimSeedPeekGateDeg;
                             preSol.ray = preAimSeedRay;
-                            preSol.hitKind = TraceHitKind::World;
+                            preSol.hitKind = preAimSeedHitKind;
                             preSol.trajectorySegments = preAimSeedSegments;
                             preSol.plan = candidateConfig.value;
                             preSol.planPreferred = preUIn.planPreferred;
@@ -3438,6 +3588,7 @@ namespace OW {
             {
                 std::lock_guard<std::mutex> preAimLock(TargetingDetail::RuntimePreAimMutex());
                 auto& tracker = TargetingDetail::RuntimePreAimTrackerStorage();
+                const bool barrierPreAim = best.hitKind == TraceHitKind::Barrier;
                 keepPreAim = tracker.Update(
                     best.entityKey,
                     best.actorGeneration,
@@ -3451,11 +3602,13 @@ namespace OW {
                     fovContext.forward,
                     best.motion.worldVelocity,
                     candidateReverseBroken,
-                    hybridLiveWorldGate && liveRayScene != 0);
+                    !barrierPreAim && hybridLiveWorldGate && liveRayScene != 0);
                 if (keepPreAim) {
-                    TargetingDetail::RuntimeReactionDelayGateStorage()
-                        .ObserveOccludedOrPreAim(best.entityKey, best.actorGeneration, now64, true);
-                    needEdgeFanPass = hybridLiveWorldGate && liveRayScene != 0 &&
+                    if (!barrierPreAim) {
+                        TargetingDetail::RuntimeReactionDelayGateStorage()
+                            .ObserveOccludedOrPreAim(best.entityKey, best.actorGeneration, now64, true);
+                    }
+                    needEdgeFanPass = !barrierPreAim && hybridLiveWorldGate && liveRayScene != 0 &&
                         tracker.NeedsEdgeFanPass(isRefinePass, fanLo, fanHi);
                     fanAnchor = tracker.FanAnchorTargetPos();
                     fanLateral = tracker.LateralDir();
@@ -3608,20 +3761,34 @@ namespace OW {
         }
 
         // Bounded off-guidance acceptance ray warmup for the winning Hybrid + AnyValidHitbox
-        // candidate (R4 fix): feed into Slot 1 of the 6-slot batch plan when not already used.
+        // candidate (R4 + Phase 3 barrier fix): feed into Slot 1 of the 6-slot batch plan when
+        // not already used, warming missing/stale world rays first and then missing/stale barrier
+        // rays under Ray[World+Barrier] so off-guidance bones can recover after shield drop.
         if (best.valid && best.tier == VisibilityTier::Engageable &&
             hybridLiveWorldGate && liveRayScene != 0 &&
             !best.contour.evidence.exposed &&
             best.hitAcceptance == HitAcceptance::AnyValidHitbox &&
             best.acceptanceMask != 0 && fovContext.valid &&
             batchInput.top1FallbackOrWarmup.count == 0) {
+            const bool warmOffGuidanceBarrier =
+                slotVisibilityPolicy == VisibilityPolicy::RayWorldAndBarrier &&
+                barrierRayMask != 0;
+            const uint32_t warmupRayMaxAgeMs =
+                TargetPipeline::ResolveCandidateRayMaxAgeMs(best.entitySnapshot.velocity.Size());
             int bestWarmupBoneId = Plexies20260609::kUnusedRenderSkeletonBone;
             Vector3 bestWarmupPoint{};
+            RaySegmentKind bestWarmupSegKind = RaySegmentKind::Direct;
+            uint64_t bestWarmupMask = worldRayMask;
             float bestWarmupCos = -2.0f;
             for (std::size_t slot = 0; slot < Plexies20260609::kSkeletonSlotCount; ++slot) {
                 const SkeletonBoneMask grpBit = kSkeletonBoneGroupForRenderSlot[slot];
                 const uint32_t slotBit = slot < 32 ? (1u << static_cast<uint32_t>(slot)) : 0u;
-                if ((best.acceptanceMask & grpBit) == 0 || (best.worldClearSlotMask & slotBit) != 0)
+                if ((best.acceptanceMask & grpBit) == 0)
+                    continue;
+                const bool needWorldWarmup = (best.worldClearSlotMask & slotBit) == 0;
+                const bool needBarrierWarmup = !needWorldWarmup && warmOffGuidanceBarrier &&
+                    (best.barrierClearSlotMask & slotBit) == 0;
+                if (!needWorldWarmup && !needBarrierWarmup)
                     continue;
                 int slotBoneId = Plexies20260609::kUnusedRenderSkeletonBone;
                 Vector3 slotPoint{};
@@ -3631,15 +3798,21 @@ namespace OW {
                     continue;
                 const Vector3 predictedSlotPoint = TargetPipeline::ComputeAcceptanceRayEndpoint(
                     slotPoint, best.rawGuidancePoint, best.predictedGuidancePoint, best.nativeHitWindow);
+                const RaySegmentKind slotSegKind = needBarrierWarmup
+                    ? RaySegmentKind::Barrier : RaySegmentKind::Direct;
+                const uint64_t slotMask = needBarrierWarmup ? barrierRayMask : worldRayMask;
                 EngineTrace::Request slotReq{};
                 slotReq.start = {fovContext.camera.X, fovContext.camera.Y, fovContext.camera.Z};
                 slotReq.end = {predictedSlotPoint.X, predictedSlotPoint.Y, predictedSlotPoint.Z};
+                slotReq.mask = slotMask;
                 slotReq.sceneEpoch = liveRayScene;
                 const auto slotCached = RayRuntime::Broker().Latest(
                     slotReq, frame.sequence, best.entitySnapshot.connection_epoch, liveRayScene,
-                    best.entityKey, best.actorGeneration, slotBoneId, 100);
-                if (slotCached && slotCached->world != RayDecisionStatus::Stale &&
-                    slotCached->world != RayDecisionStatus::Unknown)
+                    best.entityKey, best.actorGeneration, slotBoneId, warmupRayMaxAgeMs,
+                    EngineTrace::RayQueryBroker::kDefaultMaxEndpointDriftMeters,
+                    slotSegKind, 0);
+                if (slotCached && !slotCached->IsObservationVacuum() &&
+                    slotCached->Fresh(warmupRayMaxAgeMs))
                     continue;
                 const Vector3 toSlot = predictedSlotPoint - fovContext.camera;
                 const float len = toSlot.Size();
@@ -3652,19 +3825,21 @@ namespace OW {
                     bestWarmupCos = cosAlign;
                     bestWarmupBoneId = slotBoneId;
                     bestWarmupPoint = predictedSlotPoint;
+                    bestWarmupSegKind = slotSegKind;
+                    bestWarmupMask = slotMask;
                 }
             }
             if (bestWarmupBoneId != Plexies20260609::kUnusedRenderSkeletonBone) {
                 batchInput.top1FallbackOrWarmup.PushUrgent(makeBrokerQuery(
                     best.entitySnapshot, best.entityKey, bestWarmupBoneId,
-                    fovContext.camera, bestWarmupPoint, RaySegmentKind::Direct, 0));
+                    fovContext.camera, bestWarmupPoint, bestWarmupSegKind, 0, bestWarmupMask));
             }
         }
 
         // §6.3: Atomically submit the planned 6-slot batch to RayQueryBroker so the worker
         // dispatches all slots concurrently in one 6-engine VisionProbe wave.
         if (hybridLiveWorldGate && liveRayScene != 0) {
-            batchInput.top1WorldClear = best.valid && best.ray.WorldClear();
+            batchInput.top1WorldClear = top1WorldClearForBatch || (best.valid && best.ray.WorldClear());
             const TrajectoryRay::RayBatchPlan rayPlan = TrajectoryRay::PlanRayBatch(batchInput);
             if (rayPlan.count > 0) {
                 RayRuntime::Broker().SubmitBatch(rayPlan.Span());
@@ -3781,10 +3956,16 @@ namespace OW {
             TargetingDetail::ResolveProjectileRuntimeSpec(weaponSpec, localEntity, secondary);
         const float hitboxScale = secondary ? Config::hitbox2 : Config::View_hitbox();
         const int activeRayBackend = UI::Preferences::ActiveRayBackend();
+        const uint64_t barrierRayMask = RayRuntime::BarrierRayMask();
+        const BarrierPolicy slotBarrierPolicy = ClampBarrierPolicy(Config::slotTargetRules.active
+            ? Config::slotTargetRules.barrierPolicy : Config::aimBarrierPolicy);
+        const VisibilityPolicy slotVisibilityPolicy = ResolveVisibilityPolicy(
+            activeRayBackend, false, slotBarrierPolicy, barrierRayMask);
         const bool hybridLiveWorldGate =
             activeRayBackend == static_cast<int>(RayDecisionPolicy::Hybrid) &&
             RayRuntime::HasAttachedService() &&
             RayRuntime::SceneEpoch() != 0;
+        const uint64_t liveTriggerRayScene = hybridLiveWorldGate ? RayRuntime::SceneEpoch() : 0;
         WarnIfHybridServiceUnbound(activeRayBackend, now);
         float bestNormalizedScore = (std::numeric_limits<float>::max)();
         size_t rayRejectedCandidates = 0;
@@ -3916,18 +4097,53 @@ namespace OW {
                         entity, boneId, fovContext.camera,
                         fovContext.forward * distance, aimPoint,
                         nativeInput, frame.sequence, false, &trigChordPlan);
+                    TraceHitKind triggerHitKind = candidateRay.world == RayDecisionStatus::Clear
+                        ? TraceHitKind::None
+                        : (candidateRay.world == RayDecisionStatus::Occluded ? TraceHitKind::World : TraceHitKind::Unknown);
+                    // Phase 3 (§8.2, Decision #4): WaitBarrierDrop Trigger strictly checks Slot 3
+                    // barrier layer before authorizing fire so shots are never wasted into shields.
+                    if (slotVisibilityPolicy == VisibilityPolicy::RayWorldAndBarrier &&
+                        hybridLiveWorldGate && liveTriggerRayScene != 0 &&
+                        candidateRay.WorldClear()) {
+                        const auto barrierEval = TrajectoryRay::EvaluateBarrierLayerDecision(
+                            RayRuntime::Broker(),
+                            slotVisibilityPolicy,
+                            slotBarrierPolicy,
+                            barrierRayMask,
+                            true,
+                            fovContext.camera,
+                            trigChordPlan.impactPoint,
+                            frame.sequence,
+                            entity.connection_epoch,
+                            liveTriggerRayScene,
+                            entityStableId,
+                            entity.actor_generation,
+                            boneId,
+                            entity.native_hitboxes.tick,
+                            RayDecision::kDefaultMaxAgeMs,
+                            /*submitImmediately=*/true);
+                        if (barrierEval.barrierActive) {
+                            candidateRay.barrierCheckRequired = true;
+                            candidateRay.barrier = barrierEval.barrierDecision.world;
+                            candidateRay.barrierAgeMs = barrierEval.barrierDecision.ageMs;
+                            triggerHitKind = barrierEval.hitKind;
+                        }
+                    }
                     if (!RayDecisionAllowsAutoFire(candidateRay, false, activeRayBackend)) {
                         ++rayRejectedCandidates;
                         if (candidateRay.world == RayDecisionStatus::Occluded ||
-                            (hybridLiveWorldGate && !entity.Vis)) {
+                            (hybridLiveWorldGate && !entity.Vis && !candidateRay.BarrierOccluded())) {
                             entityHadOccludedBone = true;
                         }
                         Diagnostics::Aim(
-                            "target.trigger.ray_reject index=%zu bone=%d vis=%d policy=%s actor=%s world=%s segs=%u ageMs=%u latencyUs=%u",
+                            "target.trigger.ray_reject index=%zu bone=%d vis=%d policy=%s visPolicy=%s actor=%s world=%s barrier=%s hitKind=%s segs=%u ageMs=%u latencyUs=%u",
                             entityIndex, boneId, entity.Vis ? 1 : 0,
                             RayDecisionPolicyName(activeRayBackend),
+                            VisibilityPolicyName(slotVisibilityPolicy),
                             RayDecisionStatusName(candidateRay.actor),
                             RayDecisionStatusName(candidateRay.world),
+                            RayDecisionStatusName(candidateRay.barrier),
+                            TraceHitKindName(triggerHitKind),
                             static_cast<unsigned>(trigChordPlan.segmentCount),
                             candidateRay.ageMs, candidateRay.latencyUs);
                         continue;
@@ -3949,6 +4165,9 @@ namespace OW {
                     entityBest.hitAcceptance = HitAcceptance::AnyValidHitbox;
                     entityBest.acceptanceMask = candidateMask;
                     entityBest.worldClearSlotMask = candidateRay.WorldClear()
+                        ? TargetPipeline::RenderSlotBitForBoneId(boneId)
+                        : 0u;
+                    entityBest.barrierClearSlotMask = candidateRay.BarrierClear()
                         ? TargetPipeline::RenderSlotBitForBoneId(boneId)
                         : 0u;
                     entityBest.plan = candidateConfig.value;
@@ -3980,9 +4199,9 @@ namespace OW {
                     entityBest.weaponSpec = weaponSpec;
                     entityBest.nativeHitWindow = nativeInput;
                     entityBest.ray = candidateRay;
-                    entityBest.hitKind = candidateRay.world == RayDecisionStatus::Clear
-                        ? TraceHitKind::None
-                        : (candidateRay.world == RayDecisionStatus::Occluded ? TraceHitKind::World : TraceHitKind::Unknown);
+                    entityBest.visibilityPolicy = slotVisibilityPolicy;
+                    entityBest.barrierPolicy = slotBarrierPolicy;
+                    entityBest.hitKind = triggerHitKind;
                 }
 
                 const uint64_t trigStableKey = TargetingDetail::StableTargetKey(entity);

@@ -37,12 +37,14 @@ struct Vec3 {
     float z = 0.0f;
 };
 
+inline constexpr uint64_t kDefaultWorldMask = 0x0690000000000002ull;
+
 struct Request {
     Vec3 start{};
     Vec3 end{};
-    // Engine layer mask. Field evidence on CN 155284N: 0x0690000000000002 is used by the
-    // game's own world traces, 0x0690000000000017 by its player-filtered traces.
-    uint64_t mask = 0x0690000000000002ull;
+    // Engine layer mask. Field evidence across CN 155284N / World 155284 / Nexon 155284KB:
+    // 0x0690000000000002 is used by world traces, 0x0690000000000017 by player-filtered traces.
+    uint64_t mask = kDefaultWorldMask;
     // Caller's scene generation. A mismatch means the answer would describe another scene.
     uint64_t sceneEpoch = 0;
     // 0 means "backend default". The backend owns enforcement; the service records overruns.
@@ -54,6 +56,8 @@ struct Result {
     float fraction = 1.0f;  // 1.0 = segment clear, < 1.0 = blocked at that fraction
     Vec3 hitPosition{};
     Vec3 hitNormal{};
+    bool hasHitPosition = false;
+    bool hasHitNormal = false;
     uint32_t hitbox = 0xFFFFFFFFu;
     uint32_t entityId = 0xFFFFFFFFu;
     uint32_t hitFlags = 0;

@@ -98,4 +98,29 @@ inline constexpr void MigrateAimTargetFields(bool hasAimPriority,
         : DeriveHitAcceptanceFromLegacy(rawMask, boneSelectionMode);
 }
 
+// Shared Aim & Trigger slot-rule builder so ApplyLocalHeroPreset and ApplyLocalHeroTriggerPreset
+// can never drop trailing Phase 1-3 fields (aimPriority, hitAcceptance, barrierPolicy, roleUtilityMode).
+// Sombra stealth filtering honors BOTH the user-facing UI visibility toggle (uiIgnoreInvisibleValue,
+// per V2 commit bbda8778) AND an explicit legacy/JSON preset.ignoreSombraStealth flag.
+template <typename RulesT, typename PresetT>
+inline void PopulateSlotTargetRulesFromPreset(RulesT& outRules,
+                                              const PresetT& preset,
+                                              bool uiIgnoreInvisibleValue) noexcept
+{
+    outRules = RulesT{};
+    outRules.active = true;
+    outRules.ignoreSombraStealth = uiIgnoreInvisibleValue || preset.ignoreSombraStealth;
+    outRules.requireTargetable = preset.requireTargetable;
+    outRules.allyHealthMaxPercent = preset.allyHealthMaxPercent;
+    outRules.maxTargetSpeedMps = preset.maxTargetSpeedMps;
+    outRules.allyBoneMask = preset.allyBoneMask;
+    outRules.predictionAlgorithm = preset.predictionAlgorithm;
+    outRules.boneSelectionMode = preset.boneSelectionMode;
+    outRules.preferredBone = preset.preferredBone;
+    outRules.aimPriority = static_cast<int>(ClampAimPriority(preset.aimPriority));
+    outRules.hitAcceptance = static_cast<int>(ClampHitAcceptance(preset.hitAcceptance));
+    outRules.barrierPolicy = static_cast<int>(ClampBarrierPolicy(preset.barrierPolicy));
+    outRules.roleUtilityMode = static_cast<int>(ClampRoleUtilityMode(preset.roleUtilityMode));
+}
+
 } // namespace OW::Config
