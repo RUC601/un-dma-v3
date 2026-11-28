@@ -35,6 +35,16 @@ public:
         return Lease(this);
     }
 
+    void CloseAdmission() {
+        std::lock_guard<std::mutex> lock(mutex_);
+        open_ = false;
+    }
+
+    void WaitDrained() {
+        std::unique_lock<std::mutex> lock(mutex_);
+        drained_.wait(lock, [this] { return active_ == 0; });
+    }
+
     void CloseAndDrain() {
         std::unique_lock<std::mutex> lock(mutex_);
         open_ = false;

@@ -66,18 +66,13 @@
                                   rosterPair.second->entity.LinkParent==LinkParent &&
                                   rosterPair.second->participantControllerUid==cacheIt->second->participantControllerUid));
                         });
-                    if (legacyActorIt != entityRoster.end()) {
-                        if (entityRoster.find(entity.roster_key) == entityRoster.end()) {
-                            auto promotedEntry = legacyActorIt->second;
-                            entityRoster.erase(legacyActorIt);
-                            entityRoster.emplace(
-                                entity.roster_key,
-                                std::move(promotedEntry));
-                        } else {
-                            if(legacyActorIt->second->entity.address!=entity.address)
-                                retireObservedBody(legacyActorIt->second->entity);
-                            entityRoster.erase(legacyActorIt);
-                        }
+                    if (legacyActorIt != entityRoster.end() &&
+                        entityRoster.find(entity.roster_key) == entityRoster.end()) {
+                        auto promotedEntry = legacyActorIt->second;
+                        entityRoster.erase(legacyActorIt);
+                        entityRoster.emplace(
+                            entity.roster_key,
+                            std::move(promotedEntry));
                     }
                 }
                 auto existingRosterIt = entityRoster.find(entity.roster_key);
@@ -133,6 +128,207 @@
                     default:
                         break;
                     }
+                    }
+                }
+                const auto resolveCnMapOwner = [](const OW::c_entity& candidate, OW::CnLinkTargetMapIdentity& outMap) -> bool {
+                    outMap = {};
+                    if (!candidate.LinkBase || !candidate.address || !candidate.match_id ||
+                        OW::offset::Active().componentTransform != OW::offset::ComponentTransformMode::Cn155284) {
+                        return false;
+                    }
+                    uint32_t mappedUid = 0;
+                    if (OW::ResolveCnLinkTargetMapBase(candidate.LinkBase, OW::offset::Link_UniqueId, &mappedUid, &outMap) == candidate.address &&
+                        mappedUid == candidate.match_id) {
+                        return true;
+                    }
+                    outMap = {};
+                    mappedUid = 0;
+                    if (OW::ResolveCnLinkTargetMapBase(candidate.LinkBase, OW::offset::Link_TargetId, &mappedUid, &outMap) == candidate.address &&
+                        mappedUid == candidate.match_id) {
+                        return true;
+                    }
+                    outMap = {};
+                    return false;
+                };
+                const auto entryMapOwner = [](const RosterEntry& entry) -> uint64_t {
+                    return entry.participantBindingContext.owner != 0
+                        ? entry.participantBindingContext.owner
+                        : entry.fallbackMapOwner;
+                };
+                OW::CnLinkTargetMapIdentity cachedIncomingMap{};
+                bool incomingMapResolved = false;
+                bool incomingMapValid = false;
+                const auto getIncomingMap = [&](OW::CnLinkTargetMapIdentity& outMap) -> bool {
+                    if (!incomingMapResolved) {
+                        incomingMapResolved = true;
+                        incomingMapValid = resolveCnMapOwner(entity, cachedIncomingMap);
+                    }
+                    outMap = cachedIncomingMap;
+                    return incomingMapValid;
+                };
+
+                // Symmetric cross-seat match_id duplicate guard across ALL seats in entityRoster:
+                // prevents a foreign-world clone (whether participant_key == 0 or != 0) sharing
+                // match_id with an already-seated body under another roster_key (0x4000... or
+                // 0x1000...) from opening a duplicate seat or hijacking a live incumbent.
+                if (entity.match_id != 0) {
+                    bool crossSeatRejected = false;
+                    for (const auto& [dupKey, dupPtr] : entityRoster) {
+                        if (dupKey == entity.roster_key || !dupPtr ||
+                            dupPtr->entity.address == 0 ||
+                            dupPtr->entity.address == entity.address ||
+                            dupPtr->entity.match_id != entity.match_id) {
+                            continue;
+                        }
+                        const auto& dupEntry = *dupPtr;
+                        const auto& dupEntity = dupEntry.entity;
+                        if (entity.participant_key != 0 && dupEntity.participant_key != 0 &&
+                            entity.participant_key != dupEntity.participant_key) {
+                            continue;
+                        }
+                        const bool sameController =
+                            dupEntity.LinkParent == LinkParent &&
+                            dupEntry.participantControllerUid == cacheIt->second->participantControllerUid;
+                        if (entity.participant_key != 0 && sameController)
+                            continue;
+
+                        const bool dupFresh =
+                            dupEntity.roster_state == OW::EntityRosterState::Fresh &&
+                            dupEntity.Alive;
+                        const bool incomingFresh =
+                            entity.roster_state == OW::EntityRosterState::Fresh &&
+                            entity.Alive;
+                        const bool dupMember = latestCompleteActorMembers.contains(dupEntity.address);
+                        const bool incomingMember = latestCompleteActorMembers.contains(entity.address);
+
+                        if (!incomingFresh) {
+                            rejectAdmission(1, "incoming_not_alive", "match_id_duplicate");
+                            crossSeatRejected = true;
+                            break;
+                        }
+                        if (dupFresh && !(completeActorMembershipKnown && !dupMember && incomingMember)) {
+                            rejectAdmission(1, "match_id_live_duplicate", sameController ? "same_controller" : "foreign_seat");
+                            crossSeatRejected = true;
+                            break;
+                        }
+                        bool sameWorldDeadCrossReplacement = false;
+                        if (!sameController) {
+                            uint64_t dupOwner = entryMapOwner(dupEntry);
+                            if (dupOwner == 0 && (dupFresh || dupMember)) {
+                                OW::CnLinkTargetMapIdentity dupMap{};
+                                if (resolveCnMapOwner(dupEntity, dupMap))
+                                    dupOwner = dupMap.owner;
+                            }
+                            if (dupOwner != 0) {
+                                OW::CnLinkTargetMapIdentity incomingMap{};
+                                if (getIncomingMap(incomingMap) && incomingMap.owner != 0) {
+                                    if (incomingMap.owner != dupOwner) {
+                                        rejectAdmission(1, "match_id_foreign_world", "owner_mismatch");
+                                        crossSeatRejected = true;
+                                        break;
+                                    }
+                                    if (!dupFresh && incomingMap.context == entity.LinkParent) {
+                                        sameWorldDeadCrossReplacement = true;
+                                    }
+                                } else if (entity.LinkBase != 0 &&
+                                           OW::offset::Active().componentTransform == OW::offset::ComponentTransformMode::Cn155284) {
+                                    rejectAdmission(1, "match_id_map_unconfirmed", "incoming_map_failed");
+                                    crossSeatRejected = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (!sameWorldDeadCrossReplacement && !sameController &&
+                            completeActorMembershipKnown && dupMember && incomingMember) {
+                            rejectAdmission(1, "match_id_foreign_duplicate", "both_in_table");
+                            crossSeatRejected = true;
+                            break;
+                        }
+                    }
+                    if (crossSeatRejected)
+                        continue;
+                }
+
+                if (entity.participant_key == 0 &&
+                    existingRosterIt != entityRoster.end() &&
+                    existingRosterIt->second->entity.address != entity.address) {
+                    // Guard same-roster_key collisions for participant_key == 0 (0x1000... | match_id)
+                    // so a foreign-world killcam/replay clone cannot hijack and retire a live or
+                    // recently-dead real body, while genuine same-world respawns/replacements
+                    // succeed cleanly when the old body is dead/absent.
+                    const auto& existingEntry = *existingRosterIt->second;
+                    const auto& existingEntity = existingEntry.entity;
+                    const bool existingFresh =
+                        existingEntity.roster_state == OW::EntityRosterState::Fresh &&
+                        existingEntity.Alive;
+                    const bool incomingFresh =
+                        entity.roster_state == OW::EntityRosterState::Fresh &&
+                        entity.Alive;
+                    const bool existingMember = latestCompleteActorMembers.contains(existingEntity.address);
+                    const bool incomingMember = latestCompleteActorMembers.contains(entity.address);
+                    const bool sameController =
+                        existingEntity.LinkParent == LinkParent &&
+                        existingEntry.participantControllerUid == cacheIt->second->participantControllerUid;
+
+                    OW::CnLinkTargetMapIdentity incomingMap{};
+                    const bool incomingMapped = getIncomingMap(incomingMap);
+                    const bool incomingPaired = sameController && (liveBindingConfirmed || incomingMapped);
+
+                    bool foreignWorldMismatch = false;
+                    bool incomingMapUnconfirmed = false;
+                    bool sameWorldDeadReplacement = false;
+                    if (!sameController && incomingFresh) {
+                        uint64_t existingOwner = entryMapOwner(existingEntry);
+                        if (existingOwner == 0 && (existingFresh || existingMember)) {
+                            OW::CnLinkTargetMapIdentity existingMap{};
+                            if (resolveCnMapOwner(existingEntity, existingMap))
+                                existingOwner = existingMap.owner;
+                        }
+                        if (existingOwner != 0) {
+                            if (incomingMapped && incomingMap.owner != 0) {
+                                if (incomingMap.owner != existingOwner) {
+                                    foreignWorldMismatch = true;
+                                } else if (!existingFresh && incomingMap.context == entity.LinkParent) {
+                                    sameWorldDeadReplacement = true;
+                                }
+                            } else if (entity.LinkBase != 0 &&
+                                       OW::offset::Active().componentTransform == OW::offset::ComponentTransformMode::Cn155284) {
+                                incomingMapUnconfirmed = true;
+                            }
+                        }
+                    }
+
+                    if (foreignWorldMismatch) {
+                        rejectAdmission(1, "fallback_foreign_world", "owner_mismatch");
+                        continue;
+                    }
+                    if (incomingMapUnconfirmed) {
+                        rejectAdmission(1, "fallback_map_unconfirmed", "incoming_map_failed");
+                        continue;
+                    }
+
+                    if (!sameWorldDeadReplacement) {
+                        switch (OW::EntityRosterPolicy::ResolveSameParticipantObservation(
+                            existingEntry.seenThisCycle || existingFresh,
+                            false,
+                            existingFresh,
+                            incomingFresh,
+                            completeActorMembershipKnown,
+                            existingMember,
+                            incomingMember,
+                            sameController,
+                            incomingPaired,
+                            currentMapProof)) {
+                        case OW::EntityRosterPolicy::SameParticipantObservationAction::KeepExisting:
+                            rejectAdmission(1,
+                                !incomingFresh ? "incoming_not_alive"
+                                    : (sameController ? "controller_pair_unconfirmed" : "fallback_seat_collision"),
+                                existingFresh ? "existing_live" : "existing_in_table");
+                            continue;
+                        case OW::EntityRosterPolicy::SameParticipantObservationAction::ReplaceExisting:
+                        default:
+                            break;
+                        }
                     }
                 }
                 const auto retiredIt=retiredActors.find(entity.address);
@@ -204,6 +400,33 @@
                 if(!entity.body_authority_revision){rejectAdmission(3,authorityFailure);continue;}
                 OW::EntityMaintenance::ParticipantReplacementVerifier::Maintain(admissionRecord,entity,
                     processRegistry,processSceneGeneration,entityAdmissionNow);
+                if (entity.Alive && entity.LinkBase && admissionRecord.participantControllerUid != 0 &&
+                    OW::offset::Active().componentTransform == OW::offset::ComponentTransformMode::Cn155284) {
+                    if (admissionRecord.participantBindingContext.owner != 0 &&
+                        admissionRecord.participantBindingContext.context != 0 &&
+                        admissionRecord.participantBindingContext.linkBase == entity.LinkBase) {
+                        admissionRecord.fallbackMapOwner = admissionRecord.participantBindingContext.owner;
+                        admissionRecord.fallbackMapLinkBase = entity.LinkBase;
+                    } else if (admissionRecord.fallbackMapOwner == 0 ||
+                               admissionRecord.fallbackMapLinkBase != entity.LinkBase) {
+                        if (admissionRecord.fallbackMapLinkBase != 0 &&
+                            admissionRecord.fallbackMapLinkBase != entity.LinkBase) {
+                            admissionRecord.fallbackMapOwner = 0;
+                            admissionRecord.fallbackMapLinkBase = 0;
+                            admissionRecord.fallbackMapOwnerAttemptTick = 0;
+                        }
+                        const DWORD ownerNow = entityAdmissionNow();
+                        if (!admissionRecord.fallbackMapOwnerAttemptTick ||
+                            uint32_t(ownerNow - admissionRecord.fallbackMapOwnerAttemptTick) >= 250) {
+                            admissionRecord.fallbackMapOwnerAttemptTick = ownerNow;
+                            OW::CnLinkTargetMapIdentity admittedMap{};
+                            if (getIncomingMap(admittedMap) && admittedMap.owner != 0) {
+                                admissionRecord.fallbackMapOwner = admittedMap.owner;
+                                admissionRecord.fallbackMapLinkBase = entity.LinkBase;
+                            }
+                        }
+                    }
+                }
                 // A new body's observation was read before its admission generation existed.
                 // Bind only that same fully checked sample to the newly admitted generation.
                 auto& admittedSkeleton = cacheIt->second->skeletonCache;

@@ -274,6 +274,99 @@ namespace OW {
     inline thread_local uint64_t componentKeyTestTick = 0;
     inline thread_local void (*componentDecryptTestObserver)(uintptr_t,uint32_t,bool) = nullptr;
 #endif
+    struct Cn155284ComponentKeyCache {
+        uint64_t base = 0, epoch = 0, sampled = 0;
+        uint8_t a = 0, b = 0;
+        bool valid = false;
+    };
+
+    inline Cn155284ComponentKeyCache& ThreadCn155284ComponentKeys() {
+        static thread_local Cn155284ComponentKeyCache keys;
+        return keys;
+    }
+
+    inline bool HasFreshCn155284ComponentKeys(uint8_t& outA, uint8_t& outB, uint64_t& outNow, uint64_t& outEpoch) {
+#ifdef UNLEASHED_HEALTH_CACHE_TEST
+        outNow = componentKeyTestTick;
+#else
+        outNow = GetTickCount64();
+#endif
+        outEpoch = ProcessConnection::ConnectionEpoch();
+        const auto& keys = ThreadCn155284ComponentKeys();
+        if (keys.valid && keys.base == SDK->dwGameBase && keys.epoch == outEpoch && outNow - keys.sampled < 16) {
+            outA = keys.a;
+            outB = keys.b;
+            return true;
+        }
+        return false;
+    }
+
+    inline void StoreCn155284ComponentKeys(uint64_t now, uint64_t epoch, uint8_t a, uint8_t b) {
+        ThreadCn155284ComponentKeys() = { SDK->dwGameBase, epoch, now, a, b, true };
+    }
+
+    inline void InvalidateCn155284ComponentKeys() {
+        ThreadCn155284ComponentKeys().valid = false;
+    }
+
+    struct CnComponentSlotPlan {
+        bool present = false;
+        uint64_t entryAddress = 0;
+        uint64_t presentMask = 0;
+        uint32_t expectedType = 0;
+    };
+
+    inline CnComponentSlotPlan PlanCnComponentSlot(
+        uintptr_t parent,
+        uint32_t idx,
+        const EntityHeaderSnapshot& parentSnapshot)
+    {
+        CnComponentSlotPlan plan{};
+        if (!parent || !parentSnapshot.valid || parentSnapshot.parent != parent)
+            return plan;
+
+        uint64_t bit_mask = 0;
+        uint64_t lower_mask = 0;
+        uint32_t shift = 0;
+        uint32_t bucket = 0;
+        sub_E8D1A0(&bit_mask, &lower_mask, &shift, &bucket, idx);
+
+        uint64_t component_bits = 0;
+        if (!parentSnapshot.ReadParentOffset(8ull * bucket + 0x110, component_bits))
+            return plan;
+        const uint64_t present = (component_bits & bit_mask) >> shift;
+        if (!present)
+            return plan;
+
+        uint64_t below = component_bits & lower_mask;
+        below -= (below >> 1) & 0x5555555555555555ull;
+        below = (below & 0x3333333333333333ull) +
+                ((below >> 2) & 0x3333333333333333ull);
+        below = (below + (below >> 4)) & 0x0F0F0F0F0F0F0F0Full;
+
+        uint8_t component_index_base = 0;
+        if (!parentSnapshot.ReadParentOffset(bucket + 0x130, component_index_base))
+            return plan;
+
+        const uint64_t component_index =
+            component_index_base +
+            ((below * 0x0101010101010101ull) >> 0x38);
+
+        uint64_t component_table = 0;
+        if (!parentSnapshot.ReadParentOffset(0x80, component_table))
+            return plan;
+        if (!component_table) {
+            Diagnostics::RecordDecryptFailure();
+            return plan;
+        }
+
+        plan.present = true;
+        plan.entryAddress = component_table + 8ull * component_index;
+        plan.presentMask = static_cast<uint64_t>(static_cast<int64_t>(-static_cast<int32_t>(present)));
+        plan.expectedType = idx;
+        return plan;
+    }
+
     inline uintptr_t DecryptComponent(uintptr_t parent, uint32_t idx,
                                       const EntityHeaderSnapshot* parent_snapshot,
                                       bool requireExactReads = false) {
@@ -341,29 +434,18 @@ namespace OW {
         const auto& activeOffsets = offset::Active();
 
         if (activeOffsets.componentTransform == offset::ComponentTransformMode::Cn155284) {
-            struct Keys {
-                uint64_t base = 0, epoch = 0, sampled = 0;
-                uint8_t a = 0, b = 0;
-                bool valid = false;
-            };
-            static thread_local Keys keys;
-#ifdef UNLEASHED_HEALTH_CACHE_TEST
-            const uint64_t now = componentKeyTestTick;
-#else
-            const uint64_t now = GetTickCount64();
-#endif
-            const uint64_t epoch = ProcessConnection::ConnectionEpoch();
-            if (!keys.valid || keys.base != SDK->dwGameBase || keys.epoch != epoch || now - keys.sampled >= 16) {
-                keys.valid = false;
-                uint8_t a = 0, b = 0;
-                if (!SDK->read_range(SDK->dwGameBase + activeOffsets.componentKeyByteRva, &a, sizeof(a)) ||
-                    !SDK->read_range(SDK->dwGameBase + activeOffsets.componentKeySecondByteRva, &b, sizeof(b))) {
+            uint8_t keyA = 0, keyB = 0;
+            uint64_t now = 0, epoch = 0;
+            if (!HasFreshCn155284ComponentKeys(keyA, keyB, now, epoch)) {
+                InvalidateCn155284ComponentKeys();
+                if (!SDK->read_range(SDK->dwGameBase + activeOffsets.componentKeyByteRva, &keyA, sizeof(keyA)) ||
+                    !SDK->read_range(SDK->dwGameBase + activeOffsets.componentKeySecondByteRva, &keyB, sizeof(keyB))) {
                     Diagnostics::RecordDecryptFailure();
                     return 0;
                 }
-                keys = {SDK->dwGameBase, epoch, now, a, b, true};
+                StoreCn155284ComponentKeys(now, epoch, keyA, keyB);
             }
-            const uintptr_t decoded = static_cast<uintptr_t>(present_mask & Cn155284::Component(component, keys.a, keys.b));
+            const uintptr_t decoded = static_cast<uintptr_t>(present_mask & Cn155284::Component(component, keyA, keyB));
             uint8_t type = 0;
             if (decoded < 0x10000 || decoded >= 0x0000800000000000ULL ||
                 !SDK->read_range(decoded + 0x10, &type, sizeof(type)) || type != idx) {
@@ -613,6 +695,374 @@ namespace OW {
         bool operator==(const CnLinkTargetMapIdentity&) const = default;
     };
 
+    inline bool ReadCnMapBucketHeader(uint64_t bucketAddress, uint64_t& entries, uint32_t& count,
+                                      bool forceMerged12B = false) {
+        entries = 0;
+        count = 0;
+#if defined(UNLEASHED_DMA_SESSION_SELFTEST)
+        if (!forceMerged12B) {
+            return SDK->read_range(bucketAddress, &entries, sizeof(entries)) &&
+                SDK->read_range(bucketAddress + 8, &count, sizeof(count));
+        }
+#else
+        (void)forceMerged12B;
+#endif
+        std::array<uint8_t, 12> raw{};
+        if (!SDK->read_range(bucketAddress, raw.data(), raw.size()))
+            return false;
+        std::memcpy(&entries, raw.data(), sizeof(entries));
+        std::memcpy(&count, raw.data() + 8, sizeof(count));
+        return true;
+    }
+
+    struct CnLinkTargetMapBatchRequest {
+        uint64_t linkBase = 0;
+        uint64_t idOffset = 0;
+        bool requireCompleteProof = false;
+    };
+
+    struct CnLinkTargetMapBatchResult {
+        uint64_t target = 0;
+        uint32_t resolvedId = 0;
+        CnLinkTargetMapIdentity verifiedMap{};
+    };
+
+    // Dependency-wave batched version of ResolveCnLinkTargetMapBase: resolves N link
+    // map queries in 5 scatter waves instead of 6*N serial DMA round trips.
+    inline std::vector<CnLinkTargetMapBatchResult> ResolveCnLinkTargetMapBatch(
+        const std::vector<CnLinkTargetMapBatchRequest>& requests,
+        VMMDLL_SCATTER_HANDLE externalScatter = nullptr,
+        bool forceMerged12B = false,
+        bool* externalScatterPoisoned = nullptr)
+    {
+        if (externalScatterPoisoned)
+            *externalScatterPoisoned = false;
+        std::vector<CnLinkTargetMapBatchResult> results(requests.size());
+        if (requests.empty())
+            return results;
+
+        const auto mapMode = offset::Active().contextMap;
+        const bool protectedMap = mapMode == offset::ContextMapMode::Protected155284;
+        const bool worldMap = mapMode == offset::ContextMapMode::World155284;
+#if defined(UNLEASHED_DMA_SESSION_SELFTEST)
+        const bool useMerged12B = forceMerged12B;
+#else
+        (void)forceMerged12B;
+        const bool useMerged12B = true;
+#endif
+
+        VMMDLL_SCATTER_HANDLE handle = externalScatter ? externalScatter : mem.CreateScatterHandle();
+        if (!handle)
+            return results;
+        const bool ownedHandle = externalScatter == nullptr;
+        struct ScopeClose {
+            VMMDLL_SCATTER_HANDLE h;
+            bool own;
+            ~ScopeClose() { if (own && h) mem.CloseScatterHandle(h); }
+        } guard{ handle, ownedHandle };
+        const auto clearExternalOnAbort = [&]() {
+            if (!ownedHandle && !mem.ClearScatterHandle(handle) && externalScatterPoisoned)
+                *externalScatterPoisoned = true;
+        };
+
+        struct WaveState {
+            bool active = false;
+            uint32_t id = 0;
+            DWORD idBytes = 0;
+            uint64_t rawContext = 0;
+            DWORD contextBytes = 0;
+            uint64_t context = 0;
+            uint64_t rawOwner = 0;
+            DWORD ownerBytes = 0;
+            uint64_t bucketOwner = 0;
+            uint64_t rawBuckets = 0;
+            DWORD bucketsBytes = 0;
+            uint64_t bucketArray = 0;
+            std::array<uint8_t, 12> bucketRaw{};
+            uint64_t entries = 0;
+            uint32_t count = 0;
+            DWORD bucketBytes = 0;
+            DWORD entriesBytes = 0;
+            DWORD countBytes = 0;
+            uint32_t cappedCount = 0;
+            uint32_t cursor = 0;
+            uint32_t chunkLen = 0;
+            DWORD entryChunkBytes = 0;
+            uint64_t uniqueTarget = 0;
+            struct MapEntry { uint32_t id, padding; uint64_t pointer; };
+            std::array<MapEntry, 16> values{};
+        };
+
+        std::vector<WaveState> states(requests.size());
+        bool anyActive = false;
+
+        // Wave 1: linkBase + idOffset (4B) and linkBase + 0x8 (8B rawContext).
+        bool anyPrepFailed = false;
+        for (size_t i = 0; i < requests.size(); ++i) {
+            if (!IsPlausibleUserPointer(requests[i].linkBase))
+                continue;
+            const bool p1 = mem.AddScatterReadRequest(handle, requests[i].linkBase + requests[i].idOffset,
+                &states[i].id, sizeof(states[i].id), &states[i].idBytes);
+            const bool p2 = mem.AddScatterReadRequest(handle, requests[i].linkBase + 0x8,
+                &states[i].rawContext, sizeof(states[i].rawContext), &states[i].contextBytes);
+            if (p1 && p2) {
+                states[i].active = true;
+                anyActive = true;
+            } else {
+                anyPrepFailed = true;
+                if (p1 || p2) {
+                    // At least one request was queued into handle; must execute/clear before leaving wave.
+                    anyActive = true;
+                }
+            }
+        }
+        if (!anyActive) {
+            if (anyPrepFailed)
+                clearExternalOnAbort();
+            return results;
+        }
+        if (!mem.ExecuteReadScatter(handle)) {
+            clearExternalOnAbort();
+            return results;
+        }
+
+        // Wave 2: context + 0x28 (8B rawOwner).
+        anyActive = false;
+        bool wave2PrepFailed = false;
+        for (size_t i = 0; i < requests.size(); ++i) {
+            auto& st = states[i];
+            if (!st.active) continue;
+            if (st.idBytes != sizeof(st.id) || st.id == 0 || st.contextBytes != sizeof(st.rawContext)) {
+                st.active = false;
+                continue;
+            }
+            st.context = protectedMap ? Cn155284::Parent(st.rawContext)
+                : worldMap ? RegionalLayout::World155284::DecodeMapParent(st.rawContext) : st.rawContext;
+            if (!IsPlausibleUserPointer(st.context)) {
+                st.active = false;
+                continue;
+            }
+            if (!mem.AddScatterReadRequest(handle, st.context + 0x28,
+                    &st.rawOwner, sizeof(st.rawOwner), &st.ownerBytes)) {
+                st.active = false;
+                wave2PrepFailed = true;
+                continue;
+            }
+            anyActive = true;
+        }
+        if (!anyActive) {
+            if (wave2PrepFailed)
+                clearExternalOnAbort();
+            return results;
+        }
+        if (!mem.ExecuteReadScatter(handle)) {
+            clearExternalOnAbort();
+            return results;
+        }
+
+        // Wave 3: bucketOwner + 0x18 (8B rawBuckets).
+        anyActive = false;
+        bool wave3PrepFailed = false;
+        for (size_t i = 0; i < requests.size(); ++i) {
+            auto& st = states[i];
+            if (!st.active) continue;
+            if (st.ownerBytes != sizeof(st.rawOwner)) {
+                st.active = false;
+                continue;
+            }
+            st.bucketOwner = protectedMap ? Cn155284::MapOwner(st.rawOwner)
+                : worldMap ? RegionalLayout::World155284::DecodeMapOwner(st.rawOwner) : st.rawOwner;
+            if (!IsPlausibleUserPointer(st.bucketOwner)) {
+                st.active = false;
+                continue;
+            }
+            if (!mem.AddScatterReadRequest(handle, st.bucketOwner + 0x18,
+                    &st.rawBuckets, sizeof(st.rawBuckets), &st.bucketsBytes)) {
+                st.active = false;
+                wave3PrepFailed = true;
+                continue;
+            }
+            anyActive = true;
+        }
+        if (!anyActive) {
+            if (wave3PrepFailed)
+                clearExternalOnAbort();
+            return results;
+        }
+        if (!mem.ExecuteReadScatter(handle)) {
+            clearExternalOnAbort();
+            return results;
+        }
+
+        // Wave 4: bucketArray + 16*bucket (merged 12B entries+count in production).
+        anyActive = false;
+        bool wave4PrepFailed = false;
+        for (size_t i = 0; i < requests.size(); ++i) {
+            auto& st = states[i];
+            if (!st.active) continue;
+            if (st.bucketsBytes != sizeof(st.rawBuckets)) {
+                st.active = false;
+                continue;
+            }
+            st.bucketArray = protectedMap ? Cn155284::MapBuckets(st.rawBuckets)
+                : worldMap ? RegionalLayout::World155284::DecodeMapBuckets(st.rawBuckets) : st.rawBuckets;
+            if (!IsPlausibleUserPointer(st.bucketArray)) {
+                st.active = false;
+                continue;
+            }
+            const uint64_t bucketAddr = st.bucketArray + 16ull * (st.id & 0xFFFu);
+            if (useMerged12B) {
+                if (!mem.AddScatterReadRequest(handle, bucketAddr, st.bucketRaw.data(), st.bucketRaw.size(), &st.bucketBytes)) {
+                    st.active = false;
+                    wave4PrepFailed = true;
+                    continue;
+                }
+                anyActive = true;
+            } else {
+                const bool p1 = mem.AddScatterReadRequest(handle, bucketAddr, &st.entries, sizeof(st.entries), &st.entriesBytes);
+                const bool p2 = mem.AddScatterReadRequest(handle, bucketAddr + 8, &st.count, sizeof(st.count), &st.countBytes);
+                if (p1 && p2) {
+                    anyActive = true;
+                } else {
+                    st.active = false;
+                    wave4PrepFailed = true;
+                    if (p1 || p2) anyActive = true;
+                }
+            }
+        }
+        if (!anyActive) {
+            if (wave4PrepFailed)
+                clearExternalOnAbort();
+            return results;
+        }
+        if (!mem.ExecuteReadScatter(handle)) {
+            clearExternalOnAbort();
+            return results;
+        }
+
+        for (size_t i = 0; i < requests.size(); ++i) {
+            auto& st = states[i];
+            if (!st.active) continue;
+            if (useMerged12B) {
+                if (st.bucketBytes != st.bucketRaw.size()) {
+                    st.active = false;
+                    continue;
+                }
+                std::memcpy(&st.entries, st.bucketRaw.data(), sizeof(st.entries));
+                std::memcpy(&st.count, st.bucketRaw.data() + 8, sizeof(st.count));
+            } else {
+                if (st.entriesBytes != sizeof(st.entries) || st.countBytes != sizeof(st.count)) {
+                    st.active = false;
+                    continue;
+                }
+            }
+            if (!IsPlausibleUserPointer(st.entries) || st.count == 0 || st.count > 4096) {
+                st.active = false;
+                continue;
+            }
+            st.cappedCount = (std::min)(st.count, 512u);
+            if (requests[i].requireCompleteProof && st.count != st.cappedCount) {
+                st.active = false;
+                continue;
+            }
+        }
+
+        // Wave 5+: bucket MapEntry chunks until all active buckets complete.
+        // 512 entries at 16B each can straddle up to 3 4KB pages, so allow up to 64 rounds.
+        for (unsigned round = 0; round < 64; ++round) {
+            anyActive = false;
+            bool anyUnalignedAdvance = false;
+            bool wave5PrepFailed = false;
+            for (size_t i = 0; i < requests.size(); ++i) {
+                auto& st = states[i];
+                if (!st.active || st.cursor >= st.cappedCount)
+                    continue;
+                const uint64_t address = st.entries + uint64_t(st.cursor) * sizeof(WaveState::MapEntry);
+                const uint32_t pageEntries = uint32_t((0x1000 - (address & 0xFFF)) / sizeof(WaveState::MapEntry));
+                st.chunkLen = (std::min)({ uint32_t(st.values.size()), st.cappedCount - st.cursor, pageEntries });
+                st.entryChunkBytes = 0;
+                if (st.chunkLen == 0) {
+                    if (requests[i].requireCompleteProof) {
+                        st.active = false;
+                    } else {
+                        ++st.cursor;
+                        if (st.cursor < st.cappedCount)
+                            anyUnalignedAdvance = true;
+                    }
+                    continue;
+                }
+                if (!mem.AddScatterReadRequest(handle, address, st.values.data(),
+                        size_t(st.chunkLen) * sizeof(WaveState::MapEntry), &st.entryChunkBytes)) {
+                    wave5PrepFailed = true;
+                    if (requests[i].requireCompleteProof) {
+                        st.active = false;
+                    } else {
+                        st.cursor += st.chunkLen;
+                    }
+                    continue;
+                }
+                anyActive = true;
+            }
+            if (!anyActive) {
+                if (wave5PrepFailed) {
+                    clearExternalOnAbort();
+                    return results;
+                }
+                if (anyUnalignedAdvance)
+                    continue;
+                break;
+            }
+            if (!mem.ExecuteReadScatter(handle)) {
+                clearExternalOnAbort();
+                return results;
+            }
+
+            for (size_t i = 0; i < requests.size(); ++i) {
+                auto& st = states[i];
+                if (!st.active || st.cursor >= st.cappedCount)
+                    continue;
+                const size_t expectedBytes = size_t(st.chunkLen) * sizeof(WaveState::MapEntry);
+                const bool chunkRead = st.entryChunkBytes == expectedBytes;
+                if (requests[i].requireCompleteProof && !chunkRead) {
+                    st.active = false;
+                    continue;
+                }
+                if (chunkRead) {
+                    for (uint32_t idx = 0; idx < st.chunkLen; ++idx) {
+                        if (st.values[idx].id != st.id)
+                            continue;
+                        const uint64_t mapBase = st.values[idx].pointer;
+                        if (requests[i].requireCompleteProof) {
+                            if (st.uniqueTarget || !IsPlausibleUserPointer(mapBase)) {
+                                st.uniqueTarget = 0;
+                                st.active = false;
+                                break;
+                            }
+                            st.uniqueTarget = mapBase;
+                            continue;
+                        }
+                        if (IsPlausibleUserPointer(mapBase)) {
+                            results[i].target = mapBase;
+                            results[i].resolvedId = st.id;
+                            st.active = false;
+                            break;
+                        }
+                    }
+                }
+                st.cursor += st.chunkLen ? st.chunkLen : 1;
+                if (st.active && st.cursor >= st.cappedCount && requests[i].requireCompleteProof) {
+                    if (st.uniqueTarget) {
+                        results[i].target = st.uniqueTarget;
+                        results[i].resolvedId = st.id;
+                        results[i].verifiedMap = { st.context, st.bucketOwner, st.bucketArray, st.entries, st.count };
+                    }
+                    st.active = false;
+                }
+            }
+        }
+        return results;
+    }
+
     inline uint64_t ResolveCnLinkTargetMapBase(
         uint64_t linkBase,
         uint64_t idOffset,
@@ -664,8 +1114,7 @@ namespace OW {
 
         const uint64_t bucket = id & 0xFFFu;
         uint64_t entries=0;uint32_t count=0;
-        if (!SDK->read_range(bucketArray+16ull*bucket,&entries,sizeof(entries)) ||
-            !SDK->read_range(bucketArray+16ull*bucket+8,&count,sizeof(count)))
+        if (!ReadCnMapBucketHeader(bucketArray+16ull*bucket,entries,count))
             return 0;
         mapTrace.Bucket(entries, count, id);
         if (!IsPlausibleUserPointer(entries) || count == 0 || count > 4096)
@@ -1899,6 +2348,20 @@ namespace OW {
         return {};
     }
 
+    // Controls inline wave-scatter batching across parent/map/header/component/recheck waves inside ProbePriorityActor.
+    // Enabled by default in production; opt-in under selftest so legacy .direct-only fixtures stay compatible
+    // while Phase A+ tests exercise the exact production wave-scatter error/cleanup paths.
+#if defined(UNLEASHED_DMA_SESSION_SELFTEST)
+    inline bool g_probeWaveScatterEnabled = false;
+#else
+    inline bool g_probeWaveScatterEnabled = true;
+#endif
+
+    enum class PriorityProbeUnresolvedKind : uint8_t {
+        UnknownOrFailure = 0,
+        DefinitiveNonActor = 1,
+    };
+
     // Positive discovery only. Full audits retain responsibility for ambiguous
     // objects; an unresolved parent never removes an existing actor.
     inline std::vector<std::pair<uint64_t,uint64_t>> ProbePriorityActor(uint64_t parent,const EntityTopologySample& topology,bool knownLink,
@@ -1906,12 +2369,16 @@ namespace OW {
         std::vector<EntityRosterPolicy::Discovery>* discoveries=nullptr,
         const std::unordered_map<uint64_t,EntityHeaderSnapshot>* headers=nullptr,
         const std::vector<EntityRosterPolicy::Discovery>* hotActors=nullptr,bool currentController=false,
-        bool currentMapPositiveOnly=false) {
+        bool currentMapPositiveOnly=false,VMMDLL_SCATTER_HANDLE waveScatter=nullptr,
+        PriorityProbeUnresolvedKind* unresolvedKind=nullptr,
+        bool* waveScatterPoisoned=nullptr) {
         std::vector<std::pair<uint64_t,uint64_t>> result;
         const DWORD discoveryTick = static_cast<DWORD>(EntityRegistryNowMs());
         if (discoveries) discoveries->clear();
         if(bindingMembers)bindingMembers->clear();
         if(bindingComplete)*bindingComplete=false;
+        if(unresolvedKind)*unresolvedKind=PriorityProbeUnresolvedKind::UnknownOrFailure;
+        if(waveScatterPoisoned)*waveScatterPoisoned=false;
         const auto trace=[&](uint64_t reason,uint64_t component=0) {
             RuntimeTrace::Emit(RuntimeTrace::DiscoveryProbe,parent,reason,component,knownLink);
         };
@@ -1922,71 +2389,390 @@ namespace OW {
         if(headers && headers->contains(parent))header=headers->at(parent);
         else if(!header.Read(parent)){trace(1);return result;}
         uint32_t match=0;if(!header.ReadParentOffset(offset::Entity_MatchId,match) || !match){trace(2);return result;}
-        const auto link=DecryptComponent(parent,offset::Active().typeLink,&header,true);
-        if (offset::Active().capacityBoundRegistry) {
-            result = ProbeRegionalActor(parent, topology, header, match, link, discoveryTick, discoveries);
-            if (bindingMembers) *bindingMembers = result;
-            // Native map evidence admits the current body, not complete roster
-            // enumeration or deletion authority over other bodies.
-            if (bindingComplete) *bindingComplete =
-                offset::Active().contextMap == offset::ContextMapMode::Plain && result.size() == 1;
-            return result;
+
+        const auto& activeOffsets = offset::Active();
+        const bool useWave = waveScatter != nullptr && g_probeWaveScatterEnabled;
+        const bool useCnWave = useWave && !activeOffsets.capacityBoundRegistry &&
+            activeOffsets.componentTransform == offset::ComponentTransformMode::Cn155284;
+        bool scatterPoisoned = false;
+        const auto clearWaveScatter = [&]() {
+            if (waveScatter && !mem.ClearScatterHandle(waveScatter)) {
+                scatterPoisoned = true;
+                if (waveScatterPoisoned)
+                    *waveScatterPoisoned = true;
+            }
+        };
+
+        const auto runWave = [&](bool prepOk) -> bool {
+            if (scatterPoisoned)
+                return false;
+            if (!prepOk) {
+                // Never leave stack-local buffer pointers queued in reusable waveScatter!
+                clearWaveScatter();
+                return false;
+            }
+            const bool execOk = mem.ExecuteReadScatter(waveScatter);
+            if (!execOk)
+                clearWaveScatter();
+            return execOk;
+        };
+
+        const auto resolveMapBatch = [&](const std::vector<CnLinkTargetMapBatchRequest>& reqs) {
+            if (useWave && !scatterPoisoned) {
+                bool poisoned = false;
+                auto out = ResolveCnLinkTargetMapBatch(reqs, waveScatter, false, &poisoned);
+                if (poisoned) {
+                    scatterPoisoned = true;
+                    if (waveScatterPoisoned)
+                        *waveScatterPoisoned = true;
+                }
+                return out;
+            }
+            std::vector<CnLinkTargetMapBatchResult> out(reqs.size());
+            for (size_t i = 0; i < reqs.size(); ++i) {
+                uint32_t resolvedId = 0;
+                CnLinkTargetMapIdentity mapId{};
+                out[i].target = ResolveCnLinkTargetMapBase(
+                    reqs[i].linkBase,
+                    reqs[i].idOffset,
+                    &resolvedId,
+                    reqs[i].requireCompleteProof ? &mapId : nullptr);
+                out[i].resolvedId = resolvedId;
+                out[i].verifiedMap = mapId;
+            }
+            return out;
+        };
+
+        uintptr_t link = 0;
+        std::array<uint32_t, 2> linkIds{};
+        bool linkIdRead = false;
+        bool parentHeroChecked = false;
+        uintptr_t parentHeroBase = 0;
+        uint64_t parentHeroId = 0;
+        bool parentHeroIdRead = false;
+        bool transportOrDecryptFailure = false;
+        bool parentHeroCleanNonHero = false;
+        bool ambiguousMapFailed = false;
+        const bool isCnLayout = !activeOffsets.capacityBoundRegistry &&
+            activeOffsets.componentTransform == offset::ComponentTransformMode::Cn155284;
+        const auto headerHasType = [](const EntityHeaderSnapshot& hdr, uint32_t type) {
+            uint64_t bits = 0;
+            return hdr.ReadParentOffset(0x110 + 8ull * (type >> 6), bits) &&
+                (bits & (1ull << (type & 63))) != 0;
+        };
+
+        const bool headerHasLink = headerHasType(header, activeOffsets.typeLink);
+
+        if (useCnWave) {
+            const CnComponentSlotPlan linkPlan = PlanCnComponentSlot(parent, activeOffsets.typeLink, header);
+            if (headerHasLink && !linkPlan.present)
+                transportOrDecryptFailure = true;
+            if (currentMapPositiveOnly && !linkPlan.present) {
+                trace(8);
+                return result;
+            }
+            const CnComponentSlotPlan parentHeroPlan = PlanCnComponentSlot(parent, activeOffsets.typeHeroId, header);
+            if (!parentHeroPlan.present)
+                parentHeroCleanNonHero = true;
+            uint8_t keyA = 0, keyB = 0;
+            uint64_t keyNow = 0, keyEpoch = 0;
+            bool hasKeys = HasFreshCn155284ComponentKeys(keyA, keyB, keyNow, keyEpoch);
+
+            uintptr_t linkCandidate = 0;
+            uintptr_t parentHeroCandidate = 0;
+            if (linkPlan.present || parentHeroPlan.present) {
+                // Parent Wave A: refresh CN component keys (if stale) + read link/hero table entries in 1 wave.
+                DWORD keyABytes = 0, keyBBytes = 0, linkRawBytes = 0, heroRawBytes = 0;
+                uint64_t linkRaw = 0, heroRaw = 0;
+                bool prepOk = true;
+                bool anyQueued = false;
+                if (!hasKeys) {
+                    const bool pA = mem.AddScatterReadRequest(waveScatter, SDK->dwGameBase + activeOffsets.componentKeyByteRva, &keyA, sizeof(keyA), &keyABytes);
+                    const bool pB = mem.AddScatterReadRequest(waveScatter, SDK->dwGameBase + activeOffsets.componentKeySecondByteRva, &keyB, sizeof(keyB), &keyBBytes);
+                    prepOk = prepOk && pA && pB;
+                    anyQueued = anyQueued || pA || pB;
+                }
+                if (linkPlan.present) {
+                    const bool pL = mem.AddScatterReadRequest(waveScatter, linkPlan.entryAddress, &linkRaw, sizeof(linkRaw), &linkRawBytes);
+                    prepOk = prepOk && pL;
+                    anyQueued = anyQueued || pL;
+                }
+                if (parentHeroPlan.present) {
+                    const bool pH = mem.AddScatterReadRequest(waveScatter, parentHeroPlan.entryAddress, &heroRaw, sizeof(heroRaw), &heroRawBytes);
+                    prepOk = prepOk && pH;
+                    anyQueued = anyQueued || pH;
+                }
+                if (!prepOk || (anyQueued && !runWave(true))) {
+                    if (!prepOk) runWave(false);
+                    if (!hasKeys) {
+                        InvalidateCn155284ComponentKeys();
+                        Diagnostics::RecordDecryptFailure();
+                    }
+                    if (currentMapPositiveOnly) trace(8);
+                    return result;
+                }
+                if (!hasKeys) {
+                    if (keyABytes == sizeof(keyA) && keyBBytes == sizeof(keyB)) {
+                        StoreCn155284ComponentKeys(keyNow, keyEpoch, keyA, keyB);
+                        hasKeys = true;
+                    } else {
+                        InvalidateCn155284ComponentKeys();
+                        Diagnostics::RecordDecryptFailure();
+                    }
+                }
+                if (hasKeys) {
+                    if (linkPlan.present) {
+                        if (linkRawBytes != sizeof(linkRaw)) {
+                            transportOrDecryptFailure = true;
+                        } else if (!linkRaw) {
+                            Diagnostics::RecordDecryptFailure();
+                        } else {
+                            const uintptr_t dec = static_cast<uintptr_t>(linkPlan.presentMask & Cn155284::Component(linkRaw, keyA, keyB));
+                            if (dec >= 0x10000 && dec < 0x0000800000000000ULL) {
+                                linkCandidate = dec;
+                            } else {
+                                transportOrDecryptFailure = true;
+                                Diagnostics::RecordDecryptFailure();
+                            }
+                        }
+                    }
+                    if (parentHeroPlan.present) {
+                        if (heroRawBytes != sizeof(heroRaw)) {
+                            transportOrDecryptFailure = true;
+                        } else if (!heroRaw) {
+                            parentHeroCleanNonHero = true;
+                            Diagnostics::RecordDecryptFailure();
+                        } else {
+                            const uintptr_t dec = static_cast<uintptr_t>(parentHeroPlan.presentMask & Cn155284::Component(heroRaw, keyA, keyB));
+                            if (dec >= 0x10000 && dec < 0x0000800000000000ULL) {
+                                parentHeroCandidate = dec;
+                            } else {
+                                transportOrDecryptFailure = true;
+                                Diagnostics::RecordDecryptFailure();
+                            }
+                        }
+                    }
+                } else {
+                    transportOrDecryptFailure = true;
+                }
+            }
+
+            // Parent Wave B: verify type bytes + read linkIds + read parent heroId in 1 wave.
+            if (linkCandidate || parentHeroCandidate) {
+                uint8_t linkType = 0, heroType = 0;
+                DWORD linkTypeBytes = 0, linkIdsBytes = 0, heroTypeBytes = 0, heroIdBytes = 0;
+                bool prepOk = true;
+                bool anyQueued = false;
+                if (linkCandidate) {
+                    const bool p1 = mem.AddScatterReadRequest(waveScatter, linkCandidate + 0x10, &linkType, sizeof(linkType), &linkTypeBytes);
+                    const bool p2 = mem.AddScatterReadRequest(waveScatter, linkCandidate + offset::Link_TargetId, linkIds.data(), sizeof(linkIds), &linkIdsBytes);
+                    prepOk = prepOk && p1 && p2;
+                    anyQueued = anyQueued || p1 || p2;
+                }
+                if (parentHeroCandidate) {
+                    const bool p3 = mem.AddScatterReadRequest(waveScatter, parentHeroCandidate + 0x10, &heroType, sizeof(heroType), &heroTypeBytes);
+                    const bool p4 = mem.AddScatterReadRequest(waveScatter, parentHeroCandidate + 0xD0, &parentHeroId, sizeof(parentHeroId), &heroIdBytes);
+                    prepOk = prepOk && p3 && p4;
+                    anyQueued = anyQueued || p3 || p4;
+                }
+                if (!prepOk || (anyQueued && !runWave(true))) {
+                    if (!prepOk) runWave(false);
+                    if (currentMapPositiveOnly) trace(8);
+                    return result;
+                }
+                if (linkCandidate) {
+                    if (linkTypeBytes == sizeof(linkType) && linkType == activeOffsets.typeLink) {
+                        link = linkCandidate;
+                        linkIdRead = (linkIdsBytes == sizeof(linkIds));
+                        if (!linkIdRead)
+                            transportOrDecryptFailure = true;
+                    } else {
+                        linkIds = {};
+                        transportOrDecryptFailure = true;
+                        Diagnostics::RecordDecryptFailure();
+                    }
+                }
+                if (parentHeroCandidate) {
+                    if (heroTypeBytes == sizeof(heroType) && heroType == activeOffsets.typeHeroId) {
+                        parentHeroBase = parentHeroCandidate;
+                        parentHeroIdRead = (heroIdBytes == sizeof(parentHeroId));
+                        if (!parentHeroIdRead)
+                            transportOrDecryptFailure = true;
+                        else if (!GameData::IsKnownHeroId(parentHeroId))
+                            parentHeroCleanNonHero = true;
+                    } else {
+                        parentHeroId = 0;
+                        transportOrDecryptFailure = true;
+                        Diagnostics::RecordDecryptFailure();
+                    }
+                }
+            }
+            parentHeroChecked = true;
+        } else {
+            link = DecryptComponent(parent, activeOffsets.typeLink, &header, true);
+            if (activeOffsets.capacityBoundRegistry) {
+                result = ProbeRegionalActor(parent, topology, header, match, link, discoveryTick, discoveries);
+                if (bindingMembers) *bindingMembers = result;
+                // Native map evidence admits the current body, not complete roster
+                // enumeration or deletion authority over other bodies.
+                if (bindingComplete) *bindingComplete =
+                    activeOffsets.contextMap == offset::ContextMapMode::Plain && result.size() == 1;
+                return result;
+            }
+            if (!link && headerHasLink) {
+                bool cleanNullLink = false;
+                if (isCnLayout) {
+                    const auto linkPlan = PlanCnComponentSlot(parent, activeOffsets.typeLink, header);
+                    uint64_t rawLink = 0;
+                    if (linkPlan.present && SDK->read_range(linkPlan.entryAddress, &rawLink, sizeof(rawLink)) && rawLink == 0)
+                        cleanNullLink = true;
+                }
+                if (!cleanNullLink)
+                    transportOrDecryptFailure = true;
+            }
+            linkIdRead = link && SDK->read_range(link + offset::Link_TargetId, linkIds.data(), sizeof(linkIds));
+            if (link && !linkIdRead)
+                transportOrDecryptFailure = true;
+            if (unresolvedKind && !headerHasType(header, activeOffsets.typeHeroId))
+                parentHeroCleanNonHero = true;
         }
+
         std::vector<uint64_t> components;
-        std::array<uint32_t,2> linkIds{};
-        const bool linkIdRead=link && SDK->read_range(link+offset::Link_TargetId,linkIds.data(),sizeof(linkIds));
-        const bool targetIdRead=linkIdRead;
-        const uint32_t targetId=linkIds[0],linkId=linkIds[1];
+        const bool targetIdRead = linkIdRead;
+        const uint32_t targetId = linkIds[0], linkId = linkIds[1];
         if(currentMapPositiveOnly && (!linkIdRead || (!targetId && !linkId))){trace(8);return result;}
-        bool allBindingsResolved=(currentController || topology.member_ids_complete) && linkIdRead && targetIdRead;
+        // Explicit LinkedActor vs NoLinkActor separation: a self-contained NoLinkActor
+        // (link == 0) has no link component to read, so linkIdRead == false must not
+        // poison bindingsComplete and block roster_complete = 1 when topology is complete.
+        // However, if the entity header HAS typeLink and reading/decrypting Link failed,
+        // NEVER classify link == 0 as NoLinkActor with bindingComplete = true.
+        const bool linkReadOrDecryptFailed = headerHasLink && link == 0 && transportOrDecryptFailure;
+        const bool noLinkSelfActor = (link == 0) && !currentMapPositiveOnly && !linkReadOrDecryptFailed;
+        bool allBindingsResolved = noLinkSelfActor
+            ? topology.member_ids_complete
+            : ((currentController || topology.member_ids_complete) && linkIdRead && targetIdRead);
         std::vector<std::pair<uint64_t,uint64_t>> contextBindings;
         std::vector<std::pair<uint64_t,CnLinkTargetMapIdentity>> positiveMapGuards;
-        if(linkIdRead && targetIdRead)for(auto idOffset:{offset::Link_TargetId,offset::Link_UniqueId}) {
-            const auto id=idOffset==offset::Link_TargetId?targetId:linkId;
-            if(!id || (idOffset==offset::Link_UniqueId && id==targetId))continue;
-            if(currentController || currentMapPositiveOnly) {
-                uint32_t resolvedId=0;
-                CnLinkTargetMapIdentity currentMap;
-                const auto target=ResolveCnLinkTargetMapBase(link,idOffset,&resolvedId,
-                    currentMapPositiveOnly?&currentMap:nullptr);
-                if(resolvedId==id && IsPlausibleUserPointer(target)) {
-                    if(std::find(components.begin(),components.end(),target)==components.end())components.push_back(target);
-                    contextBindings.emplace_back(idOffset,target);
-                    if(currentMapPositiveOnly)positiveMapGuards.emplace_back(idOffset,currentMap);
+
+        if (linkIdRead && targetIdRead) {
+            struct LinkOffsetEntry {
+                uint64_t idOffset = 0;
+                uint32_t id = 0;
+                bool resolvedByMap = false;
+                std::vector<uint64_t> matches;
+            };
+            std::vector<LinkOffsetEntry> activeOffsetsToResolve;
+            for (uint64_t idOffset : { static_cast<uint64_t>(offset::Link_TargetId), static_cast<uint64_t>(offset::Link_UniqueId) }) {
+                const auto id = idOffset == static_cast<uint64_t>(offset::Link_TargetId) ? targetId : linkId;
+                if (!id || (idOffset == static_cast<uint64_t>(offset::Link_UniqueId) && id == targetId))
                     continue;
-                }
-                // A failed map lookup alone does not establish an absent context.
-                // A complete fresh header sweep may prove a unique UID binding;
-                // partial/stale indexes never gain this fallback.
-                if(currentMapPositiveOnly && !topology.member_ids_complete){trace(8);return {};}
+                activeOffsetsToResolve.push_back({ idOffset, id, false, {} });
             }
-            std::vector<uint64_t> matches;
-            for(const auto& [component,memberId]:topology.member_ids)
-                if(memberId==id && component!=parent)matches.push_back(component);
-            // A UID can exist in more than one world/context. Only this controller's
-            // map identifies which address it owns; equal UIDs are not a replacement proof.
-            if(matches.size()>1) {
-                uint32_t resolvedId=0;
-                const auto target=ResolveCnLinkTargetMapBase(link,idOffset,&resolvedId);
-                if(resolvedId==id && std::find(matches.begin(),matches.end(),target)!=matches.end()) {
-                    components.push_back(target);contextBindings.emplace_back(idOffset,target);
-                } else {
-                    allBindingsResolved=false;
-                    if(currentMapPositiveOnly){trace(8);return {};}
+
+            // Initial context-map batch (handles 1 or 2 bindings in 5 waves instead of 6*N serial RTs).
+            if ((currentController || currentMapPositiveOnly) && !activeOffsetsToResolve.empty()) {
+                std::vector<CnLinkTargetMapBatchRequest> initReqs;
+                initReqs.reserve(activeOffsetsToResolve.size());
+                for (const auto& entry : activeOffsetsToResolve)
+                    initReqs.push_back({ link, entry.idOffset, currentMapPositiveOnly });
+                const auto initResults = resolveMapBatch(initReqs);
+                for (size_t i = 0; i < activeOffsetsToResolve.size(); ++i) {
+                    auto& entry = activeOffsetsToResolve[i];
+                    const auto& res = initResults[i];
+                    if (res.resolvedId == entry.id && IsPlausibleUserPointer(res.target)) {
+                        if (std::find(components.begin(), components.end(), res.target) == components.end())
+                            components.push_back(res.target);
+                        contextBindings.emplace_back(entry.idOffset, res.target);
+                        if (currentMapPositiveOnly)
+                            positiveMapGuards.emplace_back(entry.idOffset, res.verifiedMap);
+                        entry.resolvedByMap = true;
+                        continue;
+                    }
+                    // A failed map lookup alone does not establish an absent context.
+                    // A complete fresh header sweep may prove a unique UID binding;
+                    // partial/stale indexes never gain this fallback.
+                    if (currentMapPositiveOnly && !topology.member_ids_complete) {
+                        trace(8);
+                        return {};
+                    }
                 }
-            } else if(!matches.empty())components.push_back(matches.front());
+            }
+
+            // UID-index lookup & batched disambiguation for any ambiguous UIDs.
+            std::vector<size_t> ambiguousIndices;
+            std::vector<CnLinkTargetMapBatchRequest> ambiguousReqs;
+            for (size_t i = 0; i < activeOffsetsToResolve.size(); ++i) {
+                auto& entry = activeOffsetsToResolve[i];
+                if (entry.resolvedByMap)
+                    continue;
+                for (const auto& [component, memberId] : topology.member_ids) {
+                    if (memberId == entry.id && component != parent)
+                        entry.matches.push_back(component);
+                }
+                // A UID can exist in more than one world/context. Only this controller's
+                // map identifies which address it owns; equal UIDs are not a replacement proof.
+                if (entry.matches.size() > 1) {
+                    ambiguousIndices.push_back(i);
+                    ambiguousReqs.push_back({ link, entry.idOffset, false });
+                } else if (!entry.matches.empty()) {
+                    components.push_back(entry.matches.front());
+                }
+            }
+            if (!ambiguousReqs.empty()) {
+                const auto ambiguousResults = resolveMapBatch(ambiguousReqs);
+                for (size_t k = 0; k < ambiguousIndices.size(); ++k) {
+                    const auto& entry = activeOffsetsToResolve[ambiguousIndices[k]];
+                    const auto& res = ambiguousResults[k];
+                    if (res.resolvedId == entry.id &&
+                        std::find(entry.matches.begin(), entry.matches.end(), res.target) != entry.matches.end()) {
+                        components.push_back(res.target);
+                        contextBindings.emplace_back(entry.idOffset, res.target);
+                    } else {
+                        allBindingsResolved = false;
+                        ambiguousMapFailed = true;
+                        if (currentMapPositiveOnly) {
+                            trace(8);
+                            return {};
+                        }
+                    }
+                }
+            }
         }
-        if(link && !currentMapPositiveOnly)for(auto idOffset:{offset::Link_TargetId,offset::Link_UniqueId}) {
-            const auto id=idOffset==offset::Link_TargetId?targetId:linkId;
-            if(std::any_of(contextBindings.begin(),contextBindings.end(),[&](const auto& pair){return pair.first==idOffset;}))continue;
-            if(id && std::any_of(topology.member_ids.begin(),topology.member_ids.end(),[&](const auto& pair){return pair.second==id;}))continue;
-            const auto target=ResolveCnLinkTargetMapBase(link,idOffset);
-            if(id && !IsPlausibleUserPointer(target) &&
-                std::none_of(topology.member_ids.begin(),topology.member_ids.end(),[&](const auto& pair){return pair.second==id;}))
-                allBindingsResolved=false;
-            if(IsPlausibleUserPointer(target) &&
-                std::find(components.begin(),components.end(),target)==components.end())components.push_back(target);
+
+        if (link && !currentMapPositiveOnly) {
+            std::vector<std::pair<uint64_t, uint32_t>> fallbackOffsets;
+            std::vector<CnLinkTargetMapBatchRequest> fallbackReqs;
+            for (uint64_t idOffset : { static_cast<uint64_t>(offset::Link_TargetId), static_cast<uint64_t>(offset::Link_UniqueId) }) {
+                const auto id = idOffset == static_cast<uint64_t>(offset::Link_TargetId) ? targetId : linkId;
+                if (linkIdRead && !id)
+                    continue;
+                if (linkIdRead && idOffset == static_cast<uint64_t>(offset::Link_UniqueId) && id == targetId &&
+                    std::any_of(contextBindings.begin(), contextBindings.end(), [&](const auto& pair) {
+                        return pair.first == static_cast<uint64_t>(offset::Link_TargetId);
+                    }))
+                    continue;
+                if (std::any_of(contextBindings.begin(), contextBindings.end(), [&](const auto& pair) { return pair.first == idOffset; }))
+                    continue;
+                if (id && std::any_of(topology.member_ids.begin(), topology.member_ids.end(), [&](const auto& pair) { return pair.second == id; }))
+                    continue;
+                fallbackOffsets.emplace_back(idOffset, id);
+                fallbackReqs.push_back({ link, idOffset, false });
+            }
+            if (!fallbackReqs.empty()) {
+                const auto fallbackResults = resolveMapBatch(fallbackReqs);
+                for (size_t i = 0; i < fallbackOffsets.size(); ++i) {
+                    const uint32_t id = fallbackOffsets[i].second;
+                    const uint64_t target = fallbackResults[i].target;
+                    if (id && !IsPlausibleUserPointer(target) &&
+                        std::none_of(topology.member_ids.begin(), topology.member_ids.end(), [&](const auto& pair) { return pair.second == id; }))
+                        allBindingsResolved = false;
+                    if (IsPlausibleUserPointer(target) &&
+                        std::find(components.begin(), components.end(), target) == components.end())
+                        components.push_back(target);
+                }
+            }
         }
+
         auto resolvedComponents=components;
         if(currentMapPositiveOnly && components.empty()){trace(8);return result;}
         struct RecoveredBinding {
@@ -1995,121 +2781,830 @@ namespace OW {
         };
         std::vector<RecoveredBinding> recoveredBindings;
         if(components.empty())components.push_back(parent);
-        for(auto component:components) {
-            if(!RuntimeWorkersRunning() || !ProcessConnection::IsConnected())break;
-            EntityHeaderSnapshot componentHeader{};
-            if(component==parent)componentHeader=header;
-            else if(headers && headers->contains(component))componentHeader=headers->at(component);
-            else componentHeader.Read(component);
-            const auto matchedId=std::find_if(topology.member_ids.begin(),topology.member_ids.end(),[&](const auto& pair) {
-                return pair.first==component && pair.second && (pair.second==linkId || pair.second==targetId);
+
+        struct CandidateState {
+            uint64_t component = 0;
+            EntityHeaderSnapshot header{};
+            bool needsHeaderRead = false;
+            bool matchedById = false;
+            uint32_t expectedId = 0;
+            bool recoveredRemote = false;
+            bool alive = true;
+            bool cleanNonActor = false;
+            uintptr_t heroBase = 0;
+            hero_compo_t hero{};
+            uint32_t actorMatch = 0;
+            bool hotBody = false;
+            bool needsCompHero = false;
+            bool needsLifeCheck = false;
+            CnComponentSlotPlan heroPlan{};
+            CnComponentSlotPlan hpPlan{};
+            CnComponentSlotPlan velPlan{};
+            uint64_t heroRaw = 0, hpRaw = 0, velRaw = 0;
+            DWORD heroRawBytes = 0, hpRawBytes = 0, velRawBytes = 0;
+            uintptr_t heroCand = 0, hpCand = 0, velCand = 0;
+            uint8_t heroType = 0, hpType = 0, velType = 0;
+            DWORD heroTypeBytes = 0, hpTypeBytes = 0, velTypeBytes = 0;
+            DWORD heroIdBytes = 0, hpBytes = 0, locBytes = 0;
+            health_compo_t hp{};
+            XMFLOAT3 location{};
+            uint32_t currentId = 0, currentComponentId = 0;
+            DWORD idBytes = 0, compIdBytes = 0;
+        };
+
+        std::vector<CandidateState> candidates;
+        candidates.reserve(components.size());
+        bool anyHeaderNeeded = false;
+        for (auto component : components) {
+            CandidateState c{};
+            c.component = component;
+            if (component == parent) {
+                c.header = header;
+            } else if (headers && headers->contains(component)) {
+                c.header = headers->at(component);
+            } else {
+                c.needsHeaderRead = true;
+                anyHeaderNeeded = true;
+            }
+            candidates.push_back(std::move(c));
+        }
+
+        // Candidate Header Wave: fetch all uncached candidate headers in 1 scatter wave.
+        if (anyHeaderNeeded && RuntimeWorkersRunning() && ProcessConnection::IsConnected()) {
+            if (useWave && !scatterPoisoned) {
+                std::vector<std::array<uint8_t, kEntityHeaderSnapshotSize>> hdrBufs(candidates.size());
+                std::vector<DWORD> hdrBytes(candidates.size(), 0);
+                bool prepOk = true;
+                bool anyQueued = false;
+                for (size_t i = 0; i < candidates.size(); ++i) {
+                    if (!candidates[i].needsHeaderRead)
+                        continue;
+                    const bool p = mem.AddScatterReadRequest(
+                        waveScatter,
+                        candidates[i].component + kEntityHeaderSnapshotOffset,
+                        hdrBufs[i].data(),
+                        hdrBufs[i].size(),
+                        &hdrBytes[i]);
+                    prepOk = prepOk && p;
+                    anyQueued = anyQueued || p;
+                }
+                if (prepOk && anyQueued && runWave(true)) {
+                    for (size_t i = 0; i < candidates.size(); ++i) {
+                        if (!candidates[i].needsHeaderRead)
+                            continue;
+                        if (hdrBytes[i] == kEntityHeaderSnapshotSize) {
+                            candidates[i].header.parent = candidates[i].component;
+                            candidates[i].header.valid = true;
+                            candidates[i].header.range.Assign(
+                                candidates[i].component + kEntityHeaderSnapshotOffset,
+                                hdrBufs[i].data(),
+                                hdrBufs[i].size());
+                        }
+                    }
+                } else if (!prepOk) {
+                    runWave(false);
+                }
+            } else {
+                for (auto& c : candidates) {
+                    if (!RuntimeWorkersRunning() || !ProcessConnection::IsConnected())
+                        break;
+                    if (c.needsHeaderRead)
+                        c.header.Read(c.component);
+                }
+            }
+        }
+
+        // Identity validation & optional stale-unique-index remote recovery.
+        for (auto& c : candidates) {
+            if (!RuntimeWorkersRunning() || !ProcessConnection::IsConnected()) {
+                c.alive = false;
+                continue;
+            }
+            const auto matchedId = std::find_if(topology.member_ids.begin(), topology.member_ids.end(), [&](const auto& pair) {
+                return pair.first == c.component && pair.second && (pair.second == linkId || pair.second == targetId);
             });
-            const auto context=std::find_if(contextBindings.begin(),contextBindings.end(),[&](const auto& pair){return pair.second==component;});
-            const bool matchedById=context!=contextBindings.end() || matchedId!=topology.member_ids.end();
-            const uint32_t expectedId=context!=contextBindings.end()
-                ? (context->first==offset::Link_TargetId?targetId:linkId) : (matchedById?matchedId->second:0);
-            uint32_t componentMatch=0;
-            bool recoveredRemote=false;
-            if(!componentHeader.valid || (matchedById &&
-                (!componentHeader.ReadParentOffset(offset::Entity_MatchId,componentMatch) || componentMatch!=expectedId))) {
+            const auto context = std::find_if(contextBindings.begin(), contextBindings.end(), [&](const auto& pair) {
+                return pair.second == c.component;
+            });
+            c.matchedById = context != contextBindings.end() || matchedId != topology.member_ids.end();
+            c.expectedId = context != contextBindings.end()
+                ? (context->first == offset::Link_TargetId ? targetId : linkId)
+                : (c.matchedById ? matchedId->second : 0);
+            uint32_t componentMatch = 0;
+            if (!c.header.valid || (c.matchedById &&
+                (!c.header.ReadParentOffset(offset::Entity_MatchId, componentMatch) || componentMatch != c.expectedId))) {
                 // Only repair a failed unique index entry. Stable and ambiguous remote
                 // bindings retain their existing path; this is not local-controller admission.
-                const bool uniqueStaleIndex=!currentController && component!=parent &&
-                    context==contextBindings.end() && matchedId!=topology.member_ids.end() &&
-                    std::count_if(topology.member_ids.begin(),topology.member_ids.end(),
-                        [&](const auto& pair){return pair.second==expectedId && pair.first!=parent;})==1;
-                if(uniqueStaleIndex) {
-                    const uint64_t idOffset=expectedId==targetId?offset::Link_TargetId:offset::Link_UniqueId;
-                    uint32_t resolvedId=0,replacementMatch=0;
-                    CnLinkTargetMapIdentity currentMap;
-                    const auto replacement=ResolveCnLinkTargetMapBase(link,idOffset,&resolvedId,&currentMap);
+                const bool uniqueStaleIndex = !currentController && c.component != parent &&
+                    context == contextBindings.end() && matchedId != topology.member_ids.end() &&
+                    std::count_if(topology.member_ids.begin(), topology.member_ids.end(),
+                        [&](const auto& pair) { return pair.second == c.expectedId && pair.first != parent; }) == 1;
+                if (uniqueStaleIndex) {
+                    const uint64_t idOffset = c.expectedId == targetId ? offset::Link_TargetId : offset::Link_UniqueId;
+                    const auto recResults = resolveMapBatch({ { link, idOffset, true } });
+                    const uint64_t replacement = recResults[0].target;
+                    const uint32_t resolvedId = recResults[0].resolvedId;
+                    const CnLinkTargetMapIdentity currentMap = recResults[0].verifiedMap;
+                    uint32_t replacementMatch = 0;
                     EntityHeaderSnapshot replacementHeader{};
-                    if(resolvedId==expectedId && IsPlausibleUserPointer(replacement) &&
-                        replacement!=component && replacement!=parent && replacementHeader.Read(replacement) &&
-                        replacementHeader.ReadParentOffset(offset::Entity_MatchId,replacementMatch) && replacementMatch==expectedId) {
-                        for(auto& resolved:resolvedComponents)if(resolved==component)resolved=replacement;
-                        component=replacement;componentHeader=std::move(replacementHeader);
-                        contextBindings.emplace_back(idOffset,replacement);
-                        recoveredBindings.push_back({idOffset,replacement,currentMap});
-                        recoveredRemote=true;
+                    if (resolvedId == c.expectedId && IsPlausibleUserPointer(replacement) &&
+                        replacement != c.component && replacement != parent && replacementHeader.Read(replacement) &&
+                        replacementHeader.ReadParentOffset(offset::Entity_MatchId, replacementMatch) && replacementMatch == c.expectedId) {
+                        for (auto& resolved : resolvedComponents)
+                            if (resolved == c.component) resolved = replacement;
+                        c.component = replacement;
+                        c.header = std::move(replacementHeader);
+                        contextBindings.emplace_back(idOffset, replacement);
+                        recoveredBindings.push_back({ idOffset, replacement, currentMap });
+                        c.recoveredRemote = true;
                     }
                 }
-                if(!recoveredRemote){trace(componentHeader.valid?8:3,component);continue;}
-            }
-            auto heroBase=DecryptComponent(parent,offset::Active().typeHeroId,&header,true);
-            if(!heroBase)heroBase=DecryptComponent(component,offset::Active().typeHeroId,&componentHeader,true);
-            hero_compo_t hero{};
-            if(!heroBase || !SDK->read_range(heroBase+0xD0,&hero.heroid,sizeof(hero.heroid)) ||
-                !GameData::IsKnownHeroId(hero.heroid)){trace(6,component);continue;}
-            uint32_t actorMatch=0;
-            if(!componentHeader.ReadParentOffset(offset::Entity_MatchId,actorMatch)){trace(2,component);continue;}
-            const bool hotBody=!recoveredRemote && !currentMapPositiveOnly && hotActors && std::any_of(hotActors->begin(),hotActors->end(),[&](const auto& actor) {
-                return actor.address==component && actor.link==parent && actor.match==actorMatch && actor.hero==hero.heroid;
-            });
-            if(!hotBody) {
-                const auto hpBase=DecryptComponent(component,offset::Active().typeHealth,&componentHeader,true);
-                const auto velocityBase=DecryptComponent(component,TYPE_VELOCITY,&componentHeader,true);
-                if(!hpBase || !velocityBase){trace(4,component);continue;}
-                health_compo_t hp{};XMFLOAT3 location{};
-                if(!SDK->read_range(hpBase,&hp,sizeof(hp)) || !SDK->read_range(velocityBase+0x200,&location,sizeof(location))) {
-                    trace(5,component);continue;
-                }
-                HealthPayloadSummary health{};
-                if(!TryParseHealthPayload(hp,health) || ((!discoveries || recoveredRemote || currentMapPositiveOnly) && (health.total<=0 || health.isDead))){trace(6,component);continue;}
-                if(!std::isfinite(location.x)||!std::isfinite(location.y)||!std::isfinite(location.z)||
-                    std::fabs(location.x)>100000 || std::fabs(location.y)>100000 || std::fabs(location.z)>100000){trace(7,component);continue;}
-            }
-            uint32_t currentMatch=0;
-            if(!SDK->read_range(parent+offset::Entity_MatchId,&currentMatch,sizeof(currentMatch)) || currentMatch!=match){trace(8,component);continue;}
-            if(matchedById) {
-                uint32_t currentId=0,currentComponentId=0;
-                if(!SDK->read_range(link+offset::Link_UniqueId,&currentId,sizeof(currentId)) || currentId!=linkId ||
-                    !SDK->read_range(component+offset::Entity_MatchId,&currentComponentId,sizeof(currentComponentId)) || currentComponentId!=expectedId) {
-                    trace(8,component);continue;
+                if (!c.recoveredRemote) {
+                    transportOrDecryptFailure = true;
+                    trace(c.header.valid ? 8 : 3, c.component);
+                    c.alive = false;
+                    continue;
                 }
             }
-            result.emplace_back(component,parent);
-            if (discoveries) {
-                uint32_t actorMatch = 0;
-                if (!componentHeader.ReadParentOffset(offset::Entity_MatchId, actorMatch)) {
-                    result.pop_back(); continue;
-                }
-                if(component!=parent && actorMatch!=linkId && actorMatch!=targetId) {
-                    result.pop_back(); continue;
-                }
-                discoveries->push_back({component, parent, hero.heroid, actorMatch, discoveryTick, currentMapPositiveOnly});
-            }
-            trace(0,component);
         }
+
+        // Hero + Health + Velocity verification waves.
+        if (useCnWave && !scatterPoisoned) {
+            bool anyWave4A = false;
+            for (auto& c : candidates) {
+                if (!c.alive)
+                    continue;
+                if (!RuntimeWorkersRunning() || !ProcessConnection::IsConnected()) {
+                    c.alive = false;
+                    continue;
+                }
+                if (parentHeroChecked && parentHeroBase != 0) {
+                    c.heroBase = parentHeroBase;
+                    if (!parentHeroIdRead || !GameData::IsKnownHeroId(parentHeroId)) {
+                        if (!parentHeroIdRead)
+                            transportOrDecryptFailure = true;
+                        else
+                            c.cleanNonActor = true;
+                        trace(6, c.component);
+                        c.alive = false;
+                        continue;
+                    }
+                    c.hero.heroid = parentHeroId;
+                    if (!c.header.ReadParentOffset(offset::Entity_MatchId, c.actorMatch)) {
+                        transportOrDecryptFailure = true;
+                        trace(2, c.component);
+                        c.alive = false;
+                        continue;
+                    }
+                    c.hotBody = !c.recoveredRemote && !currentMapPositiveOnly && hotActors &&
+                        std::any_of(hotActors->begin(), hotActors->end(), [&](const auto& actor) {
+                            return actor.address == c.component && actor.link == parent &&
+                                actor.match == c.actorMatch && actor.hero == c.hero.heroid;
+                        });
+                    if (!c.hotBody) {
+                        c.needsLifeCheck = true;
+                        c.hpPlan = PlanCnComponentSlot(c.component, activeOffsets.typeHealth, c.header);
+                        c.velPlan = PlanCnComponentSlot(c.component, TYPE_VELOCITY, c.header);
+                        if (!c.hpPlan.present || !c.velPlan.present) {
+                            c.cleanNonActor = true;
+                            trace(4, c.component);
+                            c.alive = false;
+                            continue;
+                        }
+                        anyWave4A = true;
+                    }
+                } else {
+                    c.needsCompHero = true;
+                    c.heroPlan = PlanCnComponentSlot(c.component, activeOffsets.typeHeroId, c.header);
+                    if (!c.heroPlan.present) {
+                        c.cleanNonActor = true;
+                        trace(6, c.component);
+                        c.alive = false;
+                        continue;
+                    }
+                    anyWave4A = true;
+                    uint32_t preMatch = 0;
+                    const bool hasPreMatch = c.header.ReadParentOffset(offset::Entity_MatchId, preMatch);
+                    const bool mightBeHot = hasPreMatch && !c.recoveredRemote && !currentMapPositiveOnly && hotActors &&
+                        std::any_of(hotActors->begin(), hotActors->end(), [&](const auto& actor) {
+                            return actor.address == c.component && actor.link == parent && actor.match == preMatch;
+                        });
+                    if (!mightBeHot) {
+                        c.needsLifeCheck = true;
+                        c.hpPlan = PlanCnComponentSlot(c.component, activeOffsets.typeHealth, c.header);
+                        c.velPlan = PlanCnComponentSlot(c.component, TYPE_VELOCITY, c.header);
+                    }
+                }
+            }
+
+            if (anyWave4A) {
+                uint8_t keyA = 0, keyB = 0;
+                uint64_t keyNow = 0, keyEpoch = 0;
+                bool hasKeys = HasFreshCn155284ComponentKeys(keyA, keyB, keyNow, keyEpoch);
+                DWORD keyABytes = 0, keyBBytes = 0;
+                bool prepOk = true;
+                bool anyQueued = false;
+                if (!hasKeys) {
+                    const bool pA = mem.AddScatterReadRequest(waveScatter, SDK->dwGameBase + activeOffsets.componentKeyByteRva, &keyA, sizeof(keyA), &keyABytes);
+                    const bool pB = mem.AddScatterReadRequest(waveScatter, SDK->dwGameBase + activeOffsets.componentKeySecondByteRva, &keyB, sizeof(keyB), &keyBBytes);
+                    prepOk = prepOk && pA && pB;
+                    anyQueued = anyQueued || pA || pB;
+                }
+                for (auto& c : candidates) {
+                    if (!c.alive) continue;
+                    if (c.needsCompHero && c.heroPlan.present) {
+                        const bool p = mem.AddScatterReadRequest(waveScatter, c.heroPlan.entryAddress, &c.heroRaw, sizeof(c.heroRaw), &c.heroRawBytes);
+                        prepOk = prepOk && p;
+                        anyQueued = anyQueued || p;
+                    }
+                    if (c.needsLifeCheck && c.hpPlan.present && c.velPlan.present) {
+                        const bool pHp = mem.AddScatterReadRequest(waveScatter, c.hpPlan.entryAddress, &c.hpRaw, sizeof(c.hpRaw), &c.hpRawBytes);
+                        const bool pVel = mem.AddScatterReadRequest(waveScatter, c.velPlan.entryAddress, &c.velRaw, sizeof(c.velRaw), &c.velRawBytes);
+                        prepOk = prepOk && pHp && pVel;
+                        anyQueued = anyQueued || pHp || pVel;
+                    }
+                }
+                if (!prepOk || (anyQueued && !runWave(true))) {
+                    if (!prepOk) runWave(false);
+                    transportOrDecryptFailure = true;
+                    if (!hasKeys) {
+                        InvalidateCn155284ComponentKeys();
+                        Diagnostics::RecordDecryptFailure();
+                    }
+                    for (auto& c : candidates) {
+                        if (!c.alive || (!c.needsCompHero && !c.needsLifeCheck)) continue;
+                        trace(c.needsCompHero ? 6 : 4, c.component);
+                        c.alive = false;
+                    }
+                } else {
+                    if (!hasKeys) {
+                        if (keyABytes == sizeof(keyA) && keyBBytes == sizeof(keyB)) {
+                            StoreCn155284ComponentKeys(keyNow, keyEpoch, keyA, keyB);
+                            hasKeys = true;
+                        } else {
+                            transportOrDecryptFailure = true;
+                            InvalidateCn155284ComponentKeys();
+                            Diagnostics::RecordDecryptFailure();
+                        }
+                    }
+
+                    // Decode pointers and build Wave 4B (type bytes + heroId + hp + location in 1 wave).
+                    bool prepB = true;
+                    bool anyQueuedB = false;
+                    if (hasKeys) {
+                        for (auto& c : candidates) {
+                            if (!c.alive) continue;
+                            if (c.needsCompHero) {
+                                if (c.heroRawBytes == sizeof(c.heroRaw) && c.heroRaw) {
+                                    const uintptr_t dec = static_cast<uintptr_t>(c.heroPlan.presentMask & Cn155284::Component(c.heroRaw, keyA, keyB));
+                                    if (dec >= 0x10000 && dec < 0x0000800000000000ULL) {
+                                        c.heroCand = dec;
+                                        const bool p1 = mem.AddScatterReadRequest(waveScatter, dec + 0x10, &c.heroType, sizeof(c.heroType), &c.heroTypeBytes);
+                                        const bool p2 = mem.AddScatterReadRequest(waveScatter, dec + 0xD0, &c.hero.heroid, sizeof(c.hero.heroid), &c.heroIdBytes);
+                                        prepB = prepB && p1 && p2;
+                                        anyQueuedB = anyQueuedB || p1 || p2;
+                                    } else {
+                                        Diagnostics::RecordDecryptFailure();
+                                    }
+                                } else if (c.heroRawBytes == sizeof(c.heroRaw) && !c.heroRaw) {
+                                    Diagnostics::RecordDecryptFailure();
+                                }
+                            }
+                            if (c.needsLifeCheck && c.hpPlan.present && c.velPlan.present) {
+                                if (c.hpRawBytes == sizeof(c.hpRaw) && c.hpRaw) {
+                                    const uintptr_t decHp = static_cast<uintptr_t>(c.hpPlan.presentMask & Cn155284::Component(c.hpRaw, keyA, keyB));
+                                    if (decHp >= 0x10000 && decHp < 0x0000800000000000ULL)
+                                        c.hpCand = decHp;
+                                    else
+                                        Diagnostics::RecordDecryptFailure();
+                                } else if (c.hpRawBytes == sizeof(c.hpRaw) && !c.hpRaw) {
+                                    Diagnostics::RecordDecryptFailure();
+                                }
+                                if (c.velRawBytes == sizeof(c.velRaw) && c.velRaw) {
+                                    const uintptr_t decVel = static_cast<uintptr_t>(c.velPlan.presentMask & Cn155284::Component(c.velRaw, keyA, keyB));
+                                    if (decVel >= 0x10000 && decVel < 0x0000800000000000ULL)
+                                        c.velCand = decVel;
+                                    else
+                                        Diagnostics::RecordDecryptFailure();
+                                } else if (c.velRawBytes == sizeof(c.velRaw) && !c.velRaw) {
+                                    Diagnostics::RecordDecryptFailure();
+                                }
+                                if (c.hpCand && c.velCand) {
+                                    const bool p1 = mem.AddScatterReadRequest(waveScatter, c.hpCand + 0x10, &c.hpType, sizeof(c.hpType), &c.hpTypeBytes);
+                                    const bool p2 = mem.AddScatterReadRequest(waveScatter, c.hpCand, &c.hp, sizeof(c.hp), &c.hpBytes);
+                                    const bool p3 = mem.AddScatterReadRequest(waveScatter, c.velCand + 0x10, &c.velType, sizeof(c.velType), &c.velTypeBytes);
+                                    const bool p4 = mem.AddScatterReadRequest(waveScatter, c.velCand + 0x200, &c.location, sizeof(c.location), &c.locBytes);
+                                    prepB = prepB && p1 && p2 && p3 && p4;
+                                    anyQueuedB = anyQueuedB || p1 || p2 || p3 || p4;
+                                }
+                            }
+                        }
+                    }
+
+                    bool waveBOk = false;
+                    if (!prepB) {
+                        runWave(false);
+                    } else if (anyQueuedB) {
+                        waveBOk = runWave(true);
+                    } else {
+                        waveBOk = hasKeys;
+                    }
+
+                    const auto validateLifePayload = [&](CandidateState& c) {
+                        if (!c.hpPlan.present || !c.velPlan.present) {
+                            c.cleanNonActor = true;
+                            trace(4, c.component);
+                            c.alive = false;
+                            return;
+                        }
+                        const bool hpValid = c.hpCand != 0 && c.hpTypeBytes == sizeof(c.hpType) && c.hpType == activeOffsets.typeHealth;
+                        const bool velValid = c.velCand != 0 && c.velTypeBytes == sizeof(c.velType) && c.velType == TYPE_VELOCITY;
+                        if (!hpValid && c.hpCand) Diagnostics::RecordDecryptFailure();
+                        if (!velValid && c.velCand) Diagnostics::RecordDecryptFailure();
+                        if (!hpValid || !velValid) {
+                            transportOrDecryptFailure = true;
+                            trace(4, c.component);
+                            c.alive = false;
+                            return;
+                        }
+                        if (c.hpBytes != sizeof(c.hp) || c.locBytes != sizeof(c.location)) {
+                            transportOrDecryptFailure = true;
+                            trace(5, c.component);
+                            c.alive = false;
+                            return;
+                        }
+                        HealthPayloadSummary health{};
+                        if (!TryParseHealthPayload(c.hp, health) ||
+                            ((!discoveries || c.recoveredRemote || currentMapPositiveOnly) && (health.total <= 0 || health.isDead))) {
+                            transportOrDecryptFailure = true;
+                            trace(6, c.component);
+                            c.alive = false;
+                            return;
+                        }
+                        if (!std::isfinite(c.location.x) || !std::isfinite(c.location.y) || !std::isfinite(c.location.z) ||
+                            std::fabs(c.location.x) > 100000 || std::fabs(c.location.y) > 100000 || std::fabs(c.location.z) > 100000) {
+                            transportOrDecryptFailure = true;
+                            trace(7, c.component);
+                            c.alive = false;
+                            return;
+                        }
+                    };
+
+                    std::vector<size_t> lateLifeIndices;
+                    for (size_t ci = 0; ci < candidates.size(); ++ci) {
+                        auto& c = candidates[ci];
+                        if (!c.alive || (!c.needsCompHero && !c.needsLifeCheck)) continue;
+                        if (!waveBOk) {
+                            transportOrDecryptFailure = true;
+                            trace(c.needsCompHero ? 6 : 5, c.component);
+                            c.alive = false;
+                            continue;
+                        }
+                        if (c.needsCompHero) {
+                            if (c.heroRawBytes == sizeof(c.heroRaw) && c.heroRaw == 0) {
+                                c.cleanNonActor = true;
+                                trace(6, c.component);
+                                c.alive = false;
+                                continue;
+                            }
+                            if (!c.heroCand || c.heroTypeBytes != sizeof(c.heroType) || c.heroType != activeOffsets.typeHeroId) {
+                                if (c.heroCand) Diagnostics::RecordDecryptFailure();
+                                transportOrDecryptFailure = true;
+                                trace(6, c.component);
+                                c.alive = false;
+                                continue;
+                            }
+                            if (c.heroIdBytes != sizeof(c.hero.heroid)) {
+                                transportOrDecryptFailure = true;
+                                trace(6, c.component);
+                                c.alive = false;
+                                continue;
+                            }
+                            if (!GameData::IsKnownHeroId(c.hero.heroid)) {
+                                c.cleanNonActor = true;
+                                trace(6, c.component);
+                                c.alive = false;
+                                continue;
+                            }
+                            if (!c.header.ReadParentOffset(offset::Entity_MatchId, c.actorMatch)) {
+                                transportOrDecryptFailure = true;
+                                trace(2, c.component);
+                                c.alive = false;
+                                continue;
+                            }
+                            c.hotBody = !c.recoveredRemote && !currentMapPositiveOnly && hotActors &&
+                                std::any_of(hotActors->begin(), hotActors->end(), [&](const auto& actor) {
+                                    return actor.address == c.component && actor.link == parent &&
+                                        actor.match == c.actorMatch && actor.hero == c.hero.heroid;
+                                });
+                            if (!c.hotBody && !c.needsLifeCheck) {
+                                // Rare case: parentHeroBase == 0 and hotActors matched address+link+match,
+                                // but hero changed -> defer to wave-batched life check (Wave 4C + 4D).
+                                c.hpPlan = PlanCnComponentSlot(c.component, activeOffsets.typeHealth, c.header);
+                                c.velPlan = PlanCnComponentSlot(c.component, TYPE_VELOCITY, c.header);
+                                if (!c.hpPlan.present || !c.velPlan.present) {
+                                    c.cleanNonActor = true;
+                                    trace(4, c.component);
+                                    c.alive = false;
+                                    continue;
+                                }
+                                lateLifeIndices.push_back(ci);
+                                continue;
+                            }
+                        }
+                        if (!c.hotBody && c.needsLifeCheck) {
+                            validateLifePayload(c);
+                        }
+                    }
+
+                    // Wave 4C + 4D: wave-batched health + velocity check for rare hero-switched candidates.
+                    if (!lateLifeIndices.empty() && !scatterPoisoned) {
+                        bool prepC = true;
+                        bool anyQueuedC = false;
+                        for (size_t ci : lateLifeIndices) {
+                            auto& c = candidates[ci];
+                            if (!c.alive) continue;
+                            const bool pHp = mem.AddScatterReadRequest(waveScatter, c.hpPlan.entryAddress, &c.hpRaw, sizeof(c.hpRaw), &c.hpRawBytes);
+                            const bool pVel = mem.AddScatterReadRequest(waveScatter, c.velPlan.entryAddress, &c.velRaw, sizeof(c.velRaw), &c.velRawBytes);
+                            prepC = prepC && pHp && pVel;
+                            anyQueuedC = anyQueuedC || pHp || pVel;
+                        }
+                        if (!prepC || (anyQueuedC && !runWave(true))) {
+                            if (!prepC) runWave(false);
+                            transportOrDecryptFailure = true;
+                            for (size_t ci : lateLifeIndices) {
+                                auto& c = candidates[ci];
+                                if (!c.alive) continue;
+                                trace(4, c.component);
+                                c.alive = false;
+                            }
+                        } else {
+                            bool prepD = true;
+                            bool anyQueuedD = false;
+                            for (size_t ci : lateLifeIndices) {
+                                auto& c = candidates[ci];
+                                if (!c.alive) continue;
+                                if (c.hpRawBytes == sizeof(c.hpRaw) && c.hpRaw) {
+                                    const uintptr_t decHp = static_cast<uintptr_t>(c.hpPlan.presentMask & Cn155284::Component(c.hpRaw, keyA, keyB));
+                                    if (decHp >= 0x10000 && decHp < 0x0000800000000000ULL)
+                                        c.hpCand = decHp;
+                                    else
+                                        Diagnostics::RecordDecryptFailure();
+                                } else if (c.hpRawBytes == sizeof(c.hpRaw) && !c.hpRaw) {
+                                    Diagnostics::RecordDecryptFailure();
+                                }
+                                if (c.velRawBytes == sizeof(c.velRaw) && c.velRaw) {
+                                    const uintptr_t decVel = static_cast<uintptr_t>(c.velPlan.presentMask & Cn155284::Component(c.velRaw, keyA, keyB));
+                                    if (decVel >= 0x10000 && decVel < 0x0000800000000000ULL)
+                                        c.velCand = decVel;
+                                    else
+                                        Diagnostics::RecordDecryptFailure();
+                                } else if (c.velRawBytes == sizeof(c.velRaw) && !c.velRaw) {
+                                    Diagnostics::RecordDecryptFailure();
+                                }
+                                if (c.hpCand && c.velCand) {
+                                    const bool p1 = mem.AddScatterReadRequest(waveScatter, c.hpCand + 0x10, &c.hpType, sizeof(c.hpType), &c.hpTypeBytes);
+                                    const bool p2 = mem.AddScatterReadRequest(waveScatter, c.hpCand, &c.hp, sizeof(c.hp), &c.hpBytes);
+                                    const bool p3 = mem.AddScatterReadRequest(waveScatter, c.velCand + 0x10, &c.velType, sizeof(c.velType), &c.velTypeBytes);
+                                    const bool p4 = mem.AddScatterReadRequest(waveScatter, c.velCand + 0x200, &c.location, sizeof(c.location), &c.locBytes);
+                                    prepD = prepD && p1 && p2 && p3 && p4;
+                                    anyQueuedD = anyQueuedD || p1 || p2 || p3 || p4;
+                                }
+                            }
+                            bool waveDOk = false;
+                            if (!prepD) {
+                                runWave(false);
+                            } else if (anyQueuedD) {
+                                waveDOk = runWave(true);
+                            } else {
+                                waveDOk = true;
+                            }
+                            for (size_t ci : lateLifeIndices) {
+                                auto& c = candidates[ci];
+                                if (!c.alive) continue;
+                                if (!waveDOk) {
+                                    transportOrDecryptFailure = true;
+                                    trace(5, c.component);
+                                    c.alive = false;
+                                    continue;
+                                }
+                                validateLifePayload(c);
+                            }
+                        }
+                    }
+                }
+            }
+        } else {
+            const auto cleanMissingOrNullHero = [&](uint64_t entityParent, const EntityHeaderSnapshot& entityHeader) -> bool {
+                if (!headerHasType(entityHeader, activeOffsets.typeHeroId))
+                    return true;
+                if (isCnLayout) {
+                    const auto plan = PlanCnComponentSlot(entityParent, activeOffsets.typeHeroId, entityHeader);
+                    if (!plan.present)
+                        return true;
+                    uint64_t rawSlot = 0;
+                    if (SDK->read_range(plan.entryAddress, &rawSlot, sizeof(rawSlot)) && rawSlot == 0)
+                        return true;
+                }
+                return false;
+            };
+            const auto parentHero = DecryptComponent(parent, activeOffsets.typeHeroId, &header, true);
+            uint64_t nonWaveParentHeroId = 0;
+            bool nonWaveParentHeroRead = false;
+            if (parentHero) {
+                nonWaveParentHeroRead = SDK->read_range(parentHero + 0xD0, &nonWaveParentHeroId, sizeof(nonWaveParentHeroId));
+                if (!nonWaveParentHeroRead)
+                    transportOrDecryptFailure = true;
+                else if (!GameData::IsKnownHeroId(nonWaveParentHeroId))
+                    parentHeroCleanNonHero = true;
+            } else if (unresolvedKind) {
+                if (cleanMissingOrNullHero(parent, header))
+                    parentHeroCleanNonHero = true;
+                else
+                    transportOrDecryptFailure = true;
+            }
+            for (auto& c : candidates) {
+                if (!c.alive) continue;
+                if (!RuntimeWorkersRunning() || !ProcessConnection::IsConnected()) {
+                    c.alive = false;
+                    continue;
+                }
+                if (parentHero) {
+                    if (!nonWaveParentHeroRead) {
+                        trace(6, c.component);
+                        c.alive = false;
+                        continue;
+                    }
+                    c.hero.heroid = nonWaveParentHeroId;
+                    if (!GameData::IsKnownHeroId(c.hero.heroid)) {
+                        c.cleanNonActor = true;
+                        trace(6, c.component);
+                        c.alive = false;
+                        continue;
+                    }
+                } else {
+                    const auto heroBase = c.component == parent
+                        ? uintptr_t{ 0 }
+                        : DecryptComponent(c.component, activeOffsets.typeHeroId, &c.header, true);
+                    if (!heroBase) {
+                        if (unresolvedKind) {
+                            if (c.component == parent || cleanMissingOrNullHero(c.component, c.header))
+                                c.cleanNonActor = true;
+                            else
+                                transportOrDecryptFailure = true;
+                        }
+                        trace(6, c.component);
+                        c.alive = false;
+                        continue;
+                    }
+                    if (!SDK->read_range(heroBase + 0xD0, &c.hero.heroid, sizeof(c.hero.heroid))) {
+                        transportOrDecryptFailure = true;
+                        trace(6, c.component);
+                        c.alive = false;
+                        continue;
+                    }
+                    if (!GameData::IsKnownHeroId(c.hero.heroid)) {
+                        c.cleanNonActor = true;
+                        trace(6, c.component);
+                        c.alive = false;
+                        continue;
+                    }
+                }
+                if (!c.header.ReadParentOffset(offset::Entity_MatchId, c.actorMatch)) {
+                    transportOrDecryptFailure = true;
+                    trace(2, c.component);
+                    c.alive = false;
+                    continue;
+                }
+                c.hotBody = !c.recoveredRemote && !currentMapPositiveOnly && hotActors &&
+                    std::any_of(hotActors->begin(), hotActors->end(), [&](const auto& actor) {
+                        return actor.address == c.component && actor.link == parent &&
+                            actor.match == c.actorMatch && actor.hero == c.hero.heroid;
+                    });
+                if (!c.hotBody) {
+                    if (!headerHasType(c.header, activeOffsets.typeHealth) || !headerHasType(c.header, TYPE_VELOCITY)) {
+                        c.cleanNonActor = true;
+                        trace(4, c.component);
+                        c.alive = false;
+                        continue;
+                    }
+                    const auto hpBase = DecryptComponent(c.component, activeOffsets.typeHealth, &c.header, true);
+                    const auto velocityBase = DecryptComponent(c.component, TYPE_VELOCITY, &c.header, true);
+                    if (!hpBase || !velocityBase) {
+                        transportOrDecryptFailure = true;
+                        trace(4, c.component);
+                        c.alive = false;
+                        continue;
+                    }
+                    bool readOk = false;
+                    if (useWave && !scatterPoisoned) {
+                        DWORD hpB = 0, locB = 0;
+                        const bool pHp = mem.AddScatterReadRequest(waveScatter, hpBase, &c.hp, sizeof(c.hp), &hpB);
+                        const bool pLoc = mem.AddScatterReadRequest(waveScatter, velocityBase + 0x200, &c.location, sizeof(c.location), &locB);
+                        readOk = runWave(pHp && pLoc) && hpB == sizeof(c.hp) && locB == sizeof(c.location);
+                    } else {
+                        readOk = SDK->read_range(hpBase, &c.hp, sizeof(c.hp)) &&
+                            SDK->read_range(velocityBase + 0x200, &c.location, sizeof(c.location));
+                    }
+                    if (!readOk) {
+                        transportOrDecryptFailure = true;
+                        trace(5, c.component);
+                        c.alive = false;
+                        continue;
+                    }
+                    HealthPayloadSummary health{};
+                    if (!TryParseHealthPayload(c.hp, health) ||
+                        ((!discoveries || c.recoveredRemote || currentMapPositiveOnly) && (health.total <= 0 || health.isDead))) {
+                        transportOrDecryptFailure = true;
+                        trace(6, c.component);
+                        c.alive = false;
+                        continue;
+                    }
+                    if (!std::isfinite(c.location.x) || !std::isfinite(c.location.y) || !std::isfinite(c.location.z) ||
+                        std::fabs(c.location.x) > 100000 || std::fabs(c.location.y) > 100000 || std::fabs(c.location.z) > 100000) {
+                        transportOrDecryptFailure = true;
+                        trace(7, c.component);
+                        c.alive = false;
+                        continue;
+                    }
+                }
+            }
+        }
+
+        // Recheck + final linkIds stability wave (1 single scatter wave across all surviving candidates).
+        bool anyAlive = std::any_of(candidates.begin(), candidates.end(), [](const auto& c) { return c.alive; });
+        std::array<uint32_t, 2> batchedCurrentLinkIds{};
+        bool batchedLinkIdsAttempted = false;
+        bool batchedLinkIdsRead = false;
+        if (anyAlive && RuntimeWorkersRunning() && ProcessConnection::IsConnected()) {
+            if (useWave && !scatterPoisoned) {
+                uint32_t currentMatch = 0;
+                DWORD matchBytes = 0, linkIdsBytes = 0;
+                bool prepOk = mem.AddScatterReadRequest(waveScatter, parent + offset::Entity_MatchId, &currentMatch, sizeof(currentMatch), &matchBytes);
+                if (link && linkIdRead && targetIdRead) {
+                    batchedLinkIdsAttempted = true;
+                    prepOk = prepOk && mem.AddScatterReadRequest(waveScatter, link + offset::Link_TargetId, batchedCurrentLinkIds.data(), sizeof(batchedCurrentLinkIds), &linkIdsBytes);
+                }
+                const bool reuseBatchedUniqueId = batchedLinkIdsAttempted &&
+                    (offset::Link_UniqueId == offset::Link_TargetId + sizeof(uint32_t));
+                for (auto& c : candidates) {
+                    if (!c.alive || !c.matchedById)
+                        continue;
+                    if (!reuseBatchedUniqueId)
+                        prepOk = prepOk && mem.AddScatterReadRequest(waveScatter, link + offset::Link_UniqueId, &c.currentId, sizeof(c.currentId), &c.idBytes);
+                    prepOk = prepOk && mem.AddScatterReadRequest(waveScatter, c.component + offset::Entity_MatchId, &c.currentComponentId, sizeof(c.currentComponentId), &c.compIdBytes);
+                }
+                const bool execOk = runWave(prepOk);
+                batchedLinkIdsRead = execOk && batchedLinkIdsAttempted && linkIdsBytes == sizeof(batchedCurrentLinkIds);
+                const bool parentMatchOk = execOk && matchBytes == sizeof(currentMatch) && currentMatch == match;
+                for (auto& c : candidates) {
+                    if (!c.alive)
+                        continue;
+                    const bool uniqueIdOk = reuseBatchedUniqueId
+                        ? (batchedLinkIdsRead && batchedCurrentLinkIds[1] == linkId)
+                        : (c.idBytes == sizeof(c.currentId) && c.currentId == linkId);
+                    const bool recheckOk = parentMatchOk &&
+                        (!c.matchedById || (uniqueIdOk &&
+                                            c.compIdBytes == sizeof(c.currentComponentId) && c.currentComponentId == c.expectedId));
+                    if (!recheckOk) {
+                        trace(8, c.component);
+                        continue;
+                    }
+                    result.emplace_back(c.component, parent);
+                    if (discoveries) {
+                        uint32_t actorMatch = 0;
+                        if (!c.header.ReadParentOffset(offset::Entity_MatchId, actorMatch)) {
+                            result.pop_back();
+                            continue;
+                        }
+                        if (c.component != parent && actorMatch != linkId && actorMatch != targetId) {
+                            result.pop_back();
+                            continue;
+                        }
+                        discoveries->push_back({ c.component, parent, c.hero.heroid, actorMatch, discoveryTick, currentMapPositiveOnly });
+                    }
+                    trace(0, c.component);
+                }
+            } else {
+                for (auto& c : candidates) {
+                    if (!c.alive)
+                        continue;
+                    uint32_t currentMatch = 0, currentId = 0, currentComponentId = 0;
+                    const bool recheckOk = SDK->read_range(parent + offset::Entity_MatchId, &currentMatch, sizeof(currentMatch)) &&
+                        currentMatch == match &&
+                        (!c.matchedById || (SDK->read_range(link + offset::Link_UniqueId, &currentId, sizeof(currentId)) && currentId == linkId &&
+                                            SDK->read_range(c.component + offset::Entity_MatchId, &currentComponentId, sizeof(currentComponentId)) && currentComponentId == c.expectedId));
+                    if (!recheckOk) {
+                        trace(8, c.component);
+                        continue;
+                    }
+                    result.emplace_back(c.component, parent);
+                    if (discoveries) {
+                        uint32_t actorMatch = 0;
+                        if (!c.header.ReadParentOffset(offset::Entity_MatchId, actorMatch)) {
+                            result.pop_back();
+                            continue;
+                        }
+                        if (c.component != parent && actorMatch != linkId && actorMatch != targetId) {
+                            result.pop_back();
+                            continue;
+                        }
+                        discoveries->push_back({ c.component, parent, c.hero.heroid, actorMatch, discoveryTick, currentMapPositiveOnly });
+                    }
+                    trace(0, c.component);
+                }
+            }
+        }
+
         if(!result.empty()) {
             allBindingsResolved=allBindingsResolved && std::all_of(resolvedComponents.begin(),resolvedComponents.end(),[&](auto component) {
                 return std::find(result.begin(),result.end(),std::make_pair(component,parent))!=result.end();
             });
-            if(!AcceptEntityRegistry(topology.registry))return {};
-            uint32_t currentLinkId=0,currentTargetId=0;
-            const bool idsStable=linkIdRead && targetIdRead &&
-                SDK->read_range(link+offset::Link_UniqueId,&currentLinkId,sizeof(currentLinkId)) && currentLinkId==linkId &&
-                SDK->read_range(link+offset::Link_TargetId,&currentTargetId,sizeof(currentTargetId)) && currentTargetId==targetId;
-            if(link && !idsStable){trace(8);return {};}
-            for(const auto& [idOffset,target]:contextBindings) {
-                const auto recovered=std::find_if(recoveredBindings.begin(),recoveredBindings.end(),[&](const auto& binding) {
-                    return binding.idOffset==idOffset && binding.target==target;
-                });
-                CnLinkTargetMapIdentity currentMap;
-                const auto positiveGuard=std::find_if(positiveMapGuards.begin(),positiveMapGuards.end(),
-                    [&](const auto& guard){return guard.first==idOffset;});
-                const auto currentTarget=ResolveCnLinkTargetMapBase(link,idOffset,nullptr,
-                    recovered!=recoveredBindings.end() || positiveGuard!=positiveMapGuards.end()?&currentMap:nullptr);
-                if(currentTarget!=target || (recovered!=recoveredBindings.end() && currentMap!=recovered->map) ||
-                    (positiveGuard!=positiveMapGuards.end() && currentMap!=positiveGuard->second)){
-                    if(discoveries)discoveries->clear();trace(8);return {};
+            if(!AcceptEntityRegistry(topology.registry)){if(discoveries)discoveries->clear();return {};}
+            bool idsStable = true;
+            if (link) {
+                if (batchedLinkIdsAttempted) {
+                    idsStable = linkIdRead && targetIdRead && batchedLinkIdsRead && batchedCurrentLinkIds == linkIds;
+                } else {
+                    std::array<uint32_t, 2> currentLinkIds{};
+                    idsStable = linkIdRead && targetIdRead &&
+                        SDK->read_range(link + offset::Link_TargetId, currentLinkIds.data(), sizeof(currentLinkIds)) &&
+                        currentLinkIds == linkIds;
+                }
+                if (!idsStable) { if (discoveries) discoveries->clear(); trace(8); return {}; }
+            } else if (!noLinkSelfActor) {
+                idsStable = false;
+            }
+            if (!contextBindings.empty()) {
+                if (waveScatter && !scatterPoisoned && (g_probeWaveScatterEnabled || contextBindings.size() > 1)) {
+                    std::vector<CnLinkTargetMapBatchRequest> mapReqs;
+                    mapReqs.reserve(contextBindings.size());
+                    for (const auto& [idOffset, target] : contextBindings) {
+                        const bool needProof =
+                            std::any_of(recoveredBindings.begin(), recoveredBindings.end(),
+                                [&](const auto& b) { return b.idOffset == idOffset && b.target == target; }) ||
+                            std::any_of(positiveMapGuards.begin(), positiveMapGuards.end(),
+                                [&](const auto& g) { return g.first == idOffset; });
+                        mapReqs.push_back({ link, idOffset, needProof });
+                    }
+                    bool poisoned = false;
+                    const auto mapResults = ResolveCnLinkTargetMapBatch(mapReqs, waveScatter, false, &poisoned);
+                    if (poisoned) {
+                        scatterPoisoned = true;
+                        if (waveScatterPoisoned)
+                            *waveScatterPoisoned = true;
+                    }
+                    for (size_t idx = 0; idx < contextBindings.size(); ++idx) {
+                        const auto& [idOffset, target] = contextBindings[idx];
+                        const auto recovered = std::find_if(recoveredBindings.begin(), recoveredBindings.end(),
+                            [&](const auto& binding) { return binding.idOffset == idOffset && binding.target == target; });
+                        const auto positiveGuard = std::find_if(positiveMapGuards.begin(), positiveMapGuards.end(),
+                            [&](const auto& guard) { return guard.first == idOffset; });
+                        const auto& res = mapResults[idx];
+                        if (res.target != target ||
+                            (recovered != recoveredBindings.end() && res.verifiedMap != recovered->map) ||
+                            (positiveGuard != positiveMapGuards.end() && res.verifiedMap != positiveGuard->second)) {
+                            if (discoveries) discoveries->clear();
+                            trace(8);
+                            return {};
+                        }
+                    }
+                } else {
+                    for (const auto& [idOffset, target] : contextBindings) {
+                        const auto recovered = std::find_if(recoveredBindings.begin(), recoveredBindings.end(), [&](const auto& binding) {
+                            return binding.idOffset == idOffset && binding.target == target;
+                        });
+                        CnLinkTargetMapIdentity currentMap;
+                        const auto positiveGuard = std::find_if(positiveMapGuards.begin(), positiveMapGuards.end(),
+                            [&](const auto& guard) { return guard.first == idOffset; });
+                        const auto currentTarget = ResolveCnLinkTargetMapBase(link, idOffset, nullptr,
+                            recovered != recoveredBindings.end() || positiveGuard != positiveMapGuards.end() ? &currentMap : nullptr);
+                        if (currentTarget != target || (recovered != recoveredBindings.end() && currentMap != recovered->map) ||
+                            (positiveGuard != positiveMapGuards.end() && currentMap != positiveGuard->second)) {
+                            if (discoveries) discoveries->clear();
+                            trace(8);
+                            return {};
+                        }
+                    }
                 }
             }
-            allBindingsResolved=allBindingsResolved && idsStable;
+            allBindingsResolved=allBindingsResolved && idsStable && !transportOrDecryptFailure;
             if(currentMapPositiveOnly)allBindingsResolved=false;
-            if(allBindingsResolved && bindingMembers)
-                for(auto component:resolvedComponents)bindingMembers->emplace_back(component,parent);
+            if(allBindingsResolved && bindingMembers) {
+                if (noLinkSelfActor)
+                    bindingMembers->emplace_back(parent, parent);
+                else
+                    for (auto component : resolvedComponents) bindingMembers->emplace_back(component, parent);
+            }
             if(bindingComplete)*bindingComplete=allBindingsResolved;
+        } else if (unresolvedKind && !currentMapPositiveOnly &&
+            !transportOrDecryptFailure && !ambiguousMapFailed &&
+            !candidates.empty() && AcceptEntityRegistry(topology.registry)) {
+            const bool allCleanNonActors = std::all_of(candidates.begin(), candidates.end(),
+                [](const CandidateState& c) { return c.cleanNonActor; });
+            if (allCleanNonActors && (allBindingsResolved || (topology.member_ids_complete && parentHeroCleanNonHero))) {
+                *unresolvedKind = PriorityProbeUnresolvedKind::DefinitiveNonActor;
+            }
         }
         return result;
     }

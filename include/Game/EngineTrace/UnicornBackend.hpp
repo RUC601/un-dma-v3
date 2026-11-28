@@ -2,6 +2,7 @@
 
 #include "Game/EngineTrace.hpp"
 
+#include <condition_variable>
 #include <cstdint>
 #include <functional>
 #include <memory>
@@ -24,7 +25,9 @@ public:
         uint64_t hits = 0;     // pages served from this store
     };
     std::mutex mutex;
+    std::condition_variable cv;
     std::unordered_map<uint64_t, std::vector<uint8_t>> pages;
+    std::unordered_set<uint64_t> inFlightPages;
     Stats stats;
 };
 

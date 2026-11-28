@@ -10,6 +10,8 @@
 #include <mutex>
 #include <unordered_map>
 #include <memory>
+#include <functional>
+#include "Memory/DmaAdmission.hpp"
 #include "Memory/DmaSessionAccess.hpp"
 #include "Memory/ProcessLifetime.hpp"
 #include "Memory/DmaDeviceConfig.hpp"
@@ -41,6 +43,7 @@ private:
 	std::atomic<bool> m_cancelPending{ false };
 	std::atomic<int> m_currentPid{ 0 };
 	mutable DmaSessionAccess m_sessionAccess;
+	mutable V2::Memory::DmaAdmissionController m_admission;
 	std::mutex m_sessionLifecycleMutex;
 	mutable std::recursive_mutex m_processInfoMutex;
 	mutable std::mutex m_scatterMutex;
@@ -78,6 +81,10 @@ private:
 	bool SetFPGA();
 	std::string BuildDeviceString(DmaDeviceType deviceType) const;
 	const char* GetDeviceTypeName(DmaDeviceType deviceType) const;
+	bool IsCurrentThreadInDrainedLifecycle() const noexcept;
+	void CloseDmaDrainedLocked();
+	bool RefreshProcessMetadataDrainedLocked(const char* reason) const;
+	bool FixCr3DrainedLocked();
 
 public:
 	struct ProcessLookupResult
@@ -104,13 +111,32 @@ public:
 	void CloseDma();
 	DmaSessionAccess::Lease AcquireSession() const { return m_sessionAccess.Acquire(); }
 	DmaSessionAccess::Activity SessionActivity() const { return m_sessionAccess.Inspect(); }
+	V2::Memory::DmaAdmissionController::Ticket AcquireAdmission() const {
+		return m_admission.Acquire(V2::Memory::DmaAdmissionController::CurrentThreadContext(), m_cancelPending);
+	}
+	V2::Memory::DmaAdmissionController::Ticket AcquireAdmission(const V2::Memory::DmaReadContext& context) const {
+		return m_admission.Acquire(context, m_cancelPending);
+	}
+	V2::Memory::DmaAdmissionStats SnapshotAdmissionStats() const { return m_admission.SnapshotStats(); }
+	void ResetAdmissionStats() { m_admission.ResetStats(); }
+	uint64_t AdmissionEpoch() const { return m_admission.Epoch(); }
+	void SetAdmissionSerializedPriority(bool enabled) { m_admission.SetSerializedPriorityMode(enabled); }
+	// Enforces strict Drain -> Clear -> Action (Refresh/Fix/Close) lifecycle barrier.
+	bool ExecuteDrainedLifecycle(const char* reason,
+		const std::function<void()>& onClear,
+		const std::function<bool()>& onAction,
+		bool reopenAfter = true);
+	bool IsInDrainedLifecycle() const noexcept { return IsCurrentThreadInDrainedLifecycle(); }
 	bool CheckSessionHealth() const;
 	bool CheckAttachedProcessAlive() const;
 	bool CheckAttachedImageReadable() const;
 	// Only with runtime workers drained: this refresh may block all DMA reads.
 	bool RefreshProcessMetadata(const char* reason) const;
 	bool IsDmaInitialized() const { return DMA_INITIALIZED.load(std::memory_order_acquire); }
-	void CancelPendingOperations() { m_cancelPending.store(true, std::memory_order_release); }
+	void CancelPendingOperations() {
+		m_cancelPending.store(true, std::memory_order_release);
+		m_admission.NotifyWaiters();
+	}
 	void ResetPendingOperations() { m_cancelPending.store(false, std::memory_order_release); }
 
 	// -- Process information --
@@ -149,6 +175,16 @@ public:
 		float end[3] = {};
 		uint8_t bytes[0x240] = {};
 	};
+	using ThreadEnumeratorFn = std::function<bool(std::vector<ThreadSnapshot>&)>;
+	using PageReadFn = std::function<bool(uintptr_t, void*, size_t)>;
+	using CancelCheckFn = std::function<bool()>;
+	static bool CaptureRaySetupSeedWithProbes(uint64_t context, uint64_t imageBase, uint32_t imageSize,
+		int timeoutMs, RaySetupSeed& out,
+		const ThreadEnumeratorFn& enumerateThreads,
+		const PageReadFn& readMemory,
+		const CancelCheckFn& isCancelledOrInvalid,
+		const float* startHint = nullptr,
+		float startRadius = 3.0f);
 	bool CaptureRaySetupSeed(uint64_t context, uint64_t imageBase, uint32_t imageSize,
 		int timeoutMs, RaySetupSeed& out, const float* startHint = nullptr,
 		float startRadius = 3.0f) const;
@@ -254,6 +290,8 @@ public:
 	}
 
 	bool ExecuteReadScatter(VMMDLL_SCATTER_HANDLE handle, int pid = 0);
+	// Clears queued requests on a reusable scatter handle without executing DMA I/O.
+	bool ClearScatterHandle(VMMDLL_SCATTER_HANDLE handle, int pid = 0);
 
 	// Raw SDK users must hold AcquireSession() for the complete call. Scatter
 	// handles are Memory-owned opaque tokens and must use these wrappers only.

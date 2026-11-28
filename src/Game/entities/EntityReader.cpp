@@ -3,6 +3,8 @@
 #include "Game/EntityMaintenance/ComponentRefresh.hpp"
 #include "Game/EntityMaintenance/RefreshBatch.hpp"
 #include "Game/EntityMaintenance/WorkSchedule.hpp"
+#include "Game/EntityMaintenance/DeadlineScheduler.hpp"
+#include "Game/AcquisitionTelemetry.hpp"
 #include "Game/ParticipantIdentity.hpp"
 #include "Game/camera/CameraWorker.hpp"
 #include "../../runtime/Acquisition.hpp"
@@ -472,12 +474,15 @@ void entity_thread() {
     std::unordered_set<uint64_t> scanMissHotReadComponents;
     std::unordered_set<uint64_t> scanMissHotReadSucceededComponents;
     std::unordered_set<uint64_t> hotScatterPages;
+    std::unordered_set<uint64_t> guardScatterPages;
     std::unordered_map<uint64_t, const OW::c_entity*> previousEntityByAddress;
     std::unordered_map<uint64_t, const OW::c_entity*> previousEntityByRosterKey;
     std::unordered_map<uint64_t, RosterEntry*> rosterByAddress;
     std::vector<uint8_t> needsReconciliation;
     auto measurementStart=std::chrono::steady_clock::now();
     size_t measuredCycles=0; double hotTotalMs=0, hotMaxMs=0;
+    OW::AcquisitionTelemetry::PhaseWindow phaseWindow{};
+    uint32_t consecutiveSkippedMaintenance = 0;
 
     while (OW::RuntimeWorkersRunning()) {
         if (!OW::ProcessConnection::IsConnected()) {
@@ -524,6 +529,7 @@ void entity_thread() {
             lastRespawnTopologyRescanRequestTick = 0;
             lastLoggedRawCount = static_cast<size_t>(-1);
             lastLoggedValidatedCount = static_cast<size_t>(-1);
+            consecutiveSkippedMaintenance = 0;
             Diagnostics::Info(
                 "Entity owner reset: cbf_active_cn_ne=%d profile=%s connection_epoch=%llu.",
                 criticalBatchFusionActive ? 1 : 0,
@@ -1067,7 +1073,42 @@ void entity_thread() {
             return ok;
         };
 
+        // Skip hot scatter and unbatched reads for non-seated foreign-world clones (e.g. 6v6
+        // killcam/replay) that collide on participant_key or match_id with a live in-table seat.
+        auto isBlockedLiveDuplicateClone = [&](uint64_t componentParent, uint64_t linkParent,
+                                               uint64_t participantKey, std::string_view participantLabel,
+                                               uint32_t matchId) -> bool {
+            if (!componentParent)
+                return false;
+            bool duplicateLiveFound = false;
+            for (const auto& [rKey, rEntry] : entityRoster) {
+                (void)rKey;
+                if (!rEntry)
+                    continue;
+                const auto& seated = rEntry->entity;
+                if (seated.address == componentParent)
+                    return false;
+                if (!seated.address || seated.roster_state != OW::EntityRosterState::Fresh || !seated.Alive)
+                    continue;
+                if (seated.LinkParent == linkParent)
+                    continue;
+                const bool sameParticipant = participantKey != 0 && seated.participant_key == participantKey &&
+                    (participantLabel.empty() || rEntry->participantLabel.empty() ||
+                     rEntry->participantLabel == participantLabel);
+                const bool sameMatch = matchId != 0 && seated.match_id == matchId &&
+                    (participantKey == 0 || seated.participant_key == 0 ||
+                     seated.participant_key == participantKey);
+                if ((sameParticipant || sameMatch) &&
+                    (!completeActorMembershipKnown || latestCompleteActorMembers.contains(seated.address))) {
+                    duplicateLiveFound = true;
+                }
+            }
+            return duplicateLiveFound;
+        };
+
+        const uint64_t dmaWaitBeforeUs = mem.SnapshotAdmissionStats().totalWaitUs;
         {
+            V2::Memory::DmaAdmissionController::ScopedContext hotPrepDmaScope(V2::Memory::DmaReadClass::Hot);
             ScopedPipelinePhaseTimer phaseTimer(pipelineStats.phase.hotScatterPrepareMs);
             for (const auto& [componentParent, linkParent] : raw_entities) {
                 if (!OW::RuntimeWorkersRunning() || !OW::ProcessConnection::IsConnected())
@@ -1091,6 +1132,14 @@ void entity_thread() {
                 if (cached.linkParent != linkParent ||
                     cached.baseUpdateTick == 0 ||
                     !cached.health) {
+                    continue;
+                }
+                if (isBlockedLiveDuplicateClone(
+                        componentParent,
+                        linkParent,
+                        cacheIt->second->participantKey,
+                        cacheIt->second->participantLabel,
+                        cached.matchIdValid ? cached.matchId : 0)) {
                     continue;
                 }
 
@@ -1331,6 +1380,8 @@ void entity_thread() {
             next.pos=position;next.velocity={velocity.velocity.x,velocity.velocity.y,velocity.velocity.z};
             next.rotation_valid = item.RotationRead() && item.RotationGuarded();
             if (next.rotation_valid) next.Rot = item.rotation;
+            const auto previousNativeHitboxes = next.native_hitboxes;
+            const auto previousModelWorld = next.model_world;
             next.ClearSkeletonObservation();
             if(item.reads.scatterOk && item.reads.modelWorldRequested && item.reads.modelWorldBytes==sizeof(item.reads.modelWorld))
                 next.SetModelWorldTransform(next.VelocityBase,item.reads.modelWorld);
@@ -1360,13 +1411,29 @@ void entity_thread() {
             item.readCompletedTick = skeletonCompleted;
             std::fill(next.model_shapes.valid.begin(),next.model_shapes.valid.end(),false);
             if(offset::UsesNativeModelGeometry()) {
-                if(skeletonConfirmed && next.HasCurrentModelWorldTransform() && NativeHitboxRuntimeEnabled()) {
+                bool bindingsChanged = false;
+                if(item.nativeHitboxes.Complete()) {
+                    const auto previousBoneIndices = cached.nativeHitboxLayout.boneIndices;
+                    if(!item.nativeHitboxes.RefreshBindings(cached.nativeHitboxLayout,cached.skeletonCache.boneCount,processLoopTick)) {
+                        cached.nativeHitboxLayout={};
+                    } else if(!item.nativeHitboxes.usedCachedShapes && previousBoneIndices!=cached.nativeHitboxLayout.boneIndices) {
+                        bindingsChanged = true;
+                        ++pipelineStats.hotGeometryBindingChanges;
+                    }
+                } else if(item.nativeHitboxes.prepared) {
+                    cached.nativeHitboxLayout={};
+                }
+                bool committedNativeValid = false;
+                if(!bindingsChanged && skeletonConfirmed && next.HasCurrentModelWorldTransform() && NativeHitboxRuntimeEnabled()) {
                     const auto* nativeModel = cached.skeletonCache.shapeModelIndex >= 0
                         ? &OW::ModelShapes::kModels[cached.skeletonCache.shapeModelIndex] : nullptr;
-                    next.native_hitboxes=item.nativeHitboxes.Commit(
+                    auto candidateNative = item.nativeHitboxes.Commit(
                         cached.skeletonCache.revision,item.readStartedTick,next.model_world,
                         item.geometryPoses,nativeModel,cached.skeletonCache.shapeMapped);
-                    if (!next.native_hitboxes.Matches(next.VelocityBase,next.skeleton_revision)) {
+                    committedNativeValid = candidateNative.Matches(next.VelocityBase,next.skeleton_revision);
+                    if (!committedNativeValid) {
+                        if (item.nativeHitboxes.Complete())
+                            ++pipelineStats.hotGeometryRejectedSamples;
                         static std::unordered_map<uint64_t, DWORD> lastNativeRejectLog;
                         const DWORD now = GetTickCount();
                         auto& last = lastNativeRejectLog[next.address];
@@ -1391,8 +1458,8 @@ void entity_thread() {
                                 item.nativeHitboxes.spheres.size(),item.nativeHitboxes.capsules.size(),
                                 item.readStartedTick);
                         }
-                    }
-                    if (next.native_hitboxes.Matches(next.VelocityBase,next.skeleton_revision)) {
+                    } else {
+                        next.native_hitboxes = std::move(candidateNative);
                         const DWORD now = GetTickCount();
                         auto& last = nativeHitboxLogTicks[next.address];
                         if (now - last >= 1000) {
@@ -1424,12 +1491,29 @@ void entity_thread() {
                         }
                     }
                 }
-                if(item.nativeHitboxes.Complete()) {
-                    if(!item.nativeHitboxes.RefreshBindings(cached.nativeHitboxLayout,cached.skeletonCache.boneCount,processLoopTick))cached.nativeHitboxLayout={};
-                    else if(item.nativeHitboxes.layout.boneIndices!=cached.nativeHitboxLayout.boneIndices)++pipelineStats.hotGeometryBindingChanges;
-                    if(!next.native_hitboxes.Matches(next.VelocityBase,next.skeleton_revision))++pipelineStats.hotGeometryRejectedSamples;
+                if (!committedNativeValid) {
+                    const bool retainFreshNative =
+                        cached.skeletonCache.valid &&
+                        cached.nativeHitboxLayout.Matches(next.VelocityBase,cached.skeletonCache.revision) &&
+                        previousNativeHitboxes.Matches(next.VelocityBase,cached.skeletonCache.revision) &&
+                        previousNativeHitboxes.root == cached.nativeHitboxLayout.root &&
+                        (!item.nativeHitboxes.prepared ||
+                         (item.nativeHitboxes.rootBytes == 8 &&
+                          item.nativeHitboxes.observedRoot == cached.nativeHitboxLayout.root &&
+                          item.nativeHitboxes.headerBytes == 48 &&
+                          item.nativeHitboxes.observedHeader == cached.nativeHitboxLayout.header)) &&
+                        DWORD(item.readStartedTick - previousNativeHitboxes.tick) <= 100;
+                    if (retainFreshNative) {
+                        next.native_hitboxes = previousNativeHitboxes;
+                        if (!next.HasCurrentModelWorldTransform() &&
+                            previousModelWorld.valid &&
+                            previousModelWorld.modelBase == next.VelocityBase) {
+                            next.model_world = previousModelWorld;
+                        }
+                        if (next.skeleton_revision == 0)
+                            next.skeleton_revision = cached.skeletonCache.revision;
+                    }
                 }
-                if(item.nativeHitboxes.prepared && !item.nativeHitboxes.Complete())cached.nativeHitboxLayout={};
                 cached.cachedNativeHitboxes=next.native_hitboxes;
             }
             if(skeletonConfirmed && ModelHitboxRuntimeEnabled() && OW::ModelShapes::Supported(next.HeroID) &&
@@ -1460,7 +1544,7 @@ void entity_thread() {
                     lastShapeLog=GetTickCount();
                     const auto& pose=next.model_shapes.poses[0];
                     Diagnostics::Info("Model shapes candidate hero=%llX valid=%d/%zu bone0=%d q=(%.4f,%.4f,%.4f,%.4f) scale=(%.4f,%.4f,%.4f) t=(%.4f,%.4f,%.4f)",
-                        next.HeroID,int(std::count(next.model_shapes.valid.begin(),next.model_shapes.valid.end(),true)),
+                        next.HeroID,int(std::count(next.model_shapes.valid.begin(),next.model_shapes.valid.end(),uint8_t{1})),
                         next.model_shapes.poses.size(),cached.skeletonCache.shapeMapped[0],pose.q[0],pose.q[1],pose.q[2],pose.q[3],
                         pose.scale[0],pose.scale[1],pose.scale[2],pose.translation[0],pose.translation[1],pose.translation[2]);
                 }
@@ -1540,28 +1624,45 @@ void entity_thread() {
         }
         };
         const bool hasActiveHotBatch = !hotFieldBatchItems.empty();
+        OW::AcquisitionTelemetry::CycleSample cycleTelemetry{};
+        cycleTelemetry.hotPrepareMs = pipelineStats.phase.hotScatterPrepareMs;
+        cycleTelemetry.fieldDistinctPages = hotScatterPages.size();
+        cycleTelemetry.fieldScatterReqs = pipelineStats.hotScatterBatchRequests;
+        cycleTelemetry.registryCapacity = processRegistry.capacity;
         if (hasActiveHotBatch) {
+            V2::Memory::DmaAdmissionController::ScopedContext hotDmaScope(V2::Memory::DmaReadClass::Hot);
             for(auto& item:hotFieldBatchItems)
                 item.bodyObservation=OW::CaptureEntityBodyObservation(item.componentParent);
             uint64_t fusedCameraAddr = 0, fusedProjectionAddr = 0;
             OW::Matrix fusedCamera{}, fusedProjection{};
             DWORD fusedCameraBytes = 0, fusedProjectionBytes = 0;
             bool fusedCameraPrepared = false, fusedProjectionPrepared = false;
+            const auto camPrepStarted = std::chrono::steady_clock::now();
             if (hotFieldScatter && PrepareAcquisitionCameraPointers(fusedCameraAddr, fusedProjectionAddr)) {
                 fusedCameraPrepared = mem.AddScatterReadRequest(
                     hotFieldScatter, fusedCameraAddr, &fusedCamera, sizeof(fusedCamera), &fusedCameraBytes);
                 fusedProjectionPrepared = mem.AddScatterReadRequest(
                     hotFieldScatter, fusedProjectionAddr, &fusedProjection, sizeof(fusedProjection), &fusedProjectionBytes);
+                recordHotScatterPrepare(fusedCameraAddr, sizeof(fusedCamera), fusedCameraPrepared);
+                recordHotScatterPrepare(fusedProjectionAddr, sizeof(fusedProjection), fusedProjectionPrepared);
+                cycleTelemetry.fieldScatterReqs += (fusedCameraPrepared ? 1 : 0) + (fusedProjectionPrepared ? 1 : 0);
+                cycleTelemetry.fieldDistinctPages = hotScatterPages.size();
             }
+            cycleTelemetry.cameraPrepareMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - camPrepStarted).count();
+            cycleTelemetry.hotPrepareMs += cycleTelemetry.cameraPrepareMs;
             const auto hotStarted=std::chrono::steady_clock::now();
             const DWORD started=GetTickCount();
             const uint64_t hotCameraStartedMs = GetTickCount64();
             bool ok=false;
+            const auto fieldExecStarted = std::chrono::steady_clock::now();
             {
                 ScopedPipelinePhaseTimer timer(pipelineStats.phase.hotScatterExecuteMs);
                 Diagnostics::ScopedDmaCallsite tag(Diagnostics::DmaCallsite::EntityHotScatter);
                 ok=mem.ExecuteReadScatter(hotFieldScatter);
             }
+            cycleTelemetry.fieldExecClearMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - fieldExecStarted).count();
             const uint64_t hotCameraCompletedMs = GetTickCount64();
             const DWORD hotFieldsCompleted=GetTickCount();
             const bool fusedCameraOk =
@@ -1573,13 +1674,27 @@ void entity_thread() {
                     hotCameraCompletedMs,
                     ok && fusedCameraBytes == sizeof(fusedCamera) && fusedProjectionBytes == sizeof(fusedProjection));
             bool guardQueued=false;
+            guardScatterPages.clear();
+            size_t guardReqCount = 0;
+            const auto recordGuardPrepare = [&](VMMDLL_SCATTER_HANDLE scatter, uint64_t at, void* dst, size_t bytes, DWORD* actual) {
+                ++guardReqCount;
+                if (bytes) {
+                    const auto last = (at + bytes - 1) & kScatterPageMask;
+                    for (auto page = at & kScatterPageMask;; page += 0x1000) {
+                        guardScatterPages.insert(page);
+                        if (page == last) break;
+                    }
+                }
+                return prepareSkeletonScatter(scatter, at, dst, bytes, actual);
+            };
+            const auto guardPrepStarted = std::chrono::steady_clock::now();
             if(ok && hotGuardScatter)for(auto& item:hotFieldBatchItems) {
                 const auto found=componentBaseCache.find(item.componentParent);
                 if(found==componentBaseCache.end() || found->second->linkParent!=item.linkParent)continue;
                 const auto& cached=*found->second;
                 if(item.rotationGuard.beforePrepared && cached.rotation) {
                     guardQueued=true;
-                    item.rotationGuard.afterPrepared=prepareSkeletonScatter(hotGuardScatter,
+                    item.rotationGuard.afterPrepared=recordGuardPrepare(hotGuardScatter,
                         OW::Skeleton::AddressOffset(cached.rotation,offset::RotationBase_Sub1),
                         &item.rotationGuard.after,sizeof(item.rotationGuard.after),&item.rotationGuard.afterBytes);
                 }
@@ -1588,15 +1703,24 @@ void entity_thread() {
                     item.skeletonAfter.Queue(cached.skeletonCache.layout,cached.skeletonCache.identity,
                         cached.skeletonCache.heroId==OW::eHero::HERO_DVA,item.guardedBoneIndices,
                         [&](uint64_t at,void* dst,size_t bytes,DWORD* actual) {
-                            return prepareSkeletonScatter(hotGuardScatter,at,dst,bytes,actual);
+                            return recordGuardPrepare(hotGuardScatter,at,dst,bytes,actual);
                         });
                 }
             }
+            cycleTelemetry.guardPrepareMs = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - guardPrepStarted).count();
+            cycleTelemetry.guardDistinctPages = guardScatterPages.size();
+            cycleTelemetry.guardScatterReqs = guardReqCount;
             bool guardOk=ok && hotGuardScatter;
             if(guardOk && guardQueued) {
-                ScopedPipelinePhaseTimer timer(pipelineStats.phase.hotScatterExecuteMs);
-                Diagnostics::ScopedDmaCallsite tag(Diagnostics::DmaCallsite::EntityHotScatter);
-                guardOk=mem.ExecuteReadScatter(hotGuardScatter);
+                const auto guardExecStarted = std::chrono::steady_clock::now();
+                {
+                    ScopedPipelinePhaseTimer timer(pipelineStats.phase.hotScatterExecuteMs);
+                    Diagnostics::ScopedDmaCallsite tag(Diagnostics::DmaCallsite::EntityHotScatter);
+                    guardOk=mem.ExecuteReadScatter(hotGuardScatter);
+                }
+                cycleTelemetry.guardExecClearMs = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - guardExecStarted).count();
                 ++pipelineStats.hotScatterExecuteCount; ++dmaFieldWindow.hotScatterExecute;
                 if(!guardOk){++pipelineStats.hotScatterExecuteFailCount; ++dmaFieldWindow.hotScatterExecuteFail;}
             }
@@ -1637,27 +1761,28 @@ void entity_thread() {
             if(ok) publishHotActors();
             const double hotMs=std::chrono::duration<double,std::milli>(std::chrono::steady_clock::now()-hotStarted).count();
             hotTotalMs+=hotMs; hotMaxMs=(std::max)(hotMaxMs,hotMs); ++measuredCycles;
-            const double elapsed=std::chrono::duration<double>(std::chrono::steady_clock::now()-measurementStart).count();
-            if(elapsed>=5) {
-                Diagnostics::Info("[UNDMA-V3] target_hz=%d cycles=%zu actual_cycle_hz=%.2f entities=%zu hot_mean_ms=%.3f hot_max_ms=%.3f",
-                    V2::Acquisition::kTargetHz,measuredCycles,measuredCycles/elapsed,hotFieldBatchItems.size(),hotTotalMs/measuredCycles,hotMaxMs);
-                for(const auto& [address,count]:successfulSamples)
-                    Diagnostics::Info("[UNDMA-V3-SAMPLE] entity=0x%llX samples=%llu hz=%.2f",address,count,count/elapsed);
-                successfulSamples.clear(); measuredCycles=0; hotTotalMs=0; hotMaxMs=0;
-                measurementStart=std::chrono::steady_clock::now();
-            }
         } else {
+            V2::Memory::DmaAdmissionController::ScopedContext hotDmaScope(V2::Memory::DmaReadClass::Hot);
             SampleAcquisitionCamera();
         }
+        const uint64_t nextTickUs = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::microseconds>(
+                nextProcessTick.time_since_epoch()).count());
+        const OW::EntityMaintenance::CycleDeadlineBudget cycleDeadline{ nextTickUs };
         const uint64_t coldStartedUs=RuntimeTrace::NowUs();
-        StepAcquisitionDiscovery();
+        const uint64_t discoveryDeadlineUs = cycleDeadline.DiscoveryDeadlineUs(coldStartedUs, hasActiveHotBatch);
+        {
+            V2::Memory::DmaAdmissionController::ScopedContext coldDmaScope(V2::Memory::DmaReadClass::Cold);
+            StepAcquisitionDiscoveryWithBudget(discoveryDeadlineUs);
+        }
 #include "Game/EntityMaintenance/LiveBinding.inl"
         const uint64_t maintenanceStartedUs=RuntimeTrace::NowUs();
         const uint64_t discoverySpentUs=maintenanceStartedUs>=coldStartedUs?(maintenanceStartedUs-coldStartedUs):0;
-        const uint64_t maintenanceBudgetUs = hasActiveHotBatch
-            ? (discoverySpentUs < 1200 ? (1200 - discoverySpentUs) : 0)
-            : 1000;
-        if (!hasActiveHotBatch || discoverySpentUs < 1000) {
+        cycleTelemetry.coldDiscoveryMs = static_cast<double>(discoverySpentUs) / 1000.0;
+        const uint64_t maintenanceBudgetUs = cycleDeadline.MaintenanceBudgetUsWithAntiStarvation(
+            maintenanceStartedUs, hasActiveHotBatch, consecutiveSkippedMaintenance);
+        if (!hasActiveHotBatch || cycleDeadline.CanStartQuantum(maintenanceStartedUs, 300)) {
+            V2::Memory::DmaAdmissionController::ScopedContext coldDmaScope(V2::Memory::DmaReadClass::Cold);
             V2::Maps::Sample();
             sampleGameResolution();
         }
@@ -1724,17 +1849,38 @@ void entity_thread() {
                 dynamicCacheIt = dynamicEntityCache.end();
             }
             if (dynamicCacheIt != dynamicEntityCache.end() && dynamicCacheIt->second.valid) {
-                uint64_t currentId=0;
-                const bool identityRead = V2::WorldObjects::ReadId(ComponentParent,readObjectRange,currentId);
-                if (!identityRead || currentId != dynamicCacheIt->second.entityId) {
-                    dynamicEntityCache.erase(dynamicCacheIt);
-                    dynamicCacheIt = dynamicEntityCache.end();
+                // Eliminate redundant serial WorldObjects::ReadId on cache hit:
+                // re-verify only on registry generation change or periodic 500ms rolling recheck.
+                constexpr DWORD kWorldObjectIdRecheckMs = 500;
+                const DWORD cacheNow = GetTickCount();
+                const bool needIdRecheck =
+                    dynamicCacheIt->second.registryGeneration != processRegistry.generation ||
+                    dynamicCacheIt->second.idVerifiedTick == 0 ||
+                    cycleDiscoveries.actors.contains(ComponentParent) ||
+                    DWORD(cacheNow - dynamicCacheIt->second.idVerifiedTick) >= kWorldObjectIdRecheckMs;
+                if (needIdRecheck) {
+                    uint64_t currentId=0;
+                    const bool identityRead = V2::WorldObjects::ReadId(ComponentParent,readObjectRange,currentId);
+                    if (!identityRead || currentId != dynamicCacheIt->second.entityId) {
+                        dynamicEntityCache.erase(dynamicCacheIt);
+                        dynamicCacheIt = dynamicEntityCache.end();
+                    } else {
+                        dynamicCacheIt->second.idVerifiedTick = cacheNow;
+                        dynamicCacheIt->second.registryGeneration = processRegistry.generation;
+                    }
                 }
             }
             if (dynamicCacheIt != dynamicEntityCache.end() && dynamicCacheIt->second.valid) {
                 ++lifecycleStats.dynamicCacheReusedCount;
                 DynamicEntityCache& cachedDynamic = dynamicCacheIt->second;
+                const DWORD prevUpdateTick = cachedDynamic.updateTick;
                 refreshWorldObject(ComponentParent,cachedDynamic,nullptr);
+                if (cachedDynamic.updateTick == prevUpdateTick &&
+                    cachedDynamic.lastAttemptTick &&
+                    DWORD(GetTickCount() - cachedDynamic.updateTick) > 200) {
+                    // Position refresh failed; force immediate ReadId recheck next visit.
+                    cachedDynamic.idVerifiedTick = 0;
+                }
                 OW::hpanddy hpdyentity=worldObjectSnapshot(ComponentParent,cachedDynamic);
                 if(!hpdyentity.position_tick_ms||DWORD(GetTickCount()-hpdyentity.position_tick_ms)>200)continue;
                 hpdy_entities.push_back(hpdyentity);
@@ -1816,6 +1962,8 @@ void entity_thread() {
                         dynamicCache.linkParent = LinkParent;
                         dynamicCache.valid = true;
                         dynamicCache.entityId = EntityID;
+                        dynamicCache.idVerifiedTick = GetTickCount();
+                        dynamicCache.registryGeneration = processRegistry.generation;
                         refreshWorldObject(ComponentParent,dynamicCache,componentSnapshot);
                         const bool dynamicCacheReplacing =
                             dynamicCacheExpiredByLinkChange ||
@@ -2016,6 +2164,15 @@ void entity_thread() {
                 continue;
             }
             lastentity = entity;
+            }
+
+            if (isBlockedLiveDuplicateClone(
+                    ComponentParent,
+                    LinkParent,
+                    entity.participant_key,
+                    cacheIt->second->participantLabel,
+                    entity.match_id)) {
+                continue;
             }
 
             RosterEntry& componentCache = *cacheIt->second;
@@ -3222,17 +3379,82 @@ void entity_thread() {
             continue;
         }
 
-        if (!hasActiveHotBatch || RuntimeTrace::NowUs() - coldStartedUs < 1500) {
+        if (!hasActiveHotBatch || cycleDeadline.CanStartQuantum(RuntimeTrace::NowUs(), 250)) {
 #include "Game/EntityMaintenance/Outlines.inl"
 
         // Swap processed entities
         if(!bootstrapFirst)runBootstrapBatch();
         bootstrapFirst=!bootstrapFirst;
-        } else {
-            bootstrapFirst=!bootstrapFirst;
+        } else if (maintenanceBudgetUs > 0) {
+            // Only alternate bootstrapFirst on cycles that actually received a maintenance
+            // budget (e.g. anti-starvation floor), so even skip periods (k=4) cannot lock
+            // bootstrapFirst to a single parity and starve bootstrap or entity maintenance.
+            if (!bootstrapFirst && maintenanceBudget.CanStart(RuntimeTrace::NowUs()))
+                runBootstrapBatch();
+            bootstrapFirst = !bootstrapFirst;
         }
-        if (hasActiveHotBatch && RuntimeTrace::NowUs() - coldStartedUs >= 1500) {
+        const uint64_t coldTailNowUs = RuntimeTrace::NowUs();
+        const uint64_t cameraAgeUs = OW::EntityMaintenance::CameraAgeTailGuard::SampleAgeUs(
+            LastAcquisitionCameraSampleUs(), coldTailNowUs);
+        cycleTelemetry.cameraAgeMs = static_cast<double>(cameraAgeUs) / 1000.0;
+        if (OW::EntityMaintenance::CameraAgeTailGuard::ShouldRefreshAtTail(
+                hasActiveHotBatch, LastAcquisitionCameraSampleUs(), coldTailNowUs)) {
+            V2::Memory::DmaAdmissionController::ScopedContext hotDmaScope(V2::Memory::DmaReadClass::Hot);
             SampleAcquisitionCamera();
+            cycleTelemetry.tailCameraRefreshed = true;
+        }
+        const uint64_t coldFinishedUs = RuntimeTrace::NowUs();
+        cycleTelemetry.coldMaintenanceMs =
+            coldFinishedUs >= maintenanceStartedUs
+                ? static_cast<double>(coldFinishedUs - maintenanceStartedUs) / 1000.0
+                : 0.0;
+        cycleTelemetry.coldTotalMs =
+            coldFinishedUs >= coldStartedUs
+                ? static_cast<double>(coldFinishedUs - coldStartedUs) / 1000.0
+                : 0.0;
+        const uint64_t dmaWaitAfterUs = mem.SnapshotAdmissionStats().totalWaitUs;
+        cycleTelemetry.dmaWaitMs = dmaWaitAfterUs >= dmaWaitBeforeUs
+            ? static_cast<double>(dmaWaitAfterUs - dmaWaitBeforeUs) / 1000.0
+            : 0.0;
+        if (hasActiveHotBatch) {
+            phaseWindow.Record(cycleTelemetry);
+            const double elapsed = std::chrono::duration<double>(std::chrono::steady_clock::now() - measurementStart).count();
+            if (elapsed >= 5.0 && measuredCycles > 0) {
+                Diagnostics::Info("[UNDMA-V3] target_hz=%d cycles=%zu actual_cycle_hz=%.2f entities=%zu hot_mean_ms=%.3f hot_max_ms=%.3f",
+                    V2::Acquisition::kTargetHz, measuredCycles, measuredCycles / elapsed, hotFieldBatchItems.size(),
+                    hotTotalMs / measuredCycles, hotMaxMs);
+                Diagnostics::Info(
+                    "[UNDMA-V3-PHASE-TIMING] cycles=%zu hot_prepare_ms=%.3f/%.3f cam_prepare_ms=%.3f/%.3f "
+                    "field_exec_ms=%.3f/%.3f guard_prepare_ms=%.3f/%.3f guard_exec_ms=%.3f/%.3f "
+                    "dma_wait_ms=%.3f/%.3f cold_total_ms=%.3f/%.3f cold_disc_ms=%.3f/%.3f cold_maint_ms=%.3f/%.3f "
+                    "field_pages=%.1f/%zu guard_pages=%.1f/%zu field_reqs=%.1f/%zu guard_reqs=%.1f/%zu "
+                    "reg_cap=%u cam_age_ms=%.2f/%.2f tail_cam=%llu",
+                    phaseWindow.cycles,
+                    phaseWindow.Mean(phaseWindow.hotPrepareSumMs), phaseWindow.hotPrepareMaxMs,
+                    phaseWindow.Mean(phaseWindow.cameraPrepareSumMs), phaseWindow.cameraPrepareMaxMs,
+                    phaseWindow.Mean(phaseWindow.fieldExecClearSumMs), phaseWindow.fieldExecClearMaxMs,
+                    phaseWindow.Mean(phaseWindow.guardPrepareSumMs), phaseWindow.guardPrepareMaxMs,
+                    phaseWindow.Mean(phaseWindow.guardExecClearSumMs), phaseWindow.guardExecClearMaxMs,
+                    phaseWindow.Mean(phaseWindow.dmaWaitSumMs), phaseWindow.dmaWaitMaxMs,
+                    phaseWindow.Mean(phaseWindow.coldTotalSumMs), phaseWindow.coldTotalMaxMs,
+                    phaseWindow.Mean(phaseWindow.coldDiscoverySumMs), phaseWindow.coldDiscoveryMaxMs,
+                    phaseWindow.Mean(phaseWindow.coldMaintenanceSumMs), phaseWindow.coldMaintenanceMaxMs,
+                    phaseWindow.MeanCount(phaseWindow.fieldPagesSum), phaseWindow.fieldPagesMax,
+                    phaseWindow.MeanCount(phaseWindow.guardPagesSum), phaseWindow.guardPagesMax,
+                    phaseWindow.MeanCount(phaseWindow.fieldReqsSum), phaseWindow.fieldReqsMax,
+                    phaseWindow.MeanCount(phaseWindow.guardReqsSum), phaseWindow.guardReqsMax,
+                    phaseWindow.registryCapacityMax,
+                    phaseWindow.Mean(phaseWindow.cameraAgeSumMs), phaseWindow.cameraAgeMaxMs,
+                    static_cast<unsigned long long>(phaseWindow.tailCameraRefreshes));
+                for (const auto& [address, count] : successfulSamples)
+                    Diagnostics::Info("[UNDMA-V3-SAMPLE] entity=0x%llX samples=%llu hz=%.2f", address, count, count / elapsed);
+                successfulSamples.clear();
+                measuredCycles = 0;
+                hotTotalMs = 0;
+                hotMaxMs = 0;
+                phaseWindow.Reset();
+                measurementStart = std::chrono::steady_clock::now();
+            }
         }
         RuntimeTrace::Emit(RuntimeTrace::SlowWork,RuntimeTrace::NowUs()-maintenanceStartedUs,tmp_entities.size());
         if(missingTransitionNeedsScan) {

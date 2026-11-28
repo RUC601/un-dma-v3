@@ -72,6 +72,24 @@ inline bool CollectBindings(std::vector<uint16_t>& out, std::span<const uint8_t>
     out.erase(std::unique(out.begin(),out.end()),out.end());
     return true;
 }
+inline bool ValidateShapeRecords(std::span<const uint8_t> spheres, std::span<const uint8_t> capsules) {
+    if (spheres.size() % 64 || capsules.size() % 80)
+        return false;
+    const auto check = [](std::span<const uint8_t> data, size_t stride, size_t radiusAt, bool sphere) {
+        for (size_t at = 0; at < data.size(); at += stride) {
+            const Vector3 a = Field<Vector3>(data.data() + at, 0);
+            const Vector3 b = sphere ? a : Field<Vector3>(data.data() + at, 16);
+            const float radius = Field<float>(data.data() + at, radiusAt);
+            if (!std::isfinite(radius) || radius <= 0.0f || radius > 10.0f)
+                return false;
+            for (auto p : { a, b })
+                if (!std::isfinite(p.X) || !std::isfinite(p.Y) || !std::isfinite(p.Z) || p.Size() > 20.0f)
+                    return false;
+        }
+        return true;
+    };
+    return check(spheres, 64, 16, true) && check(capsules, 80, 32, false);
+}
 template<class Read> bool LoadLayout(Layout& out,uint64_t model,uint64_t revision,size_t boneCount,Read&& read,DWORD nowTick=0) {
     out={};out.modelBase=model;out.revision=revision;
     if(!model || !revision || !read(model+0xC8,&out.root,8) || !Pointer(out.root) ||
@@ -84,6 +102,7 @@ template<class Read> bool LoadLayout(Layout& out,uint64_t model,uint64_t revisio
     std::vector<uint8_t> spheres(size_t(out.sphereCount)*64),capsules(size_t(out.capsuleCount)*80);
     out.valid=(!spheres.size() || read(out.spheres,spheres.data(),spheres.size())) &&
         (!capsules.size() || read(out.capsules,capsules.data(),capsules.size())) &&
+        ValidateShapeRecords(spheres,capsules) &&
         CollectBindings(out.boneIndices,spheres,capsules,boneCount);
     if(out.valid) {
         out.cachedSpheres=std::move(spheres);
@@ -139,7 +158,7 @@ struct Capture {
         if(!Complete() || !target.Matches(layout.modelBase,layout.revision) || target.root!=layout.root)return false;
         if(usedCachedShapes)
             return target.HasCachedShapeBytes();
-        if(!CollectBindings(target.boneIndices,spheres,capsules,boneCount))return false;
+        if(!ValidateShapeRecords(spheres,capsules) || !CollectBindings(target.boneIndices,spheres,capsules,boneCount))return false;
         target.cachedSpheres=spheres;
         target.cachedCapsules=capsules;
         target.shapesRefreshedTick=nowTick ? nowTick : GetTickCount();

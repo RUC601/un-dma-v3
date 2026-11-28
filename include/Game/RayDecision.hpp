@@ -50,6 +50,7 @@ struct RayDecision {
     uint64_t sceneEpoch = 0;
     uint64_t entityKey = 0;
     uint64_t actorGeneration = 0;
+    uint64_t bodyAuthorityRevision = 0;
     uint32_t sampleTick = 0;
     uint32_t ageMs = 0;
     uint32_t latencyUs = 0;

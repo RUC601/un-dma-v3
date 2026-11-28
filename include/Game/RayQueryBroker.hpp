@@ -33,6 +33,7 @@ public:
         uint64_t sceneEpoch = 0;
         uint64_t entityKey = 0;
         uint64_t actorGeneration = 0;
+        uint64_t bodyAuthorityRevision = 0;
         int boneId = -1;
         uint32_t sampleTick = 0;
         RaySegmentKind segmentKind = RaySegmentKind::Direct;
@@ -64,7 +65,8 @@ public:
         int boneId = -1, uint32_t maxAgeMs = 100,
         float maxEndpointDriftMeters = kDefaultMaxEndpointDriftMeters,
         RaySegmentKind segmentKind = RaySegmentKind::Direct,
-        uint8_t segmentIndex = 0) const;
+        uint8_t segmentIndex = 0,
+        uint64_t bodyAuthorityRevision = 0) const;
 
 private:
     struct CacheEntry {

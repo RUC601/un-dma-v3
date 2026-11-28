@@ -6,6 +6,11 @@ namespace OW::EntityMaintenance {
 struct ParticipantReplacementVerifier {
     using Context=EntityRosterPolicy::ParticipantBindingContext;
     using Proof=EntityRosterPolicy::VerifiedDeadParticipantReplacement;
+#if defined(UNLEASHED_DMA_SESSION_SELFTEST)
+    inline static bool useTwoBatchScatter = false;
+#else
+    inline static bool useTwoBatchScatter = true;
+#endif
 
     static bool Matches(const Context& saved,const c_entity& body,uint32_t controllerUid,
             std::string_view label,const EntityRegistry::Snapshot& registry,uint64_t scene) {
@@ -107,18 +112,141 @@ private:
             !body.participant_key || !EntityRosterPolicy::ReliableParticipantId(label) ||
             EntityRosterPolicy::ParticipantRosterKey(label)!=body.participant_key)return fail("replacement_context_changed");
         // Re-resolve current components: cached participant strings and HP cannot prove a successor.
+        const auto verifyHeaders = [&](const EntityHeaderSnapshot& actorSnap,
+                                       const EntityHeaderSnapshot& controllerSnap) {
+            uint32_t actorId = 0, parentId = 0;
+            if (!actorSnap.valid || !controllerSnap.valid ||
+                !actorSnap.ReadParentOffset(offset::Entity_MatchId, actorId) || actorId != body.match_id ||
+                !controllerSnap.ReadParentOffset(offset::Entity_MatchId, parentId) || parentId != controllerUid)
+                return false;
+            const auto link = DecryptComponent(body.LinkParent, offset::Active().typeLink, &controllerSnap, true);
+            const auto stat = DecryptComponent(body.LinkParent, TYPE_STAT, &controllerSnap, true);
+            const auto health = DecryptComponent(body.address, offset::Active().typeHealth, &actorSnap, true);
+            auto heroComp = DecryptComponent(body.LinkParent, offset::Active().typeHeroId, &controllerSnap, true);
+            if (!heroComp)
+                heroComp = DecryptComponent(body.address, offset::Active().typeHeroId, &actorSnap, true);
+            return link && link == body.LinkBase && stat && stat == body.statcombase &&
+                health && health == body.HealthBase && heroComp && heroComp == body.HeroBase;
+        };
+
+        if (useTwoBatchScatter) {
+            // Strict two-batch consistency proof: Batch A -> verify -> Batch B.
+            // Preserves full TOCTOU proof strength while collapsing serial round trips.
+            VMMDLL_SCATTER_HANDLE handle = mem.CreateScatterHandle();
+            if (!handle)
+                return fail("replacement_header_changed");
+            struct ScopedClose {
+                VMMDLL_SCATTER_HANDLE h;
+                ~ScopedClose() { if (h) mem.CloseScatterHandle(h); }
+            } closeGuard{ handle };
+
+            // ---- Batch A ----
+            std::array<uint8_t, kEntityHeaderSnapshotSize> actorBytesA{};
+            std::array<uint8_t, kEntityHeaderSnapshotSize> controllerBytesA{};
+            std::array<uint32_t, 2> ids{};
+            uint64_t hero = 0;
+            health_compo_t rawHealth{};
+            DWORD actorActualA = 0, controllerActualA = 0, idsActualA = 0, heroActualA = 0, healthActualA = 0;
+
+            bool prepA =
+                mem.AddScatterReadRequest(handle, body.address + kEntityHeaderSnapshotOffset,
+                    actorBytesA.data(), actorBytesA.size(), &actorActualA) &&
+                mem.AddScatterReadRequest(handle, body.LinkParent + kEntityHeaderSnapshotOffset,
+                    controllerBytesA.data(), controllerBytesA.size(), &controllerActualA) &&
+                mem.AddScatterReadRequest(handle, body.LinkBase + offset::Link_TargetId,
+                    ids.data(), sizeof(ids), &idsActualA) &&
+                mem.AddScatterReadRequest(handle, body.HeroBase + 0xD0,
+                    &hero, sizeof(hero), &heroActualA);
+            if (requireHealth) {
+                prepA = prepA && mem.AddScatterReadRequest(handle, body.HealthBase,
+                    &rawHealth, sizeof(rawHealth), &healthActualA);
+            }
+            const bool execA = prepA && mem.ExecuteReadScatter(handle);
+            if (!execA || actorActualA != actorBytesA.size() || controllerActualA != controllerBytesA.size())
+                return fail("replacement_header_changed");
+
+            EntityHeaderSnapshot actor{}, controller{};
+            actor.parent = body.address;
+            actor.valid = true;
+            actor.range.Assign(body.address + kEntityHeaderSnapshotOffset, actorBytesA.data(), actorBytesA.size());
+            controller.parent = body.LinkParent;
+            controller.valid = true;
+            controller.range.Assign(body.LinkParent + kEntityHeaderSnapshotOffset, controllerBytesA.data(), controllerBytesA.size());
+
+            // ---- Verify Phase between Batch A and Batch B ----
+            if (!verifyHeaders(actor, controller))
+                return fail("replacement_header_changed");
+            if (idsActualA != sizeof(ids))
+                return fail("replacement_pair_read_failed");
+            const auto idOffset = ids[1] == body.match_id ? offset::Link_UniqueId : offset::Link_TargetId;
+            if (ids[idOffset == offset::Link_UniqueId ? 1 : 0] != body.match_id)
+                return fail("replacement_pair_mismatch");
+            uint32_t mappedId = 0;
+            if (ResolveCnLinkTargetMapBase(body.LinkBase, idOffset, &mappedId, &map) != body.address ||
+                mappedId != body.match_id)
+                return fail("replacement_map_unconfirmed");
+            std::string liveLabel;
+            if (!ReadParticipantLabel(body.statcombase,
+                    [](uint64_t at, void* out, size_t size) { return SDK->read_range(at, out, size); }, liveLabel) ||
+                liveLabel != label)
+                return fail("replacement_live_participant_changed");
+            if (heroActualA != sizeof(hero) || hero != body.HeroID || !GameData::IsKnownHeroId(hero))
+                return fail("replacement_hero_changed");
+            if (requireHealth) {
+                HealthPayloadSummary healthSummary{};
+                if (healthActualA != sizeof(rawHealth) || !TryParseHealthPayload(rawHealth, healthSummary) ||
+                    healthSummary.isDead || healthSummary.total <= 0)
+                    return fail("replacement_health_unconfirmed");
+            }
+
+            // ---- Batch B (independent temporal re-verification) ----
+            std::array<uint8_t, kEntityHeaderSnapshotSize> actorBytesB{};
+            std::array<uint8_t, kEntityHeaderSnapshotSize> controllerBytesB{};
+            std::array<uint32_t, 2> finalIds{};
+            DWORD actorActualB = 0, controllerActualB = 0, idsActualB = 0;
+
+            const bool prepB =
+                mem.AddScatterReadRequest(handle, body.address + kEntityHeaderSnapshotOffset,
+                    actorBytesB.data(), actorBytesB.size(), &actorActualB) &&
+                mem.AddScatterReadRequest(handle, body.LinkParent + kEntityHeaderSnapshotOffset,
+                    controllerBytesB.data(), controllerBytesB.size(), &controllerActualB) &&
+                mem.AddScatterReadRequest(handle, body.LinkBase + offset::Link_TargetId,
+                    finalIds.data(), sizeof(finalIds), &idsActualB);
+            const bool execB = prepB && mem.ExecuteReadScatter(handle);
+            if (!execB || actorActualB != actorBytesB.size() || controllerActualB != controllerBytesB.size())
+                return fail("replacement_header_changed");
+
+            EntityHeaderSnapshot finalActor{}, finalController{};
+            finalActor.parent = body.address;
+            finalActor.valid = true;
+            finalActor.range.Assign(body.address + kEntityHeaderSnapshotOffset, actorBytesB.data(), actorBytesB.size());
+            finalController.parent = body.LinkParent;
+            finalController.valid = true;
+            finalController.range.Assign(body.LinkParent + kEntityHeaderSnapshotOffset, controllerBytesB.data(), controllerBytesB.size());
+
+            std::array<uint64_t, 6> actorLayout{}, controllerLayout{}, finalActorLayout{}, finalControllerLayout{};
+            if (!verifyHeaders(finalActor, finalController) ||
+                !actor.ReadComponentLayout(actorLayout) ||
+                !controller.ReadComponentLayout(controllerLayout) ||
+                !finalActor.ReadComponentLayout(finalActorLayout) ||
+                !finalController.ReadComponentLayout(finalControllerLayout) ||
+                actorLayout != finalActorLayout || controllerLayout != finalControllerLayout)
+                return fail("replacement_header_changed");
+            CnLinkTargetMapIdentity finalMap;
+            if (idsActualB != sizeof(finalIds) || finalIds != ids ||
+                ResolveCnLinkTargetMapBase(body.LinkBase, idOffset, &mappedId, &finalMap) != body.address ||
+                mappedId != body.match_id || finalMap != map)
+                return fail("replacement_map_changed");
+            const auto finished = clock();
+            if (!Current(registry, scene) || uint32_t(finished - started) > 100 ||
+                (requireHealth && !body.HasFreshLifeState(finished)))
+                return fail("replacement_sample_expired");
+            return true;
+        }
+
         const auto readHeaders=[&](EntityHeaderSnapshot& actor,EntityHeaderSnapshot& controller) {
-            uint32_t actorId=0,parentId=0;
-            if(!actor.Read(body.address) || !controller.Read(body.LinkParent) ||
-                !actor.ReadParentOffset(offset::Entity_MatchId,actorId) || actorId!=body.match_id ||
-                !controller.ReadParentOffset(offset::Entity_MatchId,parentId) || parentId!=controllerUid)return false;
-            const auto link=DecryptComponent(body.LinkParent,offset::Active().typeLink,&controller,true);
-            const auto stat=DecryptComponent(body.LinkParent,TYPE_STAT,&controller,true);
-            const auto health=DecryptComponent(body.address,offset::Active().typeHealth,&actor,true);
-            auto hero=DecryptComponent(body.LinkParent,offset::Active().typeHeroId,&controller,true);
-            if(!hero)hero=DecryptComponent(body.address,offset::Active().typeHeroId,&actor,true);
-            return link && link==body.LinkBase && stat && stat==body.statcombase &&
-                health && health==body.HealthBase && hero && hero==body.HeroBase;
+            if(!actor.Read(body.address) || !controller.Read(body.LinkParent))return false;
+            return verifyHeaders(actor,controller);
         };
         EntityHeaderSnapshot actor,controller;
         if(!readHeaders(actor,controller))return fail("replacement_header_changed");

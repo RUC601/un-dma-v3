@@ -32,6 +32,7 @@ namespace OW {int RunSkillModeScopeSelfTest();}
 #include <string>
 
 #include "Memory/Memory.h"        // ::mem   (global DMA instance)
+#include "Memory/TransportBenchmark.hpp"
 #include "Memory/KeyState.hpp"    // host keyboard/mouse state via DMA
 #include "Memory/DeviceRecovery.hpp"
 #include "Game/AbilityIcons.hpp"  // ability icon lookup table
@@ -428,6 +429,37 @@ static int RunConfigCheckCli()
     return 0;
 }
 
+static int RunTransportBenchCli(int iterations)
+{
+    std::printf("[BENCH] Read-only DMA transport benchmark starting (iterations=%d).\n", iterations);
+    if (!mem.LoadDmaDeviceConfig()) {
+        std::fprintf(stderr, "[BENCH] Failed to load DMA device config.\n");
+        return 2;
+    }
+    if (!mem.InitDma(false, false)) {
+        std::fprintf(stderr, "[BENCH] DMA device initialization failed; verify hardware/config.\n");
+        return 3;
+    }
+    uint64_t probeBase = 0;
+    size_t probeSpan = 512 * 1024;
+    if (mem.AttachToProcess("Overwatch.exe", false)) {
+        probeBase = mem.GetBaseDaddy("Overwatch.exe");
+        const size_t imageSize = mem.GetBaseSize("Overwatch.exe");
+        if (imageSize >= 4096)
+            probeSpan = (std::min)(imageSize, size_t{ 512 * 1024 });
+        std::printf("[BENCH] Attached to Overwatch.exe base=0x%llX span=%zuB.\n",
+            static_cast<unsigned long long>(probeBase), probeSpan);
+    } else {
+        std::fprintf(stderr, "[BENCH] Overwatch.exe not attached; cannot calibrate virtual process scatter.\n");
+        mem.CloseDma();
+        return 4;
+    }
+    const auto matrix = V2::Memory::RunTransportBenchmark(mem, probeBase, static_cast<size_t>(iterations), probeSpan);
+    V2::Memory::PrintTransportCapabilityMatrix(matrix);
+    mem.CloseDma();
+    return matrix.ok ? 0 : 5;
+}
+
 // =============================================================================
 // Main
 // =============================================================================
@@ -456,7 +488,7 @@ int main(int argc, char** argv)
     for (int index = 1; index < argc; ++index) {
         const std::string argument = argv[index] ? argv[index] : "";
         if (argument == "--help" || argument == "-h") {
-            std::printf("Usage: UNDMA_V3 [--ray-scene FILE] [--config-check] [--ray-probe]\n"
+            std::printf("Usage: UNDMA_V3 [--ray-scene FILE] [--config-check] [--transport-bench] [--bench-iterations 4..200] [--ray-probe]\n"
                         "       [--ray-start x,y,z] [--ray-end x,y,z;x,y,z...] [--ray-mask HEX]\n"
                         "       [--ray-filter-object HEX] [--ray-scene-object HEX] [--ray-aux-callback HEX]\n"
                         "       [--ray-capture-seed] [--ray-capture-seconds N] [--ray-seed-endpoints]\n"
@@ -486,6 +518,7 @@ int main(int argc, char** argv)
             continue;
         }
         if (argument == "--test-server-port" || argument == "--run-seconds" || argument == "--reconnect-after" ||
+            argument == "--bench-iterations" ||
             argument == "--ray-start" || argument == "--ray-end" || argument == "--ray-mask" ||
             argument == "--ray-filter-object" || argument == "--ray-scene-object" ||
             argument == "--ray-aux-callback" || argument == "--ray-filter-item" ||
@@ -499,7 +532,7 @@ int main(int argc, char** argv)
             }
             continue;
         }
-        if (argument == "--config-check" || argument == "--test-server" || argument == "--ray-probe" ||
+        if (argument == "--config-check" || argument == "--transport-bench" || argument == "--test-server" || argument == "--ray-probe" ||
             argument == "--ray-capture-seed" || argument == "--ray-seed-endpoints" ||
             argument == "--ray-capture-hint" || argument == "--ray-chain" ||
             argument == "--test-server-cors" || argument == "--box-perf-mode" || argument == "--canvas-only" || argument == "--launcher-stdio" || argument == "--capture-screen" || argument == "--aim-diagnostics")
@@ -539,6 +572,17 @@ int main(int argc, char** argv)
 #endif
     if (HasCommandLineFlag(argc, argv, "--config-check"))
         return RunConfigCheckCli();
+    if (HasCommandLineFlag(argc, argv, "--transport-bench")) {
+        int benchIterations = 24;
+        if (HasCommandLineFlag(argc, argv, "--bench-iterations")) {
+            if (!TryGetCommandLineInt(argc, argv, "--bench-iterations", benchIterations) ||
+                benchIterations < 4 || benchIterations > 200) {
+                std::fprintf(stderr, "[FATAL] Invalid --bench-iterations. Expected 4..200.\n");
+                return 1;
+            }
+        }
+        return RunTransportBenchCli(benchIterations);
+    }
     const bool testServerRequested = HasCommandLineFlag(argc, argv, "--test-server");
     const bool testServerCorsRequested = HasCommandLineFlag(argc, argv, "--test-server-cors");
     const bool boxPerfModeRequested = HasCommandLineFlag(argc, argv, "--box-perf-mode");

@@ -1291,6 +1291,120 @@ int main(int argc, char** argv) {
         }
     }
 
+    // 8) V3 Gate #2: body_authority_revision isolation on RayQueryBroker (Direct, World, Barrier):
+    //    Same entityKey and actorGeneration with an incremented bodyAuthorityRevision must never
+    //    match cached or stale in-flight decisions from an older authority revision.
+    {
+        struct AuthorityBackend final : OW::EngineTrace::IBackend {
+            std::atomic<bool> blockFirst{true};
+            std::atomic<bool> inFirst{false};
+            std::atomic<int> calls{0};
+            const char* Name() const override { return "AuthorityBackend"; }
+            bool BindScene(uint64_t) override { return true; }
+            void ReleaseScene() override {}
+            OW::EngineTrace::Status Trace(const OW::EngineTrace::Request&, OW::EngineTrace::Result& out) override {
+                out.status = OW::EngineTrace::Status::Ok;
+                out.fraction = 1.0f;
+                out.latencyUs = 100;
+                return out.status;
+            }
+            void TraceBatch(std::span<const OW::EngineTrace::Request> reqs,
+                            std::span<OW::EngineTrace::Result> results) override {
+                const int call = ++calls;
+                if (call == 1) {
+                    inFirst.store(true, std::memory_order_release);
+                    while (blockFirst.load(std::memory_order_acquire)) {
+                        std::this_thread::sleep_for(std::chrono::milliseconds(2));
+                    }
+                }
+                const size_t n = (std::min)(reqs.size(), results.size());
+                for (size_t i = 0; i < n; ++i) {
+                    results[i] = OW::EngineTrace::Result{};
+                    results[i].status = OW::EngineTrace::Status::Ok;
+                    results[i].fraction = 1.0f;
+                    results[i].latencyUs = 100;
+                }
+            }
+        } authBackend;
+        OW::EngineTrace::Service authSvc(&authBackend);
+
+        OW::EngineTrace::RayQueryBroker authBroker;
+        authBroker.Start();
+        authBroker.Attach(&authSvc);
+        authBroker.SetScene(77);
+
+        const OW::Vector3 cam{0.0f, 1.5f, 0.0f};
+        const OW::Vector3 pt{0.0f, 1.5f, 10.0f};
+        constexpr uint64_t kWorldMask = 0x1001ull;
+        constexpr uint64_t kBarMask = 0x2002ull;
+
+        OW::EngineTrace::RayQueryBroker::Query qRev1{};
+        qRev1.request.start = {cam.X, cam.Y, cam.Z};
+        qRev1.request.end = {pt.X, pt.Y, pt.Z};
+        qRev1.request.mask = kWorldMask;
+        qRev1.request.sceneEpoch = 77;
+        qRev1.frame = 200;
+        qRev1.connectionEpoch = 1;
+        qRev1.sceneEpoch = 77;
+        qRev1.entityKey = 0xA100;
+        qRev1.actorGeneration = 9;
+        qRev1.bodyAuthorityRevision = 1;
+        qRev1.boneId = 17;
+        qRev1.segmentKind = OW::RaySegmentKind::Direct;
+
+        // Submit rev=1 and wait until it is in-flight.
+        authBroker.Submit(qRev1);
+        for (int i = 0; i < 100 && !authBackend.inFirst.load(std::memory_order_acquire); ++i)
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        if (!authBackend.inFirst.load(std::memory_order_acquire)) {
+            authBackend.blockFirst.store(false, std::memory_order_release);
+            authBroker.Stop();
+            return Fail("Authority isolation test failed to enter in-flight trace");
+        }
+        // Let stale rev=1 complete while consumer advances to bodyAuthorityRevision=2 (same actorGeneration=9).
+        authBackend.blockFirst.store(false, std::memory_order_release);
+        std::optional<OW::RayDecision> hitRev1;
+        for (int i = 0; i < 100; ++i) {
+            hitRev1 = authBroker.Latest(qRev1.request, 200, 1, 77, 0xA100, 9, 17, 100,
+                OW::EngineTrace::RayQueryBroker::kDefaultMaxEndpointDriftMeters,
+                OW::RaySegmentKind::Direct, 0, /*bodyAuthorityRevision=*/1);
+            if (hitRev1.has_value()) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        if (!hitRev1.has_value() || hitRev1->bodyAuthorityRevision != 1 || hitRev1->world != OW::RayDecisionStatus::Clear) {
+            authBroker.Stop();
+            return Fail("Authority rev=1 result did not commit with bodyAuthorityRevision=1");
+        }
+        // Lookup with bodyAuthorityRevision=2 (same entityKey, same actorGeneration) MUST miss!
+        const auto missRev2 = authBroker.Latest(qRev1.request, 201, 1, 77, 0xA100, 9, 17, 100,
+            OW::EngineTrace::RayQueryBroker::kDefaultMaxEndpointDriftMeters,
+            OW::RaySegmentKind::Direct, 0, /*bodyAuthorityRevision=*/2);
+        if (missRev2.has_value()) {
+            authBroker.Stop();
+            return Fail("Stale rev=1 Direct ray leaked into bodyAuthorityRevision=2 lookup");
+        }
+        // Also verify Barrier segment isolation via EvaluateBarrierLayerDecision.
+        const auto barSubmitRev1 = OW::TrajectoryRay::EvaluateBarrierLayerDecision(
+            authBroker, OW::VisibilityPolicy::RayWorldAndBarrier, OW::BarrierPolicy::WaitBarrierDrop,
+            kBarMask, true, cam, pt, 201, 1, 77, 0xA100, 9, 17, 1, 100, true, /*bodyAuthorityRevision=*/1);
+        (void)barSubmitRev1;
+        OW::TrajectoryRay::BarrierEvaluationResult barHitRev1{};
+        for (int i = 0; i < 100; ++i) {
+            barHitRev1 = OW::TrajectoryRay::EvaluateBarrierLayerDecision(
+                authBroker, OW::VisibilityPolicy::RayWorldAndBarrier, OW::BarrierPolicy::WaitBarrierDrop,
+                kBarMask, true, cam, pt, 201, 1, 77, 0xA100, 9, 17, 1, 100, false, /*bodyAuthorityRevision=*/1);
+            if (barHitRev1.barrierClear) break;
+            std::this_thread::sleep_for(std::chrono::milliseconds(5));
+        }
+        const auto barMissRev2 = OW::TrajectoryRay::EvaluateBarrierLayerDecision(
+            authBroker, OW::VisibilityPolicy::RayWorldAndBarrier, OW::BarrierPolicy::WaitBarrierDrop,
+            kBarMask, true, cam, pt, 202, 1, 77, 0xA100, 9, 17, 1, 100, false, /*bodyAuthorityRevision=*/2);
+        authBroker.Stop();
+        if (!barHitRev1.barrierClear || !barMissRev2.barrierVacuum || barMissRev2.barrierClear) {
+            return Fail("Barrier ray cache leaked across bodyAuthorityRevision boundary");
+        }
+    }
+
     if (argc > 1) WriteSvg(argv[1], worldShapes);
     std::cout << "PASS shapeMapped=bound/unbound critical=unknown/critical/ordinary local+UniCore selector\n";
     return EXIT_SUCCESS;

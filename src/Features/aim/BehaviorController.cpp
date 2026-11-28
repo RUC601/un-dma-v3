@@ -24,7 +24,9 @@ bool RefreshAutoGameMouseSensitivity(bool force) {
 
     const auto prev = OW::Config::ReadOutputConversionSnapshot();
     if (!prev.autoReadGameMouseSensitivity) {
-        OW::Config::SetAutoDetectedGameMouseSensitivity(0.0f, false);
+        if (prev.gameMouseSensitivityAutoDetected || prev.detectedGameSensitivity != 0.0f) {
+            OW::Config::SetAutoDetectedGameMouseSensitivity(0.0f, false);
+        }
         return false;
     }
 
@@ -1035,11 +1037,15 @@ namespace AimbotDetail {
     }
 
     inline void MaintainSensitivity(float& origin_sens) {
-        const uintptr_t sensitive_ptr = OW::GetSenstivePTR();
-        if (!sensitive_ptr) return;
-        const float current_sens = SDK->RPM<float>(sensitive_ptr);
-        if (std::isfinite(current_sens) && current_sens > 0.0f) {
-            origin_sens = current_sens;
+        // Use the already-cached output conversion snapshot (refreshed at <=1Hz by
+        // RefreshAutoGameMouseSensitivity when enabled) instead of issuing a dead
+        // per-tick DMA read right before Triggerbot while SetSensitivityLocked is a no-op.
+        const auto snapshot = OW::Config::ReadOutputConversionSnapshot();
+        const float cached_sens = snapshot.gameMouseSensitivityAutoDetected
+            ? snapshot.detectedGameSensitivity
+            : snapshot.effectiveGameSensitivity;
+        if (std::isfinite(cached_sens) && cached_sens > 0.0f) {
+            origin_sens = cached_sens;
         }
     }
 

@@ -388,6 +388,23 @@ if(MSVC)
 endif()
 add_test(NAME V3UiPreferencesSelfTest COMMAND V3UiPreferencesSelfTest)
 
+# V3 Phase A+ acquisition, DMA admission, PageStore non-blocking cache,
+# CaptureRaySetupSeed cancel/drain, and deadline anti-starvation regression.
+add_executable(V3AcquisitionPhaseAPlusSelfTest
+    tools/v3_acquisition_selftest.cpp
+    src/Memory/Memory.cpp
+    src/Utils/Diagnostics.cpp)
+target_include_directories(V3AcquisitionPhaseAPlusSelfTest PRIVATE include src vendor/leechcore vendor/imgui vendor/rapidjson)
+target_compile_definitions(V3AcquisitionPhaseAPlusSelfTest PRIVATE _CRT_SECURE_NO_WARNINGS UNLEASHED_DMA_SESSION_SELFTEST=1)
+if(MSVC)
+    target_compile_options(V3AcquisitionPhaseAPlusSelfTest PRIVATE /W3 /wd4244 /wd4267 /wd4305 /wd4200)
+endif()
+target_link_libraries(V3AcquisitionPhaseAPlusSelfTest PRIVATE
+    "${CMAKE_SOURCE_DIR}/vendor/leechcore/vmm.lib"
+    "${CMAKE_SOURCE_DIR}/vendor/leechcore/leechcore.lib"
+    psapi)
+add_test(NAME V3AcquisitionPhaseAPlusSelfTest COMMAND V3AcquisitionPhaseAPlusSelfTest)
+
 # ============================================================================
 # Optional: UniCore trace bench (experimental, not part of the product binary)
 # ============================================================================

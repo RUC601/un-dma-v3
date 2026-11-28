@@ -168,6 +168,7 @@ bool AttachProbe() {
         ? RayScene::Decode::World155284
         : RayScene::Decode::CnNexon;
     const auto read = [](uint64_t address, void* buffer, size_t size) {
+        V2::Memory::DmaAdmissionController::ScopedContext rayScope(V2::Memory::DmaReadClass::Ray);
         return mem.Read(address, buffer, size);
     };
     if (!RayScene::Resolve(context, SDK->dwGameBase, decode,
@@ -209,7 +210,10 @@ bool AttachProbe() {
 
     auto probe = std::make_unique<EngineTrace::VisionProbe>(
         config,
-        [](uint64_t address, void* buffer, size_t size) { return mem.Read(address, buffer, size); },
+        [](uint64_t address, void* buffer, size_t size) {
+            V2::Memory::DmaAdmissionController::ScopedContext rayScope(V2::Memory::DmaReadClass::Ray);
+            return mem.Read(address, buffer, size);
+        },
         SDK->dwGameBase, offsets.imageSize, 0);
     auto backend = std::make_unique<VisionProbeBackend>(*probe);
 

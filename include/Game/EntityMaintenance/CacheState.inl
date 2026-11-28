@@ -128,6 +128,9 @@
         uint32_t participantControllerUid = 0;
         OW::EntityRosterPolicy::ParticipantBindingContext participantBindingContext{};
         DWORD participantBindingContextAttemptTick = 0;
+        uint64_t fallbackMapOwner = 0;
+        uint64_t fallbackMapLinkBase = 0;
+        DWORD fallbackMapOwnerAttemptTick = 0;
         std::string_view admissionRejectReason{};
         DWORD admissionRejectTick = 0;
         OW::c_entity entity{};
@@ -154,6 +157,8 @@
         uintptr_t meshBase = 0;
         XMFLOAT3 pos{};
         DWORD updateTick = 0, lastAttemptTick = 0;
+        DWORD idVerifiedTick = 0;
+        uint64_t registryGeneration = 0;
         uint32_t positionOffset = 0x200;
         DWORD statusTick = 0, statusAttemptTick = 0;
         uint32_t teamKey = 0;

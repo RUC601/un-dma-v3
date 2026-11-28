@@ -23,6 +23,7 @@ bool VecWithinDrift(const Vec3& lhs, const Vec3& rhs, float maxDriftMeters) {
 bool SameQuerySlot(const RayQueryBroker::Query& lhs, const RayQueryBroker::Query& rhs) {
     return lhs.entityKey == rhs.entityKey &&
            lhs.actorGeneration == rhs.actorGeneration &&
+           lhs.bodyAuthorityRevision == rhs.bodyAuthorityRevision &&
            lhs.boneId == rhs.boneId &&
            lhs.segmentKind == rhs.segmentKind &&
            lhs.segmentIndex == rhs.segmentIndex &&
@@ -156,7 +157,8 @@ std::optional<RayDecision> RayQueryBroker::Latest(
     const Request& request, uint64_t frame, uint64_t connectionEpoch,
     uint64_t sceneEpoch, uint64_t entityKey, uint64_t actorGeneration,
     int boneId, uint32_t maxAgeMs, float maxEndpointDriftMeters,
-    RaySegmentKind segmentKind, uint8_t segmentIndex) const {
+    RaySegmentKind segmentKind, uint8_t segmentIndex,
+    uint64_t bodyAuthorityRevision) const {
     if (sceneEpoch == 0) return std::nullopt;
     std::lock_guard<std::mutex> lock(mutex_);
     for (const auto& entry : cache_) {
@@ -165,6 +167,7 @@ std::optional<RayDecision> RayQueryBroker::Latest(
             entry.decision.sceneEpoch != sceneEpoch ||
             entry.decision.entityKey != entityKey ||
             entry.decision.actorGeneration != actorGeneration ||
+            entry.decision.bodyAuthorityRevision != bodyAuthorityRevision ||
             entry.boneId != boneId ||
             entry.segmentKind != segmentKind ||
             entry.segmentIndex != segmentIndex ||
@@ -199,6 +202,7 @@ void RayQueryBroker::StoreResultLocked(const CacheEntry& entry) {
     for (auto& existing : cache_) {
         if (existing.decision.entityKey == entry.decision.entityKey &&
             existing.decision.actorGeneration == entry.decision.actorGeneration &&
+            existing.decision.bodyAuthorityRevision == entry.decision.bodyAuthorityRevision &&
             existing.boneId == entry.boneId &&
             existing.segmentKind == entry.segmentKind &&
             existing.segmentIndex == entry.segmentIndex &&
@@ -316,6 +320,7 @@ void RayQueryBroker::Run() {
             decision.sceneEpoch = q.sceneEpoch;
             decision.entityKey = q.entityKey;
             decision.actorGeneration = q.actorGeneration;
+            decision.bodyAuthorityRevision = q.bodyAuthorityRevision;
             decision.sampleTick = q.sampleTick;
             decision.segmentKind = q.segmentKind;
             decision.segmentIndex = q.segmentIndex;

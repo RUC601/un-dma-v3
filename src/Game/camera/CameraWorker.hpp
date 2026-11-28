@@ -7,6 +7,7 @@ bool PrepareAcquisitionCameraPointers(uint64_t& cameraAddr, uint64_t& projection
 bool CommitAcquisitionCameraSample(const OW::Matrix& camera, const OW::Matrix& projection,
                                    uint64_t startedMs, uint64_t completedMs, bool readOk);
 bool SampleAcquisitionCamera();
+uint64_t LastAcquisitionCameraSampleUs();
 
 // 诊断读取同一份不可变启动配置，不重复解析环境变量。
 DWORD ViewMatrixPollSleepMs();

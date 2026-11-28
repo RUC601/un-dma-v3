@@ -1709,7 +1709,9 @@ namespace KeyState {
     inline void UpdateKeyStates()
     {
         auto session = mem.AcquireSession();
-        if (!session) {
+        V2::Memory::DmaAdmissionController::ScopedContext scope(V2::Memory::DmaReadClass::Control);
+        auto admission = mem.AcquireAdmission();
+        if (!session || !admission) {
             sampleAvailable.store(false, std::memory_order_release);
             return;
         }

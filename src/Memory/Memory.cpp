@@ -27,6 +27,7 @@ namespace {
 
 	std::mutex g_runtimeLibraryMutex;
 	std::mutex g_fixCr3Mutex;
+	thread_local const Memory* t_drainedLifecycleMemory = nullptr;
 
     VMM_HANDLE InitializeVmm(DWORD argc, LPSTR* args)
     {
@@ -550,6 +551,7 @@ bool Memory::InitDma(DmaDeviceType deviceType, bool memMap, bool debug)
 	}
 	DMA_INITIALIZED = true;
 	m_sessionAccess.Open();
+	m_admission.Open(true);
 	LOG("[INFO] DMA subsystem initialized: source=%s static=%d; target attachment remains separate.\n",
         GetDeviceTypeName(m_deviceType), IsStaticSource());
 	return true;
@@ -709,14 +711,14 @@ void Memory::DetachProcess()
 /*  Close DMA                                                          */
 /* ------------------------------------------------------------------ */
 
-void Memory::CloseDma()
+bool Memory::IsCurrentThreadInDrainedLifecycle() const noexcept
 {
-	std::lock_guard<std::mutex> lifecycleLock(m_sessionLifecycleMutex);
+	return t_drainedLifecycleMemory == this;
+}
+
+void Memory::CloseDmaDrainedLocked()
+{
 	DMA_INITIALIZED.store(false, std::memory_order_release);
-	{
-        RuntimeTrace::SdkSpan activity(RuntimeTrace::SdkPhase::SessionDrain);
-        m_sessionAccess.CloseAndDrain();activity.Result(true);
-    }
 	std::lock_guard<std::mutex> lock(g_fixCr3Mutex);
 	DetachProcess();
 	{
@@ -732,6 +734,85 @@ void Memory::CloseDma()
 	m_cr3PluginsInitialized = false;
 	m_processLayout = {};
 	m_systemEprocess = m_systemCreated = 0;
+}
+
+void Memory::CloseDma()
+{
+	if (IsCurrentThreadInDrainedLifecycle())
+	{
+		CloseDmaDrainedLocked();
+		return;
+	}
+	std::lock_guard<std::mutex> lifecycleLock(m_sessionLifecycleMutex);
+	DMA_INITIALIZED.store(false, std::memory_order_release);
+	// Close BOTH session and admission gates BEFORE waiting on any active lease/ticket,
+	// so no caller can observe admissionOpen==true while CloseDma is draining.
+	m_sessionAccess.CloseAdmission();
+	m_admission.CloseAdmission();
+	m_admission.WaitDrained();
+	{
+        RuntimeTrace::SdkSpan activity(RuntimeTrace::SdkPhase::SessionDrain);
+        m_sessionAccess.WaitDrained();activity.Result(true);
+    }
+	CloseDmaDrainedLocked();
+}
+
+bool Memory::ExecuteDrainedLifecycle(const char* reason,
+	const std::function<void()>& onClear,
+	const std::function<bool()>& onAction,
+	bool reopenAfter)
+{
+	if (IsCurrentThreadInDrainedLifecycle())
+		return false;
+	std::lock_guard<std::mutex> lifecycleLock(m_sessionLifecycleMutex);
+	// Phase 1: Close both admission gates first, then drain all active tickets and leases.
+	m_sessionAccess.CloseAdmission();
+	m_admission.CloseAdmission();
+	m_admission.WaitDrained();
+	m_sessionAccess.WaitDrained();
+	m_admission.BumpEpochLockedOrDrained();
+
+	struct ReopenGuard {
+		Memory* self;
+		bool reopen;
+		~ReopenGuard() {
+			if (reopen && self->DMA_INITIALIZED.load(std::memory_order_acquire) && self->vHandle != nullptr) {
+				self->m_sessionAccess.Open();
+				self->m_admission.Open(false);
+			}
+		}
+	} reopenGuard{ this, reopenAfter };
+
+	struct DrainedScope {
+		const Memory* prev;
+		explicit DrainedScope(const Memory* self) noexcept : prev(t_drainedLifecycleMemory) {
+			t_drainedLifecycleMemory = self;
+		}
+		~DrainedScope() noexcept {
+			t_drainedLifecycleMemory = prev;
+		}
+	} drainedScope{ this };
+
+	// Phase 2: Clear all scatter handles and caller-owned transient caches while drained.
+	{
+		std::lock_guard<std::mutex> scatterLock(m_scatterMutex);
+		m_scatterHandles.clear();
+	}
+	if (onClear)
+		onClear();
+
+	// Phase 3: Run exclusive lifecycle action (Refresh/FixCr3/Close).
+	bool ok = true;
+	const auto start = std::chrono::steady_clock::now();
+	if (onAction)
+		ok = onAction();
+
+	LOG("[INFO] Drained DMA lifecycle: reason=%s ok=%d epoch=%llu elapsed_ms=%.3f\n",
+		reason ? reason : "unspecified",
+		ok ? 1 : 0,
+		static_cast<unsigned long long>(m_admission.Epoch()),
+		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
+	return ok;
 }
 
 bool Memory::ReadProcessLifetime(uint64_t address, ProcessLifetime::Sample& sample) const
@@ -769,22 +850,34 @@ bool Memory::InitializeProcessMonitor()
 	return true;
 }
 
-bool Memory::RefreshProcessMetadata(const char* reason) const
+bool Memory::RefreshProcessMetadataDrainedLocked(const char* reason) const
 {
-	auto session = AcquireSession();
-	if (!session || !vHandle || m_cancelPending.load(std::memory_order_acquire))
+	if (!vHandle || m_cancelPending.load(std::memory_order_acquire))
 		return false;
 	const auto start = std::chrono::steady_clock::now();
 	const bool ok = VMMDLL_ConfigSet(vHandle, VMMDLL_OPT_REFRESH_ALL, 1) != FALSE;
-	LOG("[INFO] Process metadata refresh: reason=%s ok=%d elapsed_ms=%.3f\n", reason, ok,
+	LOG("[INFO] Process metadata refresh: reason=%s ok=%d elapsed_ms=%.3f\n",
+		reason ? reason : "unspecified", ok,
 		std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count());
 	return ok;
+}
+
+bool Memory::RefreshProcessMetadata(const char* reason) const
+{
+	if (IsCurrentThreadInDrainedLifecycle())
+		return RefreshProcessMetadataDrainedLocked(reason);
+	auto session = AcquireSession();
+	if (!session)
+		return false;
+	return RefreshProcessMetadataDrainedLocked(reason);
 }
 
 bool Memory::CheckSessionHealth() const
 {
 	auto session = AcquireSession();
-	if (!session || !vHandle || m_cancelPending.load(std::memory_order_acquire))
+	V2::Memory::DmaAdmissionController::ScopedContext scope(V2::Memory::DmaReadClass::Control);
+	auto admission = AcquireAdmission();
+	if (!session || !admission || !vHandle || m_cancelPending.load(std::memory_order_acquire))
 		return false;
 	if (!VMMDLL_ConfigSet(vHandle, VMMDLL_OPT_REFRESH_FREQ_MEM_PARTIAL, 1) ||
 		!VMMDLL_ConfigSet(vHandle, VMMDLL_OPT_REFRESH_FREQ_TLB_PARTIAL, 1))
@@ -796,7 +889,9 @@ bool Memory::CheckSessionHealth() const
 bool Memory::CheckAttachedProcessAlive() const
 {
 	auto session = AcquireSession();
-	if (!session || !vHandle || m_cancelPending.load(std::memory_order_acquire))
+	V2::Memory::DmaAdmissionController::ScopedContext scope(V2::Memory::DmaReadClass::Control);
+	auto admission = AcquireAdmission();
+	if (!session || !admission || !vHandle || m_cancelPending.load(std::memory_order_acquire))
 		return false;
 	std::lock_guard<std::recursive_mutex> processLock(m_processInfoMutex);
 	ProcessLifetime::Sample sample;
@@ -807,7 +902,9 @@ bool Memory::CheckAttachedProcessAlive() const
 bool Memory::CheckAttachedImageReadable() const
 {
 	auto session = AcquireSession();
-	if (!session || !vHandle || m_cancelPending.load(std::memory_order_acquire))
+	V2::Memory::DmaAdmissionController::ScopedContext scope(V2::Memory::DmaReadClass::Control);
+	auto admission = AcquireAdmission();
+	if (!session || !admission || !vHandle || m_cancelPending.load(std::memory_order_acquire))
 		return false;
 	uint64_t base = 0;
 	DWORD pid = 0;
@@ -986,7 +1083,10 @@ std::vector<int> Memory::GetPidListFromName(const std::string& name)
 bool Memory::SnapshotThreads(std::vector<ThreadSnapshot>& out) const
 {
 	out.clear();
-	if (!vHandle)
+	auto session = AcquireSession();
+	V2::Memory::DmaAdmissionController::ScopedContext scope(V2::Memory::DmaReadClass::Ray);
+	auto admission = AcquireAdmission();
+	if (!session || !admission || !vHandle || m_cancelPending.load(std::memory_order_acquire))
 		return false;
 	const DWORD pid = m_currentPid.load(std::memory_order_acquire);
 	if (!pid)
@@ -1012,33 +1112,79 @@ bool Memory::SnapshotThreads(std::vector<ThreadSnapshot>& out) const
 	return true;
 }
 
-bool Memory::CaptureRaySetupSeed(uint64_t context, uint64_t imageBase, uint32_t imageSize,
-	int timeoutMs, RaySetupSeed& out, const float* startHint, float startRadius) const
+bool Memory::CaptureRaySetupSeedWithProbes(uint64_t context, uint64_t imageBase, uint32_t imageSize,
+	int timeoutMs, RaySetupSeed& out,
+	const ThreadEnumeratorFn& enumerateThreads,
+	const PageReadFn& readMemory,
+	const CancelCheckFn& isCancelledOrInvalid,
+	const float* startHint, float startRadius)
 {
 	out = RaySetupSeed{};
-	if (!context || !imageBase || !imageSize)
+	if (!context || !imageBase || !imageSize || !enumerateThreads || !readMemory)
+		return false;
+	auto aborted = [&]() -> bool {
+		return isCancelledOrInvalid && isCancelledOrInvalid();
+	};
+	if (aborted())
 		return false;
 	const uint64_t deadline = GetTickCount64() + static_cast<uint64_t>((std::max)(1, timeoutMs));
 	std::vector<ThreadSnapshot> threads;
 	std::vector<uint8_t> raw(0x1000, 0);
 	RaySetupSeed fallback;
+	auto sleepCancellable = [&](uint64_t totalMs) -> bool {
+		const uint64_t sleepEnd = (std::min)(deadline, GetTickCount64() + totalMs);
+		while (GetTickCount64() < sleepEnd)
+		{
+			if (aborted())
+				return false;
+			const uint64_t now = GetTickCount64();
+			if (now >= sleepEnd)
+				break;
+			Sleep(static_cast<DWORD>((std::min<uint64_t>)(10, sleepEnd - now)));
+		}
+		return !aborted();
+	};
 	while (GetTickCount64() < deadline)
 	{
-		if (!SnapshotThreads(threads) || threads.empty())
+		if (aborted())
+			return false;
+		if (!enumerateThreads(threads) || threads.empty())
 		{
-			Sleep(50);
+			if (aborted())
+				return false;
+			if (!sleepCancellable(50))
+				return false;
 			continue;
 		}
+		bool deadlineReached = false;
 		for (const auto& thread : threads)
 		{
+			if (aborted())
+				return false;
+			if (GetTickCount64() >= deadline)
+			{
+				deadlineReached = true;
+				break;
+			}
 			if (!thread.stackBase || thread.stackBase <= thread.stackLimit)
 				continue;
 			const uint64_t size = (std::min<uint64_t>)(thread.stackBase - thread.stackLimit, 0x10000);
 			const uint64_t begin = (thread.stackBase - size) & ~0xFFFull;
 			for (uint64_t page = begin; page < thread.stackBase; page += 0x1000)
 			{
-				if (!Read(static_cast<uintptr_t>(page), raw.data(), raw.size()))
+				if (aborted())
+					return false;
+				if (GetTickCount64() >= deadline)
+				{
+					deadlineReached = true;
+					break;
+				}
+				if (!readMemory(static_cast<uintptr_t>(page), raw.data(), raw.size()))
+				{
+					if (aborted())
+						return false;
 					continue;
+				}
 				for (size_t off = 0; off + 0x240 <= raw.size(); off += 8)
 				{
 					const uint64_t address = page + off;
@@ -1057,9 +1203,15 @@ bool Memory::CaptureRaySetupSeed(uint64_t context, uint64_t imageBase, uint32_t 
 					std::memcpy(&setupContext, raw.data() + off + 0x1F0, 8);
 					if (setupContext != context)
 						continue;
+					if (aborted())
+						return false;
 					uint64_t vtable = 0;
-					if (!Read(static_cast<uintptr_t>(context), &vtable, sizeof(vtable)))
+					if (!readMemory(static_cast<uintptr_t>(context), &vtable, sizeof(vtable)))
+					{
+						if (aborted())
+							return false;
 						continue;
+					}
 					if (vtable < imageBase || vtable >= imageBase + imageSize)
 						continue;
 					float start[3] = {};
@@ -1095,6 +1247,8 @@ bool Memory::CaptureRaySetupSeed(uint64_t context, uint64_t imageBase, uint32_t 
 					// player's own body first (or return clear for long rays).
 					if (candidate.filterCount > 0)
 					{
+						if (aborted())
+							return false;
 						out = candidate;
 						return true;
 					}
@@ -1102,15 +1256,48 @@ bool Memory::CaptureRaySetupSeed(uint64_t context, uint64_t imageBase, uint32_t 
 						fallback = candidate;
 				}
 			}
+			if (deadlineReached)
+				break;
 		}
-		Sleep(10);
+		if (aborted())
+			return false;
+		if (deadlineReached)
+			break;
+		if (!sleepCancellable(10))
+			return false;
 	}
-	if (fallback.found)
+	if (fallback.found && !aborted())
 	{
 		out = fallback;
 		return true;
 	}
 	return false;
+}
+
+bool Memory::CaptureRaySetupSeed(uint64_t context, uint64_t imageBase, uint32_t imageSize,
+	int timeoutMs, RaySetupSeed& out, const float* startHint, float startRadius) const
+{
+	out = RaySetupSeed{};
+	if (!context || !imageBase || !imageSize)
+		return false;
+	const uint64_t startEpoch = AdmissionEpoch();
+	const int startPid = m_currentPid.load(std::memory_order_acquire);
+	if (startPid == 0)
+		return false;
+	V2::Memory::DmaAdmissionController::ScopedContext scope(V2::Memory::DmaReadClass::Ray);
+	auto isCancelledOrInvalid = [&]() -> bool {
+		return m_cancelPending.load(std::memory_order_acquire) ||
+			!DMA_INITIALIZED.load(std::memory_order_acquire) ||
+			!SessionActivity().admissionOpen ||
+			AdmissionEpoch() != startEpoch ||
+			m_currentPid.load(std::memory_order_acquire) != startPid;
+	};
+	return CaptureRaySetupSeedWithProbes(
+		context, imageBase, imageSize, timeoutMs, out,
+		[this](std::vector<ThreadSnapshot>& threads) { return SnapshotThreads(threads); },
+		[this](uintptr_t address, void* buffer, size_t size) { return Read(address, buffer, size); },
+		isCancelledOrInvalid,
+		startHint, startRadius);
 }
 
 Memory::ProcessLookupResult Memory::FindProcessByNamePrefix(const std::string& namePrefix)
@@ -1271,8 +1458,17 @@ size_t Memory::GetBaseSize(std::string module_name)
 
 bool Memory::FixCr3()
 {
+	if (IsCurrentThreadInDrainedLifecycle())
+		return FixCr3DrainedLocked();
 	auto session = AcquireSession();
-	if (!session || !vHandle)
+	if (!session)
+		return false;
+	return FixCr3DrainedLocked();
+}
+
+bool Memory::FixCr3DrainedLocked()
+{
+	if (!vHandle)
 		return false;
 	std::lock_guard<std::recursive_mutex> processLock(m_processInfoMutex);
 	std::lock_guard<std::mutex> lock(g_fixCr3Mutex);
@@ -1579,8 +1775,9 @@ static constexpr DWORD VMM_READ_FLAGS =
 bool Memory::Read(uintptr_t address, void* buffer, size_t size) const
 {
 	auto session = AcquireSession();
+	auto admission = AcquireAdmission();
 	const auto start = std::chrono::steady_clock::now();
-	if (!session || !vHandle || !buffer || !size || size > MAXDWORD ||
+	if (!session || !admission || !vHandle || !buffer || !size || size > MAXDWORD ||
 		m_cancelPending.load(std::memory_order_acquire))
 	{
 		Diagnostics::RecordDmaRead(false, std::chrono::steady_clock::duration::zero());
@@ -1610,8 +1807,9 @@ bool Memory::Read(uintptr_t address, void* buffer, size_t size) const
 bool Memory::ReadFreshExact(uintptr_t address, void* buffer, size_t size) const
 {
 	auto session = AcquireSession();
+	auto admission = AcquireAdmission();
 	const auto start = std::chrono::steady_clock::now();
-	if (!session || !vHandle || !buffer || !size || size > MAXDWORD ||
+	if (!session || !admission || !vHandle || !buffer || !size || size > MAXDWORD ||
 		m_cancelPending.load(std::memory_order_acquire))
 		return false;
 	DWORD actual = 0;
@@ -1627,8 +1825,9 @@ bool Memory::ReadFreshExact(uintptr_t address, void* buffer, size_t size) const
 bool Memory::Read(uintptr_t address, void* buffer, size_t size, int pid) const
 {
 	auto session = AcquireSession();
+	auto admission = AcquireAdmission();
 	const auto start = std::chrono::steady_clock::now();
-	if (!session || !vHandle || !buffer || !size || size > MAXDWORD ||
+	if (!session || !admission || !vHandle || !buffer || !size || size > MAXDWORD ||
 		m_cancelPending.load(std::memory_order_acquire))
 	{
 		Diagnostics::RecordDmaRead(false, std::chrono::steady_clock::duration::zero());
@@ -1704,7 +1903,8 @@ bool Memory::Write(uintptr_t address, const void* buffer, size_t size, int pid) 
 bool Memory::PrefetchPages(const std::vector<uint64_t>& pageAddresses, int pid) const
 {
 	auto session = AcquireSession();
-	if (!session || !vHandle || m_cancelPending.load(std::memory_order_acquire))
+	auto admission = AcquireAdmission();
+	if (!session || !admission || !vHandle || m_cancelPending.load(std::memory_order_acquire))
 		return false;
 	if (pageAddresses.empty())
 		return true;
@@ -1805,7 +2005,8 @@ bool Memory::AddScatterReadRequest(VMMDLL_SCATTER_HANDLE handle,uint64_t address
 bool Memory::ExecuteReadScatter(VMMDLL_SCATTER_HANDLE handle,int pid)
 {
     auto session=AcquireSession();
-    if(!session || !handle || m_cancelPending.load(std::memory_order_acquire)) {
+    auto admission=AcquireAdmission();
+    if(!session || !admission || !handle || m_cancelPending.load(std::memory_order_acquire)) {
         Diagnostics::RecordDmaRead(false,std::chrono::steady_clock::duration::zero());return false;
     }
     auto state=FindScatterHandle(handle);if(!state)return false;
@@ -1830,6 +2031,28 @@ bool Memory::ExecuteReadScatter(VMMDLL_SCATTER_HANDLE handle,int pid)
     }();
     Diagnostics::RecordDmaRead(executeOk && clearOk,std::chrono::steady_clock::now()-start);
     return executeOk && clearOk;
+}
+
+bool Memory::ClearScatterHandle(VMMDLL_SCATTER_HANDLE handle, int pid)
+{
+    // VMMDLL_Scatter_Clear does zero DMA I/O (only releases SDK-queued local buffer pointers).
+    // Allow clearing even when m_cancelPending is true so callers can safely release stack
+    // pointers before unwinding; session lease + scatter handle table protect handle lifetime.
+    auto session = AcquireSession();
+    if (!session || !vHandle || !handle)
+        return false;
+    auto state = FindScatterHandle(handle);
+    if (!state)
+        return false;
+    std::lock_guard<std::mutex> callLock(state->mutex);
+    if (!state->native)
+        return false;
+    if (pid == 0)
+        pid = m_currentPid.load(std::memory_order_acquire);
+    RuntimeTrace::SdkSpan activity(RuntimeTrace::SdkPhase::ScatterClear, reinterpret_cast<uint64_t>(handle));
+    const bool ok = VMMDLL_Scatter_Clear(state->native, pid, VMMDLL_FLAG_NOCACHE) != FALSE;
+    activity.Result(ok);
+    return ok;
 }
 
 /* ------------------------------------------------------------------ */

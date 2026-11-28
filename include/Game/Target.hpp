@@ -2137,6 +2137,7 @@ namespace OW {
             return decision;
         }
         decision.sceneEpoch = rayScene;
+        decision.bodyAuthorityRevision = entity.body_authority_revision;
 
         const RayDecision worldVerdict = TrajectoryRay::EvaluateParabolicBrokerDecision(
             RayRuntime::Broker(),
@@ -2152,7 +2153,8 @@ namespace OW {
             decision.sampleTick,
             RayRuntime::WorldRayMask(),
             maxAgeMs,
-            submitBrokerQuery);
+            submitBrokerQuery,
+            entity.body_authority_revision);
         decision.world = worldVerdict.world;
         decision.ageMs = worldVerdict.ageMs;
         decision.latencyUs = worldVerdict.latencyUs;
@@ -2578,7 +2580,9 @@ namespace OW {
                     ? activeLock.boneId : BONE_HEAD;
                 if (const auto cached = RayRuntime::Broker().Latest(
                         probeReq, frame.sequence, entity.connection_epoch, probeReq.sceneEpoch,
-                        entry.key, entity.actor_generation, priorBone, 100)) {
+                        entry.key, entity.actor_generation, priorBone, 100,
+                        EngineTrace::RayQueryBroker::kDefaultMaxEndpointDriftMeters,
+                        RaySegmentKind::Direct, 0, entity.body_authority_revision)) {
                     if (cached->world == RayDecisionStatus::Clear)
                         visPrior = 1.0f;
                     else if (cached->world == RayDecisionStatus::Occluded)
@@ -2701,6 +2705,7 @@ namespace OW {
             q.sceneEpoch = liveRayScene;
             q.entityKey = entKey;
             q.actorGeneration = ent.actor_generation;
+            q.bodyAuthorityRevision = ent.body_authority_revision;
             q.boneId = bId;
             q.sampleTick = ent.native_hitboxes.tick;
             q.segmentKind = segKind;
@@ -2734,7 +2739,7 @@ namespace OW {
                     req, frame.sequence, ent.connection_epoch, liveRayScene,
                     entKey, ent.actor_generation, bId, maxAgeMs,
                     EngineTrace::RayQueryBroker::kDefaultMaxEndpointDriftMeters,
-                    segKind, s);
+                    segKind, s, ent.body_authority_revision);
                 const bool isUnresolved = !cached.has_value() || cached->IsObservationVacuum();
                 if (isUnresolved) {
                     dst.PushUrgent(makeBrokerQuery(ent, entKey, bId, segStart, segEnd, segKind, s));
@@ -2769,7 +2774,7 @@ namespace OW {
                     req, frame.sequence, ent.connection_epoch, liveRayScene,
                     entKey, ent.actor_generation, bId, maxAgeMs,
                     EngineTrace::RayQueryBroker::kDefaultMaxEndpointDriftMeters,
-                    segKind, s);
+                    segKind, s, ent.body_authority_revision);
                 if (!cached.has_value() || cached->IsObservationVacuum()) {
                     dst.PushUrgent(makeBrokerQuery(ent, entKey, bId, segStart, segEnd, segKind, s));
                 }
@@ -2982,7 +2987,7 @@ namespace OW {
                             gcQuery.request, frame.sequence, entity.connection_epoch, liveRayScene,
                             candidateKey, entity.actor_generation, candidateBoneId, candidateRayMaxAgeMs,
                             EngineTrace::RayQueryBroker::kDefaultMaxEndpointDriftMeters,
-                            RaySegmentKind::GroundClip, 0);
+                            RaySegmentKind::GroundClip, 0, entity.body_authority_revision);
                         if (currentRank == 0 && !batchInput.top1GroundClip.has_value()) {
                             batchInput.top1GroundClip = gcQuery;
                             batchInput.top1GroundClipUrgent =
@@ -3258,7 +3263,8 @@ namespace OW {
                             candidateBoneId,
                             entity.native_hitboxes.tick,
                             candidateRayMaxAgeMs,
-                            /*submitImmediately=*/false);
+                            /*submitImmediately=*/false,
+                            entity.body_authority_revision);
                         if (barrierEval.barrierActive) {
                             rayDecision.barrierCheckRequired = true;
                             rayDecision.barrier = barrierEval.barrierDecision.world;
@@ -3457,7 +3463,9 @@ namespace OW {
                         slotReq.sceneEpoch = liveRayScene;
                         if (const auto slotCached = RayRuntime::Broker().Latest(
                                 slotReq, frame.sequence, entity.connection_epoch, liveRayScene,
-                                candidateKey, entity.actor_generation, slotBoneId, candidateRayMaxAgeMs)) {
+                                candidateKey, entity.actor_generation, slotBoneId, candidateRayMaxAgeMs,
+                                EngineTrace::RayQueryBroker::kDefaultMaxEndpointDriftMeters,
+                                RaySegmentKind::Direct, 0, entity.body_authority_revision)) {
                             if (slotCached->world == RayDecisionStatus::Clear) {
                                 next.worldClearSlotMask |= slotBit;
                                 if (!checkOffGuidanceBarrier) {
@@ -3469,7 +3477,7 @@ namespace OW {
                                             slotBarReq, frame.sequence, entity.connection_epoch, liveRayScene,
                                             candidateKey, entity.actor_generation, slotBoneId, candidateRayMaxAgeMs,
                                             EngineTrace::RayQueryBroker::kDefaultMaxEndpointDriftMeters,
-                                            RaySegmentKind::Barrier, 0)) {
+                                            RaySegmentKind::Barrier, 0, entity.body_authority_revision)) {
                                         if (slotBarCached->world == RayDecisionStatus::Clear &&
                                             slotBarCached->Fresh(candidateRayMaxAgeMs)) {
                                             next.barrierClearSlotMask |= slotBit;
@@ -3842,7 +3850,8 @@ namespace OW {
                             liveRayScene, best.entityKey, best.actorGeneration,
                             best.guidanceBoneId, 150,
                             EngineTrace::RayQueryBroker::kDefaultMaxEndpointDriftMeters,
-                            RaySegmentKind::EdgeFan, fanRays[r].segmentIndex);
+                            RaySegmentKind::EdgeFan, fanRays[r].segmentIndex,
+                            best.entitySnapshot.body_authority_revision);
                     }
                     const auto analysis = PreAim::AnalyzeEdgeFanResults(
                         fovContext.camera, fanAnchor, fanLateral, fanRays, fanDecisions, fanMaxWidth);
@@ -4016,7 +4025,7 @@ namespace OW {
                     slotReq, frame.sequence, best.entitySnapshot.connection_epoch, liveRayScene,
                     best.entityKey, best.actorGeneration, slotBoneId, warmupRayMaxAgeMs,
                     EngineTrace::RayQueryBroker::kDefaultMaxEndpointDriftMeters,
-                    slotSegKind, 0);
+                    slotSegKind, 0, best.entitySnapshot.body_authority_revision);
                 if (slotCached && !slotCached->IsObservationVacuum() &&
                     slotCached->Fresh(warmupRayMaxAgeMs))
                     continue;
@@ -4351,7 +4360,8 @@ namespace OW {
                             boneId,
                             entity.native_hitboxes.tick,
                             RayDecision::kDefaultMaxAgeMs,
-                            /*submitImmediately=*/true);
+                            /*submitImmediately=*/true,
+                            entity.body_authority_revision);
                         if (barrierEval.barrierActive) {
                             candidateRay.barrierCheckRequired = true;
                             candidateRay.barrier = barrierEval.barrierDecision.world;

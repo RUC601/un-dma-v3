@@ -66,8 +66,9 @@
                     if (!plausibleHealthLayout) {
                         dmaFieldWindow.healthLayoutFail++;
                         requestTopologyRescan(processLoopTick);
-
-                        componentBaseCache.erase(ComponentParent);
+                        if (!refreshHealthBaseAfterTransportFailure(entity, processLoopTick)) {
+                            componentBaseCache.erase(ComponentParent);
+                        }
                         processStats.healthBaseFail++;
                         processStats.healthReadFail++;
                         recordHealthFailureSample(entity, ComponentParent, LinkParent, true);

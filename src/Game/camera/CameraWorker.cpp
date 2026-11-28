@@ -13,6 +13,7 @@ namespace {
 struct CameraState {
     VMMDLL_SCATTER_HANDLE scatter = mem.CreateScatterHandle();
     uint64_t camera=0, projection=0, epoch=0, scene=0;
+    uint64_t lastSampleUs=0;
     DWORD resolvedAt=0, lastLog=0;
     bool hasStatus=false, lastValid=false;
     OW::ViewMatrixPublishState publication{};
@@ -45,7 +46,10 @@ bool PrepareAcquisitionCameraPointers(uint64_t& cameraAddr, uint64_t& projection
         }
         state.camera=p2 ? p2+offsets.VM_ViewMatrix : 0;
         state.projection=projection; state.resolvedAt=now;
-        if(epoch!=state.epoch || scene!=state.scene) state.publication={};
+        if(epoch!=state.epoch || scene!=state.scene) {
+            state.publication={};
+            state.lastSampleUs=0;
+        }
         state.epoch=epoch; state.scene=scene;
     }
     cameraAddr = state.camera;
@@ -72,9 +76,14 @@ bool CommitAcquisitionCameraSample(const OW::Matrix& camera, const OW::Matrix& p
         OW::RecordViewMatrixRejected(reason,state.camera,state.projection,state.hasStatus,state.lastValid,state.lastLog);
         return false;
     }
+    state.lastSampleUs = RuntimeTrace::NowUs();
     RuntimeTrace::Emit(RuntimeTrace::CameraRead,startedMs,completedMs,1,epoch,&camera.m11,16);
     OW::RecordViewMatrixResolved(state.projection,state.camera,true,state.hasStatus,state.lastValid,state.lastLog);
     return true;
+}
+
+uint64_t LastAcquisitionCameraSampleUs() {
+    return ThreadCameraState().lastSampleUs;
 }
 
 bool SampleAcquisitionCamera() {

@@ -200,7 +200,8 @@ inline RayDecision EvaluateParabolicBrokerDecision(
     uint64_t sampleTick,
     uint64_t mask,
     uint32_t maxAgeMs,
-    bool submitMissing) noexcept {
+    bool submitMissing,
+    uint64_t bodyAuthorityRevision = 0) noexcept {
     const uint8_t segCount = (chordPlan != nullptr && chordPlan->segmentCount >= 1)
         ? std::clamp<uint8_t>(chordPlan->segmentCount, 1u, static_cast<uint8_t>(kMaxParabolicSegments))
         : static_cast<uint8_t>(1u);
@@ -223,6 +224,7 @@ inline RayDecision EvaluateParabolicBrokerDecision(
         q.sceneEpoch = sceneEpoch;
         q.entityKey = entityKey;
         q.actorGeneration = actorGeneration;
+        q.bodyAuthorityRevision = bodyAuthorityRevision;
         q.boneId = boneId;
         q.sampleTick = sampleTick;
         q.segmentKind = segKind;
@@ -232,7 +234,7 @@ inline RayDecision EvaluateParabolicBrokerDecision(
             q.request, frame, connectionEpoch, sceneEpoch,
             entityKey, actorGeneration, boneId, maxAgeMs,
             EngineTrace::RayQueryBroker::kDefaultMaxEndpointDriftMeters,
-            segKind, s);
+            segKind, s, bodyAuthorityRevision);
     }
     if (submitMissing) {
         if (segCount > 1) {
@@ -330,6 +332,7 @@ struct RayBatchPlan {
                             const EngineTrace::RayQueryBroker::Query& b) noexcept {
         return a.entityKey == b.entityKey &&
                a.actorGeneration == b.actorGeneration &&
+               a.bodyAuthorityRevision == b.bodyAuthorityRevision &&
                a.boneId == b.boneId &&
                a.segmentKind == b.segmentKind &&
                a.segmentIndex == b.segmentIndex &&
@@ -695,7 +698,8 @@ inline BarrierEvaluationResult EvaluateBarrierLayerDecision(
     int boneId,
     uint32_t sampleTick,
     uint32_t maxAgeMs,
-    bool submitImmediately = false) noexcept {
+    bool submitImmediately = false,
+    uint64_t bodyAuthorityRevision = 0) noexcept {
     BarrierEvaluationResult out{};
     if (!worldClear) {
         out.hitKind = TraceHitKind::World;
@@ -721,6 +725,7 @@ inline BarrierEvaluationResult EvaluateBarrierLayerDecision(
     q.sceneEpoch = sceneEpoch;
     q.entityKey = entityKey;
     q.actorGeneration = actorGeneration;
+    q.bodyAuthorityRevision = bodyAuthorityRevision;
     q.boneId = boneId;
     q.sampleTick = sampleTick;
     q.segmentKind = RaySegmentKind::Barrier;
@@ -730,7 +735,7 @@ inline BarrierEvaluationResult EvaluateBarrierLayerDecision(
         q.request, frame, connectionEpoch, sceneEpoch,
         entityKey, actorGeneration, boneId, maxAgeMs,
         EngineTrace::RayQueryBroker::kDefaultMaxEndpointDriftMeters,
-        RaySegmentKind::Barrier, 0);
+        RaySegmentKind::Barrier, 0, bodyAuthorityRevision);
 
     out.slot3Query = q;
     if (!cached.has_value()) {

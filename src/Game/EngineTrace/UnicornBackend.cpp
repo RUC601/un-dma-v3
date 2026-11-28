@@ -259,17 +259,49 @@ bool UnicornBackend::EnsurePage(uint64_t page) {
 
     std::vector<uint8_t> bytes(kPage, 0);
     if (sharedStore_) {
-        // One DMA read serves every engine in the process.
-        std::lock_guard<std::mutex> lock(sharedStore_->mutex);
-        const auto it = sharedStore_->pages.find(page);
-        if (it != sharedStore_->pages.end()) {
-            std::memcpy(bytes.data(), it->second.data(), kPage);
-            ++sharedStore_->stats.hits;
-            ++stats_.cacheHits;
-        } else {
-            if (!FetchPageWithRetry(page, bytes.data())) return false;
-            sharedStore_->pages.emplace(page, bytes);
-            ++sharedStore_->stats.fetches;
+        // One DMA read serves every engine in the process without holding
+        // sharedStore_->mutex across FetchPageWithRetry() / sleep / DMA.
+        bool servedFromCache = false;
+        {
+            std::unique_lock<std::mutex> lock(sharedStore_->mutex);
+            for (;;) {
+                const auto it = sharedStore_->pages.find(page);
+                if (it != sharedStore_->pages.end()) {
+                    std::memcpy(bytes.data(), it->second.data(), kPage);
+                    ++sharedStore_->stats.hits;
+                    ++stats_.cacheHits;
+                    servedFromCache = true;
+                    break;
+                }
+                if (sharedStore_->inFlightPages.insert(page).second) {
+                    break;
+                }
+                sharedStore_->cv.wait(lock, [&] {
+                    return sharedStore_->inFlightPages.count(page) == 0 ||
+                           sharedStore_->pages.count(page) != 0;
+                });
+            }
+        }
+        if (!servedFromCache) {
+            bool fetched = false;
+            try {
+                fetched = FetchPageWithRetry(page, bytes.data());
+            } catch (...) {
+                std::lock_guard<std::mutex> lock(sharedStore_->mutex);
+                sharedStore_->inFlightPages.erase(page);
+                sharedStore_->cv.notify_all();
+                throw;
+            }
+            {
+                std::lock_guard<std::mutex> lock(sharedStore_->mutex);
+                sharedStore_->inFlightPages.erase(page);
+                if (fetched) {
+                    sharedStore_->pages.emplace(page, bytes);
+                    ++sharedStore_->stats.fetches;
+                }
+                sharedStore_->cv.notify_all();
+            }
+            if (!fetched) return false;
         }
     } else {
         const auto it = pageBytes_.find(page);
@@ -415,10 +447,10 @@ bool UnicornBackend::PrepareSetup() {
 bool UnicornBackend::RefreshTouchedPages() {
     std::vector<uint8_t> bytes(kPage);
     for (uint64_t page : touched_) {
-        {
-            std::unique_lock<std::mutex> lock;
-            if (sharedStore_) lock = std::unique_lock(sharedStore_->mutex);
-            if (!ReadPage(page, bytes.data())) return false;
+        if (!ReadPage(page, bytes.data())) return false;
+        if (sharedStore_) {
+            std::lock_guard<std::mutex> lock(sharedStore_->mutex);
+            sharedStore_->pages[page] = bytes;
         }
         if (uc_mem_write(reinterpret_cast<uc_engine*>(uc_), page, bytes.data(), kPage) != UC_ERR_OK) {
             return false;
